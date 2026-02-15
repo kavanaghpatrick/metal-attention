@@ -11,10 +11,13 @@ pub mod dispatch;
 pub mod embed;
 pub mod ffn;
 pub mod flash;
+pub mod gqa;
+pub mod kv_cache;
 pub mod linear;
 pub mod matmul;
 pub mod norm;
 pub mod pipeline;
+pub mod rope;
 pub mod rwkv;
 pub mod types;
 
@@ -27,9 +30,12 @@ pub use dispatch::{dispatch_1d, dispatch_2d, dispatch_threadgroups, set_buffer, 
 pub use embed::dispatch_embedding_lookup;
 pub use ffn::dispatch_ffn_silu;
 pub use flash::dispatch_flash_attention;
+pub use gqa::{cpu_gqa_remap, dispatch_gqa_remap};
+pub use kv_cache::DenseKVCache;
 pub use linear::dispatch_linear_attention;
 pub use matmul::dispatch_matmul;
 pub use norm::dispatch_rmsnorm;
 pub use pipeline::{ConstantType, ConstantValue, PsoCache, PsoKey};
+pub use rope::{cpu_rope, dispatch_rope};
 pub use rwkv::{cpu_rwkv_wkv, dispatch_rwkv_wkv};
 pub use types::{AttentionParams, LayerParams, SSMParams};
