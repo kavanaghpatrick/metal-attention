@@ -318,6 +318,66 @@ impl FlashAttentionLayer {
         }
     }
 
+    /// Apply RoPE (Rotary Position Embeddings) to Q and K tensors.
+    ///
+    /// Processes each head independently. Q has `num_heads` heads, K has `num_kv_heads` heads.
+    /// `pos_offset` is the starting position (0 for prefill, cached_len for decode).
+    /// `theta` is the RoPE frequency base (typically 10000.0).
+    fn apply_rope(
+        q: &mut [f32],
+        k: &mut [f32],
+        seq_len: usize,
+        head_dim: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        pos_offset: usize,
+        theta: f32,
+    ) {
+        // Apply RoPE per Q head
+        let q_stride = num_heads * head_dim;
+        for h in 0..num_heads {
+            for t in 0..seq_len {
+                let pos = pos_offset + t;
+                for pair in 0..(head_dim / 2) {
+                    let angle =
+                        pos as f32 / theta.powf(2.0 * pair as f32 / head_dim as f32);
+                    let cos_a = angle.cos();
+                    let sin_a = angle.sin();
+
+                    let idx0 = t * q_stride + h * head_dim + 2 * pair;
+                    let idx1 = idx0 + 1;
+
+                    let q0 = q[idx0];
+                    let q1 = q[idx1];
+                    q[idx0] = q0 * cos_a - q1 * sin_a;
+                    q[idx1] = q0 * sin_a + q1 * cos_a;
+                }
+            }
+        }
+
+        // Apply RoPE per K head
+        let k_stride = num_kv_heads * head_dim;
+        for h in 0..num_kv_heads {
+            for t in 0..seq_len {
+                let pos = pos_offset + t;
+                for pair in 0..(head_dim / 2) {
+                    let angle =
+                        pos as f32 / theta.powf(2.0 * pair as f32 / head_dim as f32);
+                    let cos_a = angle.cos();
+                    let sin_a = angle.sin();
+
+                    let idx0 = t * k_stride + h * head_dim + 2 * pair;
+                    let idx1 = idx0 + 1;
+
+                    let k0 = k[idx0];
+                    let k1 = k[idx1];
+                    k[idx0] = k0 * cos_a - k1 * sin_a;
+                    k[idx1] = k0 * sin_a + k1 * cos_a;
+                }
+            }
+        }
+    }
+
     /// Apply output projection: project attention output back to hidden_size.
     ///
     /// Input layout: [seq_len, num_heads * head_dim] (token-major, heads concatenated).
@@ -438,15 +498,29 @@ impl FlashAttentionLayer {
         assert_eq!(input.len(), seq_len * self.hidden_size);
 
         // 1. Project Q/K/V
-        let (q, k, v) = self.project_sequence(input, seq_len);
+        let (mut q, mut k, v) = self.project_sequence(input, seq_len);
 
-        // 2. Populate KV cache
+        // 2. Apply RoPE if configured
+        if let PositionEncoding::RoPE { theta } = self.pos_encoding {
+            Self::apply_rope(
+                &mut q,
+                &mut k,
+                seq_len,
+                self.head_dim,
+                self.num_heads,
+                self.num_kv_heads,
+                0, // prefill starts at position 0
+                theta,
+            );
+        }
+
+        // 3. Populate KV cache (after RoPE so cached K has position encoding)
         state.kv_cache.append(&k, &v);
 
-        // 3. Run flash attention
+        // 4. Run flash attention
         let attn_out = self.run_attention(&q, &k, &v, seq_len, seq_len);
 
-        // 4. Output projection (per-token: concat heads then project)
+        // 5. Output projection (per-token: concat heads then project)
         self.output_projection(&attn_out, seq_len)
     }
 
@@ -463,19 +537,34 @@ impl FlashAttentionLayer {
         assert_eq!(input.len(), self.hidden_size);
 
         // 1. Project Q/K/V
-        let (q, k_new, v_new) = self.project_token(input);
+        let (mut q, mut k_new, v_new) = self.project_token(input);
 
-        // 2. Append to KV cache
+        // 2. Apply RoPE if configured (position = current cached length)
+        if let PositionEncoding::RoPE { theta } = self.pos_encoding {
+            let pos_offset = state.kv_cache.len();
+            Self::apply_rope(
+                &mut q,
+                &mut k_new,
+                1, // single token
+                self.head_dim,
+                self.num_heads,
+                self.num_kv_heads,
+                pos_offset,
+                theta,
+            );
+        }
+
+        // 3. Append to KV cache (after RoPE so cached K has position encoding)
         state.kv_cache.append(&k_new, &v_new);
 
-        // 3. Run flash attention: Q=[1, head_dim], K/V=[cached_len, head_dim]
+        // 4. Run flash attention: Q=[1, head_dim], K/V=[cached_len, head_dim]
         let cached_len = state.kv_cache.len();
         let full_k = state.kv_cache.k_slice();
         let full_v = state.kv_cache.v_slice();
 
         let attn_out = self.run_attention(&q, full_k, full_v, 1, cached_len);
 
-        // 4. Output projection
+        // 5. Output projection
         self.output_projection(&attn_out, 1)
     }
 }

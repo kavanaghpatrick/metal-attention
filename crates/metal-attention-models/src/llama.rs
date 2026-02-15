@@ -240,6 +240,12 @@ impl LlamaLayer {
             pso.as_deref_mut(),
         )?;
 
+        // Extract RoPE theta from GGUF metadata (default 10000.0)
+        let theta = gguf_file
+            .metadata
+            .get_f32("llama.rope.freq_base")
+            .unwrap_or(10000.0);
+
         // Build FlashAttentionLayer with loaded weights
         let attention = FlashAttentionLayer {
             hidden_size: config.hidden_size,
@@ -251,7 +257,7 @@ impl LlamaLayer {
             w_k,
             w_v,
             w_o,
-            pos_encoding: PositionEncoding::None,
+            pos_encoding: PositionEncoding::RoPE { theta },
         };
 
         Ok(Self {
