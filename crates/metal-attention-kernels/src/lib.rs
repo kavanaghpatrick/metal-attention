@@ -15,6 +15,7 @@ pub mod linear;
 pub mod matmul;
 pub mod norm;
 pub mod pipeline;
+pub mod rwkv;
 pub mod types;
 
 // Re-export primary types for convenience
@@ -30,4 +31,5 @@ pub use linear::dispatch_linear_attention;
 pub use matmul::dispatch_matmul;
 pub use norm::dispatch_rmsnorm;
 pub use pipeline::{ConstantType, ConstantValue, PsoCache, PsoKey};
+pub use rwkv::{cpu_rwkv_wkv, dispatch_rwkv_wkv};
 pub use types::{AttentionParams, LayerParams, SSMParams};
