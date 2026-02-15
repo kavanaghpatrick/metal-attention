@@ -122,8 +122,7 @@ fn cpu_rope(q: &mut [f32], k: &mut [f32], seq_len: usize, head_dim: usize) {
     let theta_base: f32 = 10000.0;
     for token in 0..seq_len {
         for pair in 0..(head_dim / 2) {
-            let angle =
-                token as f32 / theta_base.powf(2.0 * pair as f32 / head_dim as f32);
+            let angle = token as f32 / theta_base.powf(2.0 * pair as f32 / head_dim as f32);
             let cos_a = angle.cos();
             let sin_a = angle.sin();
 

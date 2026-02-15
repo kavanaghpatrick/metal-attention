@@ -160,10 +160,7 @@ impl ZambaModel {
                 // 2. Residual connection
                 add(input, &ssm_out)
             }
-            (
-                ZambaLayer::Attention { attn_index },
-                ZambaLayerState::Attention(attn_state),
-            ) => {
+            (ZambaLayer::Attention { attn_index }, ZambaLayerState::Attention(attn_state)) => {
                 // 1. Apply LoRA projector to specialize input for this position
                 let lora_input = self.lora_projectors[*attn_index].forward(input);
 
@@ -241,9 +238,7 @@ pub fn build_zamba_model(
                 layers.push(ZambaLayer::Mamba(block));
             }
             LayerType::Attention => {
-                layers.push(ZambaLayer::Attention {
-                    attn_index,
-                });
+                layers.push(ZambaLayer::Attention { attn_index });
                 attn_index += 1;
             }
         }
@@ -334,7 +329,14 @@ mod tests {
         let lora_rank = 4;
 
         let model = build_zamba_model(
-            hidden_size, head_dim, num_heads, num_kv_heads, num_layers, d_state, lora_rank, 42,
+            hidden_size,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+            num_layers,
+            d_state,
+            lora_rank,
+            42,
         );
 
         assert_eq!(model.layers.len(), num_layers);
@@ -387,7 +389,14 @@ mod tests {
         let lora_rank = 4;
 
         let model = build_zamba_model(
-            hidden_size, head_dim, num_heads, num_kv_heads, num_layers, d_state, lora_rank, 42,
+            hidden_size,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+            num_layers,
+            d_state,
+            lora_rank,
+            42,
         );
 
         // The shared_attention field is a single LlamaLayer -- all attention positions
@@ -456,7 +465,14 @@ mod tests {
         let lora_rank = 4;
 
         let model = build_zamba_model(
-            hidden_size, head_dim, num_heads, num_kv_heads, num_layers, d_state, lora_rank, 42,
+            hidden_size,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+            num_layers,
+            d_state,
+            lora_rank,
+            42,
         );
 
         let config = make_config(hidden_size, head_dim, num_heads, num_kv_heads);
@@ -475,7 +491,8 @@ mod tests {
             assert!(
                 val.is_finite(),
                 "Mamba layer output[{}] not finite: {}",
-                i, val
+                i,
+                val
             );
         }
     }
@@ -492,7 +509,14 @@ mod tests {
         let lora_rank = 4;
 
         let model = build_zamba_model(
-            hidden_size, head_dim, num_heads, num_kv_heads, num_layers, d_state, lora_rank, 42,
+            hidden_size,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+            num_layers,
+            d_state,
+            lora_rank,
+            42,
         );
 
         let config = make_config(hidden_size, head_dim, num_heads, num_kv_heads);
@@ -507,11 +531,7 @@ mod tests {
 
         assert_eq!(output.len(), hidden_size);
         for (i, &val) in output.iter().enumerate() {
-            assert!(
-                val.is_finite(),
-                "Final output[{}] not finite: {}",
-                i, val
-            );
+            assert!(val.is_finite(), "Final output[{}] not finite: {}", i, val);
         }
 
         // Verify the schedule was correct

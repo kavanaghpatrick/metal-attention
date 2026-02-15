@@ -38,13 +38,7 @@ const GQA_ATOL: f64 = 1e-6;
 ///
 /// All intermediate values use FP64 for maximum precision.
 /// The final output is truncated to FP32.
-fn cpu_attention_f64(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    seq_len: usize,
-    head_dim: usize,
-) -> Vec<f32> {
+fn cpu_attention_f64(q: &[f32], k: &[f32], v: &[f32], seq_len: usize, head_dim: usize) -> Vec<f32> {
     assert_eq!(q.len(), seq_len * head_dim, "Q length mismatch");
     assert_eq!(k.len(), seq_len * head_dim, "K length mismatch");
     assert_eq!(v.len(), seq_len * head_dim, "V length mismatch");
@@ -190,9 +184,7 @@ fn assert_allclose(gpu: &[f32], cpu: &[f32], atol: f32, rtol: f32, context: &str
         );
     }
 
-    eprintln!(
-        "{context}: PASS (max_abs={max_abs_err:.2e}, max_rel={max_rel_err:.2e})"
-    );
+    eprintln!("{context}: PASS (max_abs={max_abs_err:.2e}, max_rel={max_rel_err:.2e})");
 }
 
 /// Generate deterministic test data using simple trig formula.
@@ -231,13 +223,7 @@ fn test_flash_attention_gpu_vs_cpu_small() {
         num_heads,
     );
 
-    assert_allclose(
-        &gpu_out,
-        &cpu_out,
-        5e-3,
-        1e-2,
-        "flash_attention N=64 D=64",
-    );
+    assert_allclose(&gpu_out, &cpu_out, 5e-3, 1e-2, "flash_attention N=64 D=64");
 }
 
 #[test]
@@ -265,13 +251,7 @@ fn test_flash_attention_gpu_vs_cpu_medium() {
         num_heads,
     );
 
-    assert_allclose(
-        &gpu_out,
-        &cpu_out,
-        5e-3,
-        1e-2,
-        "flash_attention N=256 D=64",
-    );
+    assert_allclose(&gpu_out, &cpu_out, 5e-3, 1e-2, "flash_attention N=256 D=64");
 }
 
 #[test]
@@ -403,7 +383,13 @@ fn test_assert_allclose_fails() {
 ///
 /// output[i] = (input[i] / rms) * weight[i]
 /// where rms = sqrt(mean(input^2) + eps)
-fn cpu_rmsnorm(input: &[f32], weight: &[f32], num_tokens: usize, hidden_dim: usize, eps: f32) -> Vec<f32> {
+fn cpu_rmsnorm(
+    input: &[f32],
+    weight: &[f32],
+    num_tokens: usize,
+    hidden_dim: usize,
+    eps: f32,
+) -> Vec<f32> {
     let mut output = vec![0.0f32; num_tokens * hidden_dim];
     for t in 0..num_tokens {
         let offset = t * hidden_dim;
@@ -488,13 +474,23 @@ fn test_rmsnorm_gpu_vs_cpu() {
     let eps = 1e-5f32;
 
     let input = gen_data(num_tokens * hidden_dim, 0.0);
-    let weight: Vec<f32> = (0..hidden_dim).map(|i| 0.5 + (i as f32 * 0.01).sin() * 0.3).collect();
+    let weight: Vec<f32> = (0..hidden_dim)
+        .map(|i| 0.5 + (i as f32 * 0.01).sin() * 0.3)
+        .collect();
 
     let cpu_out = cpu_rmsnorm(&input, &weight, num_tokens, hidden_dim, eps);
 
     let device = GpuDevice::new();
     let mut pso_cache = PsoCache::new(device.library.clone());
-    let gpu_out = dispatch_rmsnorm(&device, &mut pso_cache, &input, &weight, num_tokens, hidden_dim, eps);
+    let gpu_out = dispatch_rmsnorm(
+        &device,
+        &mut pso_cache,
+        &input,
+        &weight,
+        num_tokens,
+        hidden_dim,
+        eps,
+    );
 
     assert_allclose(&gpu_out, &cpu_out, 1e-4, 1e-3, "rmsnorm 4x64");
 }
@@ -512,7 +508,15 @@ fn test_rmsnorm_gpu_vs_cpu_single_token() {
 
     let device = GpuDevice::new();
     let mut pso_cache = PsoCache::new(device.library.clone());
-    let gpu_out = dispatch_rmsnorm(&device, &mut pso_cache, &input, &weight, num_tokens, hidden_dim, eps);
+    let gpu_out = dispatch_rmsnorm(
+        &device,
+        &mut pso_cache,
+        &input,
+        &weight,
+        num_tokens,
+        hidden_dim,
+        eps,
+    );
 
     // RMS of all-1s vector with dim=16 is sqrt(1 + eps) ~= 1.0
     // So output should be ~2.0 for each element
@@ -536,7 +540,14 @@ fn test_ffn_silu_gpu_vs_cpu() {
 
     let device = GpuDevice::new();
     let mut pso_cache = PsoCache::new(device.library.clone());
-    let gpu_out = dispatch_ffn_silu(&device, &mut pso_cache, &gate, &up, num_tokens, intermediate_dim);
+    let gpu_out = dispatch_ffn_silu(
+        &device,
+        &mut pso_cache,
+        &gate,
+        &up,
+        num_tokens,
+        intermediate_dim,
+    );
 
     assert_allclose(&gpu_out, &cpu_out, 1e-5, 1e-4, "ffn_silu 4x64");
 }
@@ -553,7 +564,14 @@ fn test_ffn_silu_zeros() {
 
     let device = GpuDevice::new();
     let mut pso_cache = PsoCache::new(device.library.clone());
-    let gpu_out = dispatch_ffn_silu(&device, &mut pso_cache, &gate, &up, num_tokens, intermediate_dim);
+    let gpu_out = dispatch_ffn_silu(
+        &device,
+        &mut pso_cache,
+        &gate,
+        &up,
+        num_tokens,
+        intermediate_dim,
+    );
 
     // silu(0) * 1.0 = 0.0
     assert_allclose(&gpu_out, &cpu_out, 1e-6, 1e-5, "ffn_silu zeros");
@@ -605,16 +623,16 @@ fn test_embedding_lookup_single_token() {
 
     let device = GpuDevice::new();
     let mut pso_cache = PsoCache::new(device.library.clone());
-    let gpu_out = dispatch_embedding_lookup(
-        &device,
-        &mut pso_cache,
-        &table,
-        &token_ids,
-        1,
-        hidden_dim,
-    );
+    let gpu_out =
+        dispatch_embedding_lookup(&device, &mut pso_cache, &table, &token_ids, 1, hidden_dim);
 
-    assert_allclose(&gpu_out, &cpu_out, 1e-6, 1e-5, "embedding_lookup single token");
+    assert_allclose(
+        &gpu_out,
+        &cpu_out,
+        1e-6,
+        1e-5,
+        "embedding_lookup single token",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -649,7 +667,9 @@ fn test_matmul_identity() {
         a[i * n + i] = 1.0;
     }
     // B = arbitrary
-    let b = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0];
+    let b = vec![
+        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+    ];
 
     let cpu_out = cpu_matmul(&a, &b, n, n, n);
     // I * B = B
@@ -706,15 +726,15 @@ fn test_dequantize_q4_0_gpu_vs_cpu() {
     // Create 2 blocks of Q4_0 data
     let scale1 = 0.5f32;
     let vals1: [i8; 32] = [
-        -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7,
-        -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7,
+        -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1, 0,
+        1, 2, 3, 4, 5, 6, 7,
     ];
     let block1 = pack_q4_0_block(scale1, &vals1);
 
     let scale2 = 1.0f32;
     let vals2: [i8; 32] = [
-        0, 0, 0, 0, 1, 1, 1, 1, -1, -1, -1, -1, 7, 7, 7, 7,
-        -8, -8, -8, -8, 3, 3, 3, 3, -5, -5, -5, -5, 2, 2, 2, 2,
+        0, 0, 0, 0, 1, 1, 1, 1, -1, -1, -1, -1, 7, 7, 7, 7, -8, -8, -8, -8, 3, 3, 3, 3, -5, -5, -5,
+        -5, 2, 2, 2, 2,
     ];
     let block2 = pack_q4_0_block(scale2, &vals2);
 
@@ -736,15 +756,18 @@ fn test_dequantize_q4_0_gpu_vs_cpu() {
 fn test_dequantize_q4_0_zero_scale() {
     // Zero scale should produce all zeros
     let vals: [i8; 32] = [
-        -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7,
-        -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7,
+        -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1, 0,
+        1, 2, 3, 4, 5, 6, 7,
     ];
     let block = pack_q4_0_block(0.0, &vals);
     let input = block.to_vec();
 
     let cpu_out = cpu_dequantize_q4_0(&input, 1);
     // All should be 0.0 since scale is 0
-    assert!(cpu_out.iter().all(|&v| v == 0.0), "CPU: zero scale should give zeros");
+    assert!(
+        cpu_out.iter().all(|&v| v == 0.0),
+        "CPU: zero scale should give zeros"
+    );
 
     let device = GpuDevice::new();
     let mut pso_cache = PsoCache::new(device.library.clone());
@@ -794,15 +817,15 @@ fn test_dequantize_q8_0_gpu_vs_cpu() {
     // Create 2 blocks of Q8_0 data
     let scale1 = 0.25f32;
     let vals1: [i8; 32] = [
-        -128, -100, -80, -60, -40, -20, -10, -5, -1, 0, 1, 5, 10, 20, 40, 60,
-        80, 100, 127, -127, -64, -32, -16, -8, -4, -2, 2, 4, 8, 16, 32, 64,
+        -128, -100, -80, -60, -40, -20, -10, -5, -1, 0, 1, 5, 10, 20, 40, 60, 80, 100, 127, -127,
+        -64, -32, -16, -8, -4, -2, 2, 4, 8, 16, 32, 64,
     ];
     let block1 = pack_q8_0_block(scale1, &vals1);
 
     let scale2 = 1.0f32;
     let vals2: [i8; 32] = [
-        0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8,
-        -8, 16, -16, 32, -32, 64, -64, 127, -127, -128, 100, -100, 50, -50, 25, -25,
+        0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8, -8, 16, -16, 32, -32, 64, -64, 127,
+        -127, -128, 100, -100, 50, -50, 25, -25,
     ];
     let block2 = pack_q8_0_block(scale2, &vals2);
 
@@ -824,14 +847,17 @@ fn test_dequantize_q8_0_gpu_vs_cpu() {
 fn test_dequantize_q8_0_zero_scale() {
     // Zero scale should produce all zeros
     let vals: [i8; 32] = [
-        -128, -100, -80, -60, -40, -20, -10, -5, -1, 0, 1, 5, 10, 20, 40, 60,
-        80, 100, 127, -127, -64, -32, -16, -8, -4, -2, 2, 4, 8, 16, 32, 64,
+        -128, -100, -80, -60, -40, -20, -10, -5, -1, 0, 1, 5, 10, 20, 40, 60, 80, 100, 127, -127,
+        -64, -32, -16, -8, -4, -2, 2, 4, 8, 16, 32, 64,
     ];
     let block = pack_q8_0_block(0.0, &vals);
     let input = block.to_vec();
 
     let cpu_out = cpu_dequantize_q8_0(&input, 1);
-    assert!(cpu_out.iter().all(|&v| v == 0.0), "CPU: zero scale should give zeros");
+    assert!(
+        cpu_out.iter().all(|&v| v == 0.0),
+        "CPU: zero scale should give zeros"
+    );
 
     let device = GpuDevice::new();
     let mut pso_cache = PsoCache::new(device.library.clone());
@@ -1142,13 +1168,7 @@ fn test_matmul_identity_sweep() {
     let mut pso_cache = PsoCache::new(device.library.clone());
     let gpu_out = dispatch_matmul(&device, &mut pso_cache, &a, &identity, n, n, n);
 
-    assert_allclose(
-        &gpu_out,
-        &a,
-        1e-5,
-        1e-4,
-        "matmul A*I=A sweep",
-    );
+    assert_allclose(&gpu_out, &a, 1e-5, 1e-4, "matmul A*I=A sweep");
 }
 
 // ===========================================================================
@@ -1179,7 +1199,11 @@ fn test_flash_attention_output_finiteness() {
         num_heads,
     );
 
-    assert_eq!(gpu_out.len(), seq_len * head_dim, "output dimension mismatch");
+    assert_eq!(
+        gpu_out.len(),
+        seq_len * head_dim,
+        "output dimension mismatch"
+    );
     for (i, &val) in gpu_out.iter().enumerate() {
         assert!(
             val.is_finite(),
@@ -1212,7 +1236,11 @@ fn test_linear_attention_output_finiteness() {
         chunk_size,
     );
 
-    assert_eq!(gpu_out.len(), seq_len * head_dim, "output dimension mismatch");
+    assert_eq!(
+        gpu_out.len(),
+        seq_len * head_dim,
+        "output dimension mismatch"
+    );
     for (i, &val) in gpu_out.iter().enumerate() {
         assert!(
             val.is_finite(),
@@ -1227,7 +1255,10 @@ fn test_tolerance_constants_consistency() {
     // Flash attention: 5e-3 absolute tolerance
     assert!((FLASH_ATOL - 5e-3).abs() < 1e-10, "FLASH_ATOL must be 5e-3");
     // Linear attention: 1e-3 absolute tolerance
-    assert!((LINEAR_ATOL - 1e-3).abs() < 1e-10, "LINEAR_ATOL must be 1e-3");
+    assert!(
+        (LINEAR_ATOL - 1e-3).abs() < 1e-10,
+        "LINEAR_ATOL must be 1e-3"
+    );
     // RoPE: 1e-4 absolute tolerance
     assert!((ROPE_ATOL - 1e-4).abs() < 1e-10, "ROPE_ATOL must be 1e-4");
     // GQA: 1e-6 absolute tolerance
@@ -1235,5 +1266,8 @@ fn test_tolerance_constants_consistency() {
     // Verify ordering: tightest to loosest
     assert!(GQA_ATOL < ROPE_ATOL, "GQA must be tighter than RoPE");
     assert!(ROPE_ATOL < LINEAR_ATOL, "RoPE must be tighter than Linear");
-    assert!(LINEAR_ATOL < FLASH_ATOL, "Linear must be tighter than Flash");
+    assert!(
+        LINEAR_ATOL < FLASH_ATOL,
+        "Linear must be tighter than Flash"
+    );
 }

@@ -35,7 +35,11 @@ pub fn dispatch_rmsnorm(
     hidden_dim: usize,
     eps: f32,
 ) -> Vec<f32> {
-    assert_eq!(input.len(), num_tokens * hidden_dim, "input length mismatch");
+    assert_eq!(
+        input.len(),
+        num_tokens * hidden_dim,
+        "input length mismatch"
+    );
     assert_eq!(weight.len(), hidden_dim, "weight length mismatch");
 
     let total_elements = num_tokens * hidden_dim;

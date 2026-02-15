@@ -74,10 +74,7 @@ pub fn dispatch_linear_attention(
 
     // H_deltas buffer: [num_chunks, head_dim, head_dim]
     let h_deltas_size = num_chunks * head_dim * head_dim;
-    let h_deltas_buf = alloc_buffer(
-        &device.device,
-        h_deltas_size * std::mem::size_of::<f32>(),
-    );
+    let h_deltas_buf = alloc_buffer(&device.device, h_deltas_size * std::mem::size_of::<f32>());
 
     // ====================================================================
     // Pass 1: chunk_h kernel - compute delta_H per chunk

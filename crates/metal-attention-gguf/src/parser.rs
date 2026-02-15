@@ -543,7 +543,10 @@ mod tests {
 
         let file = GgufFile::from_bytes(data).expect("parse failed");
         assert_eq!(file.version, 3);
-        assert_eq!(file.metadata.get_string("general.architecture"), Some("llama"));
+        assert_eq!(
+            file.metadata.get_string("general.architecture"),
+            Some("llama")
+        );
         assert_eq!(file.tensors.len(), 1);
         assert_eq!(file.tensors[0].name, "token_embd.weight");
         assert_eq!(file.tensors[0].shape, vec![32, 4096]);
@@ -677,6 +680,10 @@ mod tests {
             .build();
 
         let file = GgufFile::from_bytes(data).expect("parse failed");
-        assert_eq!(file.data_offset % 32, 0, "data_offset must be 32-byte aligned");
+        assert_eq!(
+            file.data_offset % 32,
+            0,
+            "data_offset must be 32-byte aligned"
+        );
     }
 }

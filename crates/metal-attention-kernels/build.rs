@@ -54,9 +54,7 @@ fn main() {
             stub_air.to_str().unwrap(),
         ]);
 
-        let status = cmd
-            .status()
-            .expect("Failed to run xcrun metal compiler");
+        let status = cmd.status().expect("Failed to run xcrun metal compiler");
 
         if !status.success() {
             panic!("Metal stub shader compilation failed");
@@ -83,10 +81,7 @@ fn main() {
             "cargo:warning=Built shaders.metallib (stub) at {}",
             metallib_path.display()
         );
-        println!(
-            "cargo:rustc-env=METALLIB_PATH={}",
-            metallib_path.display()
-        );
+        println!("cargo:rustc-env=METALLIB_PATH={}", metallib_path.display());
         // Re-run if any .metal file is added or types.h changes
         println!("cargo:rerun-if-changed=shaders/");
         return;
@@ -123,9 +118,7 @@ fn main() {
             air_file.to_str().unwrap(),
         ]);
 
-        let output = cmd
-            .output()
-            .expect("Failed to run xcrun metal compiler");
+        let output = cmd.output().expect("Failed to run xcrun metal compiler");
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -162,10 +155,7 @@ fn main() {
     }
 
     // Export METALLIB_PATH so Rust code can find the compiled library
-    println!(
-        "cargo:rustc-env=METALLIB_PATH={}",
-        metallib_path.display()
-    );
+    println!("cargo:rustc-env=METALLIB_PATH={}", metallib_path.display());
 
     println!(
         "cargo:warning=Built shaders.metallib at {}",

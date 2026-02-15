@@ -30,10 +30,7 @@ pub enum JambaLayerState {
 /// Mamba layers use MambaBlock for the sequence mixing, plus a simplified MoE FFN.
 pub enum JambaLayer {
     /// Mamba SSM block + MoE FFN.
-    Mamba {
-        block: MambaBlock,
-        moe: MoEFFN,
-    },
+    Mamba { block: MambaBlock, moe: MoEFFN },
     /// FlashAttention block (includes SwiGLU FFN from LlamaLayer).
     Attention(LlamaLayer),
 }
@@ -42,9 +39,7 @@ impl JambaLayer {
     /// Initialize state for this layer.
     pub fn init_state(&self, config: &BlockConfig) -> JambaLayerState {
         match self {
-            JambaLayer::Mamba { block, .. } => {
-                JambaLayerState::Mamba(block.init_state(config))
-            }
+            JambaLayer::Mamba { block, .. } => JambaLayerState::Mamba(block.init_state(config)),
             JambaLayer::Attention(llama) => {
                 JambaLayerState::Attention(llama.attention.init_state(config))
             }
@@ -302,13 +297,8 @@ pub fn build_jamba_layers(
                 layers.push(JambaLayer::Mamba { block, moe });
             }
             LayerType::Attention => {
-                let llama = LlamaLayer::random(
-                    hidden_size,
-                    head_dim,
-                    num_heads,
-                    num_kv_heads,
-                    layer_seed,
-                );
+                let llama =
+                    LlamaLayer::random(hidden_size, head_dim, num_heads, num_kv_heads, layer_seed);
                 layers.push(JambaLayer::Attention(llama));
             }
         }
@@ -350,7 +340,12 @@ mod tests {
     use super::*;
     use metal_attention_traits::schedule::LayerType;
 
-    fn make_config(hidden_size: usize, head_dim: usize, num_heads: usize, num_kv_heads: usize) -> BlockConfig {
+    fn make_config(
+        hidden_size: usize,
+        head_dim: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+    ) -> BlockConfig {
         BlockConfig {
             hidden_size,
             head_dim,
@@ -371,8 +366,14 @@ mod tests {
         let num_experts = 16;
 
         let (layers, schedule) = build_jamba_layers(
-            hidden_size, head_dim, num_heads, num_kv_heads,
-            num_layers, d_state, num_experts, 42,
+            hidden_size,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+            num_layers,
+            d_state,
+            num_experts,
+            42,
         );
 
         assert_eq!(layers.len(), num_layers);
@@ -426,7 +427,12 @@ mod tests {
         let output = layer.process_token(&input, &mut state);
         assert_eq!(output.len(), hidden_size);
         for (i, &val) in output.iter().enumerate() {
-            assert!(val.is_finite(), "Mamba layer output[{}] not finite: {}", i, val);
+            assert!(
+                val.is_finite(),
+                "Mamba layer output[{}] not finite: {}",
+                i,
+                val
+            );
         }
     }
 
@@ -451,7 +457,12 @@ mod tests {
         let output = layer.process_token(&input, &mut state);
         assert_eq!(output.len(), hidden_size);
         for (i, &val) in output.iter().enumerate() {
-            assert!(val.is_finite(), "Attention layer output[{}] not finite: {}", i, val);
+            assert!(
+                val.is_finite(),
+                "Attention layer output[{}] not finite: {}",
+                i,
+                val
+            );
         }
     }
 
@@ -467,15 +478,19 @@ mod tests {
         let num_experts = 4;
 
         let (layers, schedule) = build_jamba_layers(
-            hidden_size, head_dim, num_heads, num_kv_heads,
-            num_layers, d_state, num_experts, 42,
+            hidden_size,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+            num_layers,
+            d_state,
+            num_experts,
+            42,
         );
 
         let config = make_config(hidden_size, head_dim, num_heads, num_kv_heads);
-        let mut states: Vec<JambaLayerState> = layers
-            .iter()
-            .map(|l| l.init_state(&config))
-            .collect();
+        let mut states: Vec<JambaLayerState> =
+            layers.iter().map(|l| l.init_state(&config)).collect();
 
         let mut rng = SimpleRng::new(300);
         let input: Vec<f32> = (0..hidden_size)
@@ -485,12 +500,19 @@ mod tests {
         let mut hidden = input;
         for (i, layer) in layers.iter().enumerate() {
             hidden = layer.process_token(&hidden, &mut states[i]);
-            assert_eq!(hidden.len(), hidden_size, "Layer {} output size mismatch", i);
+            assert_eq!(
+                hidden.len(),
+                hidden_size,
+                "Layer {} output size mismatch",
+                i
+            );
             for (j, &val) in hidden.iter().enumerate() {
                 assert!(
                     val.is_finite(),
                     "Layer {} output[{}] not finite: {}",
-                    i, j, val
+                    i,
+                    j,
+                    val
                 );
             }
         }
@@ -526,7 +548,10 @@ mod tests {
         let (top1, top2, w1, w2) = top2_gating(&logits);
 
         assert_eq!(top1, 1, "Top-1 should be index 1 (highest logit 3.0)");
-        assert_eq!(top2, 3, "Top-2 should be index 3 (second highest logit 2.0)");
+        assert_eq!(
+            top2, 3,
+            "Top-2 should be index 3 (second highest logit 2.0)"
+        );
         assert!(
             (w1 + w2 - 1.0).abs() < 1e-6,
             "Gating weights should sum to 1.0, got {}",

@@ -62,12 +62,18 @@ impl LayerSchedule {
 
     /// Count of linear layers.
     pub fn linear_count(&self) -> usize {
-        self.types.iter().filter(|t| **t == LayerType::Linear).count()
+        self.types
+            .iter()
+            .filter(|t| **t == LayerType::Linear)
+            .count()
     }
 
     /// Count of attention layers.
     pub fn attention_count(&self) -> usize {
-        self.types.iter().filter(|t| **t == LayerType::Attention).count()
+        self.types
+            .iter()
+            .filter(|t| **t == LayerType::Attention)
+            .count()
     }
 
     /// Get the layer type at a given index.

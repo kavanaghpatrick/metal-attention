@@ -152,7 +152,11 @@ impl MambaBlock {
         let gate: Vec<f32> = gate_proj.iter().map(|&g| Self::silu(g)).collect();
 
         // 3. Apply gate element-wise
-        let x_gated: Vec<f32> = x_proj.iter().zip(gate.iter()).map(|(&x, &g)| x * g).collect();
+        let x_gated: Vec<f32> = x_proj
+            .iter()
+            .zip(gate.iter())
+            .map(|(&x, &g)| x * g)
+            .collect();
 
         // 4. Compute input-dependent SSM parameters
         // A = sigmoid(a_log) for decay in (0, 1)
@@ -325,7 +329,11 @@ mod tests {
             let output = block.process_token(&input, &mut state);
 
             // Verify output shape
-            assert_eq!(output.len(), hidden_size, "Output should have hidden_size elements");
+            assert_eq!(
+                output.len(),
+                hidden_size,
+                "Output should have hidden_size elements"
+            );
 
             // Verify no NaN values
             for (i, &val) in output.iter().enumerate() {
@@ -340,7 +348,10 @@ mod tests {
 
         // Verify state was updated (non-zero)
         let state_nonzero = state.ssm_state.iter().any(|&x| x != 0.0);
-        assert!(state_nonzero, "SSM state should be non-zero after processing tokens");
+        assert!(
+            state_nonzero,
+            "SSM state should be non-zero after processing tokens"
+        );
     }
 
     #[test]

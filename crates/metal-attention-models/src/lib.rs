@@ -18,6 +18,9 @@ pub use griffin::{build_griffin_layers, GriffinLayer, GriffinLayerState, RgLruBl
 pub use jamba::{build_jamba_layers, JambaLayer, JambaLayerState, MoEFFN};
 pub use llama::{LlamaLayer, LlamaState};
 pub use mamba::{MambaBlock, MambaState};
-pub use registry::{create_griffin_layers, create_jamba_layers, create_llama_layer, create_mamba_block, create_rwkv7_block, create_zamba_model, is_supported, supported_architectures, ModelConfig};
+pub use registry::{
+    create_griffin_layers, create_jamba_layers, create_llama_layer, create_mamba_block,
+    create_rwkv7_block, create_zamba_model, is_supported, supported_architectures, ModelConfig,
+};
 pub use rwkv7::{Rwkv7Block, Rwkv7State};
 pub use zamba::{build_zamba_model, LoraProjector, ZambaLayer, ZambaLayerState, ZambaModel};

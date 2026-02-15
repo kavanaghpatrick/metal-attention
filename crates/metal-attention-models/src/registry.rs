@@ -88,9 +88,9 @@ pub fn create_jamba_layers(config: &ModelConfig) -> Option<Vec<JambaLayer>> {
         config.num_heads,
         config.num_kv_heads,
         config.num_layers,
-        16,  // d_state
-        16,  // num_experts
-        42,  // seed
+        16, // d_state
+        16, // num_experts
+        42, // seed
     );
 
     Some(layers)
@@ -111,7 +111,7 @@ pub fn create_griffin_layers(config: &ModelConfig) -> Option<Vec<GriffinLayer>> 
         config.num_heads,
         config.num_kv_heads,
         config.num_layers,
-        42,  // seed
+        42, // seed
     );
 
     Some(layers)
@@ -132,9 +132,9 @@ pub fn create_zamba_model(config: &ModelConfig) -> Option<ZambaModel> {
         config.num_heads,
         config.num_kv_heads,
         config.num_layers,
-        16,  // d_state
-        8,   // lora_rank
-        42,  // seed
+        16, // d_state
+        8,  // lora_rank
+        42, // seed
     );
 
     Some(model)
@@ -199,7 +199,10 @@ mod tests {
         };
 
         let block = create_rwkv7_block(&config, 0);
-        assert!(block.is_none(), "Should not create RWKV-7 block for Llama arch");
+        assert!(
+            block.is_none(),
+            "Should not create RWKV-7 block for Llama arch"
+        );
     }
 
     #[test]
@@ -233,7 +236,10 @@ mod tests {
         };
 
         let layer = create_llama_layer(&config, 0);
-        assert!(layer.is_none(), "Should not create Llama layer for Rwkv arch");
+        assert!(
+            layer.is_none(),
+            "Should not create Llama layer for Rwkv arch"
+        );
     }
 
     #[test]
@@ -248,7 +254,10 @@ mod tests {
         };
 
         let layers = create_griffin_layers(&config);
-        assert!(layers.is_some(), "Should create Griffin layers for Griffin arch");
+        assert!(
+            layers.is_some(),
+            "Should create Griffin layers for Griffin arch"
+        );
 
         let layers = layers.unwrap();
         assert_eq!(layers.len(), 6);
@@ -272,7 +281,10 @@ mod tests {
         };
 
         let layers = create_griffin_layers(&config);
-        assert!(layers.is_none(), "Should not create Griffin layers for Llama arch");
+        assert!(
+            layers.is_none(),
+            "Should not create Griffin layers for Llama arch"
+        );
     }
 
     #[test]
@@ -311,7 +323,10 @@ mod tests {
         };
 
         let model = create_zamba_model(&config);
-        assert!(model.is_none(), "Should not create Zamba model for Jamba arch");
+        assert!(
+            model.is_none(),
+            "Should not create Zamba model for Jamba arch"
+        );
     }
 
     #[test]

@@ -168,7 +168,9 @@ impl LlamaLayer {
         let normed = Self::rmsnorm(input, &self.attn_norm_weight);
 
         // 2. Attention
-        let attn_out = self.attention.process_decode(&normed, &mut state.attn_state);
+        let attn_out = self
+            .attention
+            .process_decode(&normed, &mut state.attn_state);
 
         // 3. Residual connection
         let hidden = Self::add(input, &attn_out);
@@ -345,7 +347,8 @@ mod tests {
             assert!(
                 val.is_finite(),
                 "Output element {} is not finite: {}",
-                i, val
+                i,
+                val
             );
         }
     }
@@ -378,7 +381,8 @@ mod tests {
             assert!(
                 val.is_finite(),
                 "Output element {} is not finite: {}",
-                i, val
+                i,
+                val
             );
         }
     }
@@ -441,7 +445,11 @@ mod tests {
             .collect();
 
         let output = layer.ffn_forward(&input);
-        assert_eq!(output.len(), hidden_size, "FFN output should be [hidden_size]");
+        assert_eq!(
+            output.len(),
+            hidden_size,
+            "FFN output should be [hidden_size]"
+        );
         for (i, &val) in output.iter().enumerate() {
             assert!(val.is_finite(), "FFN output[{}] not finite: {}", i, val);
         }
@@ -486,7 +494,10 @@ mod tests {
 
         // Output should not be all zeros (residual preserves input)
         let has_nonzero = output.iter().any(|&v| v.abs() > 1e-10);
-        assert!(has_nonzero, "Output should not be all zeros due to residual connections");
+        assert!(
+            has_nonzero,
+            "Output should not be all zeros due to residual connections"
+        );
 
         // Output should differ from input (attention + FFN changed it)
         let differs = input

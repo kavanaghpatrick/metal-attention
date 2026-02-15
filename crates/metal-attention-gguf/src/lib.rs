@@ -12,7 +12,7 @@ pub mod tensor;
 pub mod tokenizer;
 
 // Re-exports for convenience
-pub use architectures::{ModelArchitecture, WeightRole, map_tensor_name};
+pub use architectures::{map_tensor_name, ModelArchitecture, WeightRole};
 pub use detect::detect_architecture;
 pub use metadata::{GgufMetadata, GgufMetadataValue};
 pub use parser::{GgufBuilder, GgufError, GgufFile};

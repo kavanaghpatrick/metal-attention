@@ -29,7 +29,12 @@ impl TensorView {
     }
 
     /// Create a new TensorView with explicit offset, shape, strides, and dtype.
-    pub fn with_offset(offset: usize, shape: Vec<usize>, strides: Vec<usize>, dtype: DType) -> Self {
+    pub fn with_offset(
+        offset: usize,
+        shape: Vec<usize>,
+        strides: Vec<usize>,
+        dtype: DType,
+    ) -> Self {
         Self {
             offset,
             shape,

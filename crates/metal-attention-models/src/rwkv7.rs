@@ -76,11 +76,21 @@ impl Rwkv7Block {
 
         // Projection weights: small random values for stability
         let scale = 1.0 / (hs as f32).sqrt();
-        let w_r = (0..hs * hs).map(|_| rng.next_f32_range(-scale, scale)).collect();
-        let w_k = (0..hs * hs).map(|_| rng.next_f32_range(-scale, scale)).collect();
-        let w_v = (0..hs * hs).map(|_| rng.next_f32_range(-scale, scale)).collect();
-        let w_w = (0..hs * hs).map(|_| rng.next_f32_range(-scale, scale)).collect();
-        let w_o = (0..hs * hs).map(|_| rng.next_f32_range(-scale, scale)).collect();
+        let w_r = (0..hs * hs)
+            .map(|_| rng.next_f32_range(-scale, scale))
+            .collect();
+        let w_k = (0..hs * hs)
+            .map(|_| rng.next_f32_range(-scale, scale))
+            .collect();
+        let w_v = (0..hs * hs)
+            .map(|_| rng.next_f32_range(-scale, scale))
+            .collect();
+        let w_w = (0..hs * hs)
+            .map(|_| rng.next_f32_range(-scale, scale))
+            .collect();
+        let w_o = (0..hs * hs)
+            .map(|_| rng.next_f32_range(-scale, scale))
+            .collect();
 
         Self {
             hidden_size: hs,
@@ -130,11 +140,7 @@ impl Rwkv7Block {
     /// Process a single token through the RWKV-7 block.
     ///
     /// Returns output vector.
-    pub fn process_token(
-        &self,
-        input: &[f32],
-        state: &mut Rwkv7State,
-    ) -> Vec<f32> {
+    pub fn process_token(&self, input: &[f32], state: &mut Rwkv7State) -> Vec<f32> {
         let hs = self.hidden_size;
         let hd = self.head_dim;
 
@@ -163,7 +169,17 @@ impl Rwkv7Block {
             // GPU path: single head
             let gpu = GpuDevice::new();
             let mut pso_cache = PsoCache::new(gpu.library.clone());
-            dispatch_rwkv_wkv(&gpu, &mut pso_cache, &r, &k, &v, &w, &state.wkv_state, 1, hd)
+            dispatch_rwkv_wkv(
+                &gpu,
+                &mut pso_cache,
+                &r,
+                &k,
+                &v,
+                &w,
+                &state.wkv_state,
+                1,
+                hd,
+            )
         } else {
             // CPU path or multi-head
             let mut wkv_state = state.wkv_state.clone();
@@ -254,7 +270,9 @@ struct SimpleRng {
 
 impl SimpleRng {
     fn new(seed: u64) -> Self {
-        Self { state: seed.wrapping_add(1) }
+        Self {
+            state: seed.wrapping_add(1),
+        }
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -310,8 +328,17 @@ mod tests {
         // GPU dispatch
         let gpu = GpuDevice::new();
         let mut pso_cache = PsoCache::new(gpu.library.clone());
-        let (gpu_output, gpu_state) =
-            dispatch_rwkv_wkv(&gpu, &mut pso_cache, &r, &k, &v, &w, &state, seq_len, head_dim);
+        let (gpu_output, gpu_state) = dispatch_rwkv_wkv(
+            &gpu,
+            &mut pso_cache,
+            &r,
+            &k,
+            &v,
+            &w,
+            &state,
+            seq_len,
+            head_dim,
+        );
 
         // Compare outputs
         assert_eq!(cpu_output.len(), gpu_output.len());
@@ -372,7 +399,11 @@ mod tests {
             let output = block.process_token(&input, &mut state);
 
             // Verify output shape
-            assert_eq!(output.len(), hidden_size, "Output should have hidden_size elements");
+            assert_eq!(
+                output.len(),
+                hidden_size,
+                "Output should have hidden_size elements"
+            );
 
             // Verify no NaN values
             for (i, &val) in output.iter().enumerate() {
@@ -387,7 +418,10 @@ mod tests {
 
         // Verify state was updated (non-zero)
         let state_nonzero = state.wkv_state.iter().any(|&x| x != 0.0);
-        assert!(state_nonzero, "WKV state should be non-zero after processing tokens");
+        assert!(
+            state_nonzero,
+            "WKV state should be non-zero after processing tokens"
+        );
     }
 
     /// Test: Rwkv7Block implements SequenceBlock and LinearSequenceModel traits.

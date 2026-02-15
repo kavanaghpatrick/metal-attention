@@ -7,8 +7,8 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 
 use metal_attention::config::InferenceConfig;
-use metal_attention::model::HybridModel;
 use metal_attention::generate_streaming;
+use metal_attention::model::HybridModel;
 
 use metal_attention_gguf::parser::{GgufError, GgufFile};
 use metal_attention_gguf::quantize::GgufType;
@@ -138,7 +138,15 @@ fn main() {
             json,
             seed,
         } => {
-            if let Err(e) = run_bench(model, &seq_lengths, gen_length, iterations, synthetic, json, seed) {
+            if let Err(e) = run_bench(
+                model,
+                &seq_lengths,
+                gen_length,
+                iterations,
+                synthetic,
+                json,
+                seed,
+            ) {
                 eprintln!("{e}");
                 process::exit(1);
             }
@@ -232,9 +240,7 @@ fn run_info(model_path: PathBuf, json_output: bool) -> Result<(), String> {
     let memory_mb = total_bytes as f64 / (1024.0 * 1024.0);
 
     // File size
-    let file_size = std::fs::metadata(&model_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let file_size = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
 
     if json_output {
         let json = format!(
@@ -305,11 +311,7 @@ fn detect_dominant_quant(gguf: &GgufFile) -> GgufType {
     if non_f32.is_empty() {
         GgufType::F32
     } else {
-        *non_f32
-            .iter()
-            .max_by_key(|(_, count)| *count)
-            .unwrap()
-            .0
+        *non_f32.iter().max_by_key(|(_, count)| *count).unwrap().0
     }
 }
 
@@ -385,7 +387,14 @@ fn run_bench(
         (hs, hd, nh, nl, vs)
     };
 
-    let model = HybridModel::random(vocab_size, hidden_size, head_dim, num_heads, num_layers, seed);
+    let model = HybridModel::random(
+        vocab_size,
+        hidden_size,
+        head_dim,
+        num_heads,
+        num_layers,
+        seed,
+    );
 
     if !json_output {
         eprintln!(
@@ -444,7 +453,8 @@ fn run_bench(
         // Compute averages
         let avg_prefill = prefill_times.iter().sum::<f64>() / iterations as f64;
         let avg_decode = decode_times.iter().sum::<f64>() / iterations as f64;
-        let avg_decode_tokens = decode_tokens_counts.iter().sum::<usize>() as f64 / iterations as f64;
+        let avg_decode_tokens =
+            decode_tokens_counts.iter().sum::<usize>() as f64 / iterations as f64;
         let prefill_tok_s = if avg_prefill > 0.0 {
             seq_len as f64 / avg_prefill
         } else {
@@ -577,9 +587,8 @@ fn run_inference(
     );
 
     // 5. Build tokenizer from GGUF metadata
-    let tokenizer = GgufTokenizer::from_metadata(&gguf.metadata).map_err(|e| {
-        format!("Error: Failed to build tokenizer from GGUF metadata: {e}")
-    })?;
+    let tokenizer = GgufTokenizer::from_metadata(&gguf.metadata)
+        .map_err(|e| format!("Error: Failed to build tokenizer from GGUF metadata: {e}"))?;
 
     // 6. Construct model (random weights for now -- real weight loading in later phase)
     let vocab_size = tokenizer.vocab_size();

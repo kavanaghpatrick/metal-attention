@@ -51,11 +51,7 @@ pub fn dispatch_ssm_scan(
     assert_eq!(a.len(), seq_len * d_model, "A length mismatch");
     assert_eq!(b.len(), seq_len * d_state, "B length mismatch");
     assert_eq!(c.len(), seq_len * d_state, "C length mismatch");
-    assert_eq!(
-        state.len(),
-        d_model * d_state,
-        "State length mismatch"
-    );
+    assert_eq!(state.len(), d_model * d_state, "State length mismatch");
 
     let out_len = seq_len * d_model;
 
@@ -255,13 +251,34 @@ mod tests {
 
         // CPU reference
         let mut cpu_state = state.clone();
-        let cpu_output = cpu_ssm_scan(&x, &a, &b, &c, d_param, &mut cpu_state, seq_len, d_model, d_state);
+        let cpu_output = cpu_ssm_scan(
+            &x,
+            &a,
+            &b,
+            &c,
+            d_param,
+            &mut cpu_state,
+            seq_len,
+            d_model,
+            d_state,
+        );
 
         // GPU dispatch
         let gpu = GpuDevice::new();
         let mut pso_cache = PsoCache::new(gpu.library.clone());
-        let (gpu_output, gpu_state) =
-            dispatch_ssm_scan(&gpu, &mut pso_cache, &x, &a, &b, &c, d_param, &state, seq_len, d_model, d_state);
+        let (gpu_output, gpu_state) = dispatch_ssm_scan(
+            &gpu,
+            &mut pso_cache,
+            &x,
+            &a,
+            &b,
+            &c,
+            d_param,
+            &state,
+            seq_len,
+            d_model,
+            d_state,
+        );
 
         // Compare outputs
         assert_eq!(cpu_output.len(), gpu_output.len());
@@ -308,7 +325,9 @@ mod tests {
         let d_param = 0.0f32;
 
         let mut state = vec![0.0f32; d_model * d_state];
-        let output = cpu_ssm_scan(&x, &a, &b, &c, d_param, &mut state, seq_len, d_model, d_state);
+        let output = cpu_ssm_scan(
+            &x, &a, &b, &c, d_param, &mut state, seq_len, d_model, d_state,
+        );
 
         // After t=0: h[m][s] = 0*0 + 1*1 = 1 for all m,s
         // y[m] = sum_s(1 * 1) = d_state = 2

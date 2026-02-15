@@ -9,7 +9,10 @@ use crate::tensor::GgufTensorInfo;
 /// Strategy:
 /// 1. Check `general.architecture` metadata key (primary)
 /// 2. Fallback: scan tensor names for architecture-specific patterns
-pub fn detect_architecture(metadata: &GgufMetadata, tensors: &[GgufTensorInfo]) -> ModelArchitecture {
+pub fn detect_architecture(
+    metadata: &GgufMetadata,
+    tensors: &[GgufTensorInfo],
+) -> ModelArchitecture {
     // Primary: check explicit metadata key
     if let Some(arch_str) = metadata.get_string("general.architecture") {
         let arch = ModelArchitecture::from_str_name(arch_str);
@@ -36,7 +39,8 @@ fn detect_from_tensor_names(tensors: &[GgufTensorInfo]) -> ModelArchitecture {
         if name.contains("attn_q.") || name.contains("attn_k.") || name.contains("attn_v.") {
             has_attn = true;
         }
-        if name.contains(".ssm_in.") || name.contains(".ssm_out.") || name.contains(".ssm_conv1d.") {
+        if name.contains(".ssm_in.") || name.contains(".ssm_out.") || name.contains(".ssm_conv1d.")
+        {
             has_ssm = true;
         }
         if name.contains("time_mix_") {
@@ -161,7 +165,10 @@ mod tests {
             make_tensor("blk.0.rglru_gate.weight"),
             make_tensor("blk.0.rglru_a.weight"),
         ];
-        assert_eq!(detect_architecture(&md, &tensors), ModelArchitecture::Griffin);
+        assert_eq!(
+            detect_architecture(&md, &tensors),
+            ModelArchitecture::Griffin
+        );
     }
 
     #[test]
@@ -198,6 +205,9 @@ mod tests {
     fn test_detect_unknown() {
         let md = make_metadata(None);
         let tensors = vec![make_tensor("some.random.tensor")];
-        assert_eq!(detect_architecture(&md, &tensors), ModelArchitecture::Unknown);
+        assert_eq!(
+            detect_architecture(&md, &tensors),
+            ModelArchitecture::Unknown
+        );
     }
 }

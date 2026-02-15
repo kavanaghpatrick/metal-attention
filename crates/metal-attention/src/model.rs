@@ -3,15 +3,15 @@
 //! Constructs a full model from GGUF-loaded weights (or random weights for testing).
 //! Supports schedule-driven dispatch through RWKV-7 blocks.
 
+use metal_attention_gguf::ModelArchitecture;
 use metal_attention_models::griffin::{GriffinLayer, GriffinLayerState};
 use metal_attention_models::jamba::{JambaLayer, JambaLayerState};
 use metal_attention_models::llama::{LlamaLayer, LlamaState};
 use metal_attention_models::mamba::{MambaBlock, MambaState};
-use metal_attention_models::rwkv7::{Rwkv7Block, Rwkv7State};
 use metal_attention_models::registry::ModelConfig;
-use metal_attention_gguf::ModelArchitecture;
-use metal_attention_traits::types::BlockConfig;
+use metal_attention_models::rwkv7::{Rwkv7Block, Rwkv7State};
 use metal_attention_traits::sequence::SequenceBlock;
+use metal_attention_traits::types::BlockConfig;
 
 use crate::sampling::SimpleRng;
 
@@ -114,7 +114,8 @@ impl HybridModel {
         // Layers
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
-            let block = Rwkv7Block::random(hidden_size, head_dim, num_heads, seed + i as u64 * 31 + 7);
+            let block =
+                Rwkv7Block::random(hidden_size, head_dim, num_heads, seed + i as u64 * 31 + 7);
             layers.push(ModelLayer::Rwkv7(block));
         }
 
@@ -151,15 +152,9 @@ impl HybridModel {
             .layers
             .iter()
             .map(|layer| match layer {
-                ModelLayer::Rwkv7(block) => {
-                    LayerState::Rwkv7(block.init_state(&self.block_config))
-                }
-                ModelLayer::Llama(layer) => {
-                    LayerState::Llama(layer.init_state(&self.block_config))
-                }
-                ModelLayer::Mamba(block) => {
-                    LayerState::Mamba(block.init_state(&self.block_config))
-                }
+                ModelLayer::Rwkv7(block) => LayerState::Rwkv7(block.init_state(&self.block_config)),
+                ModelLayer::Llama(layer) => LayerState::Llama(layer.init_state(&self.block_config)),
+                ModelLayer::Mamba(block) => LayerState::Mamba(block.init_state(&self.block_config)),
                 ModelLayer::Jamba(jamba_layer) => {
                     LayerState::Jamba(jamba_layer.init_state(&self.block_config))
                 }

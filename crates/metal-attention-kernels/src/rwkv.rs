@@ -48,11 +48,7 @@ pub fn dispatch_rwkv_wkv(
     assert_eq!(k.len(), n, "K length mismatch");
     assert_eq!(v.len(), n, "V length mismatch");
     assert_eq!(w.len(), n, "W length mismatch");
-    assert_eq!(
-        state.len(),
-        head_dim * head_dim,
-        "State length mismatch"
-    );
+    assert_eq!(state.len(), head_dim * head_dim, "State length mismatch");
 
     // Allocate Metal buffers
     let r_buf = alloc_buffer_with_data(&device.device, r);

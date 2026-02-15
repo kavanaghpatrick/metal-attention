@@ -324,8 +324,12 @@ mod tests {
         let mut cache = DenseKVCache::new(128, 4);
 
         // Append 3 tokens at once
-        let k = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0, 100.0, 200.0, 300.0, 400.0];
-        let v = vec![5.0, 6.0, 7.0, 8.0, 50.0, 60.0, 70.0, 80.0, 500.0, 600.0, 700.0, 800.0];
+        let k = vec![
+            1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0, 100.0, 200.0, 300.0, 400.0,
+        ];
+        let v = vec![
+            5.0, 6.0, 7.0, 8.0, 50.0, 60.0, 70.0, 80.0, 500.0, 600.0, 700.0, 800.0,
+        ];
         cache.append(&k, &v);
 
         assert_eq!(cache.len(), 3);
@@ -353,8 +357,14 @@ mod tests {
         assert_eq!(cache.len(), 2);
 
         // Verify both tokens are accessible
-        assert_eq!(cache.k_slice(), &[1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]);
-        assert_eq!(cache.v_slice(), &[5.0, 6.0, 7.0, 8.0, 50.0, 60.0, 70.0, 80.0]);
+        assert_eq!(
+            cache.k_slice(),
+            &[1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]
+        );
+        assert_eq!(
+            cache.v_slice(),
+            &[5.0, 6.0, 7.0, 8.0, 50.0, 60.0, 70.0, 80.0]
+        );
     }
 
     #[test]
@@ -432,12 +442,18 @@ mod tests {
         let phys = cache.block_table()[0] as usize;
         let page_elems = page_size * head_dim;
         let k_start = phys * page_elems;
-        assert_eq!(cache.k_pages()[k_start..k_start + head_dim], [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(
+            cache.k_pages()[k_start..k_start + head_dim],
+            [1.0, 2.0, 3.0, 4.0]
+        );
         assert_eq!(
             cache.k_pages()[k_start + head_dim..k_start + 2 * head_dim],
             [10.0, 20.0, 30.0, 40.0]
         );
-        assert_eq!(cache.v_pages()[k_start..k_start + head_dim], [5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(
+            cache.v_pages()[k_start..k_start + head_dim],
+            [5.0, 6.0, 7.0, 8.0]
+        );
     }
 
     #[test]
@@ -503,7 +519,7 @@ mod tests {
     #[should_panic(expected = "no free pages")]
     fn test_paged_kv_cache_overflow() {
         let mut cache = PagedKVCache::new(1, 2, 2); // 1 page, 2 tokens per page
-        // Fill the one page
+                                                    // Fill the one page
         cache.append(&[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0]);
         // This requires a new page but none are free -> panic
         cache.append(&[1.0, 2.0], &[5.0, 6.0]);

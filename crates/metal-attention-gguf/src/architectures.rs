@@ -88,9 +88,9 @@ pub fn map_tensor_name(arch: ModelArchitecture, name: &str) -> Option<(Option<us
             if let Ok(layer) = rest[..dot_pos].parse::<usize>() {
                 let suffix = &rest[dot_pos + 1..];
                 let role = match arch {
-                    ModelArchitecture::Llama | ModelArchitecture::Zamba | ModelArchitecture::Unknown => {
-                        map_llama_suffix(suffix)
-                    }
+                    ModelArchitecture::Llama
+                    | ModelArchitecture::Zamba
+                    | ModelArchitecture::Unknown => map_llama_suffix(suffix),
                     ModelArchitecture::Rwkv => map_rwkv_suffix(suffix),
                     ModelArchitecture::Jamba => map_jamba_suffix(suffix),
                     ModelArchitecture::Griffin => map_griffin_suffix(suffix),
@@ -185,18 +185,54 @@ mod tests {
 
     #[test]
     fn test_architecture_from_str() {
-        assert_eq!(ModelArchitecture::from_str_name("llama"), ModelArchitecture::Llama);
-        assert_eq!(ModelArchitecture::from_str_name("Llama"), ModelArchitecture::Llama);
-        assert_eq!(ModelArchitecture::from_str_name("LLAMA"), ModelArchitecture::Llama);
-        assert_eq!(ModelArchitecture::from_str_name("rwkv"), ModelArchitecture::Rwkv);
-        assert_eq!(ModelArchitecture::from_str_name("rwkv6"), ModelArchitecture::Rwkv);
-        assert_eq!(ModelArchitecture::from_str_name("rwkv7"), ModelArchitecture::Rwkv);
-        assert_eq!(ModelArchitecture::from_str_name("jamba"), ModelArchitecture::Jamba);
-        assert_eq!(ModelArchitecture::from_str_name("griffin"), ModelArchitecture::Griffin);
-        assert_eq!(ModelArchitecture::from_str_name("recurrentgemma"), ModelArchitecture::Griffin);
-        assert_eq!(ModelArchitecture::from_str_name("zamba"), ModelArchitecture::Zamba);
-        assert_eq!(ModelArchitecture::from_str_name("zamba2"), ModelArchitecture::Zamba);
-        assert_eq!(ModelArchitecture::from_str_name("bert"), ModelArchitecture::Unknown);
+        assert_eq!(
+            ModelArchitecture::from_str_name("llama"),
+            ModelArchitecture::Llama
+        );
+        assert_eq!(
+            ModelArchitecture::from_str_name("Llama"),
+            ModelArchitecture::Llama
+        );
+        assert_eq!(
+            ModelArchitecture::from_str_name("LLAMA"),
+            ModelArchitecture::Llama
+        );
+        assert_eq!(
+            ModelArchitecture::from_str_name("rwkv"),
+            ModelArchitecture::Rwkv
+        );
+        assert_eq!(
+            ModelArchitecture::from_str_name("rwkv6"),
+            ModelArchitecture::Rwkv
+        );
+        assert_eq!(
+            ModelArchitecture::from_str_name("rwkv7"),
+            ModelArchitecture::Rwkv
+        );
+        assert_eq!(
+            ModelArchitecture::from_str_name("jamba"),
+            ModelArchitecture::Jamba
+        );
+        assert_eq!(
+            ModelArchitecture::from_str_name("griffin"),
+            ModelArchitecture::Griffin
+        );
+        assert_eq!(
+            ModelArchitecture::from_str_name("recurrentgemma"),
+            ModelArchitecture::Griffin
+        );
+        assert_eq!(
+            ModelArchitecture::from_str_name("zamba"),
+            ModelArchitecture::Zamba
+        );
+        assert_eq!(
+            ModelArchitecture::from_str_name("zamba2"),
+            ModelArchitecture::Zamba
+        );
+        assert_eq!(
+            ModelArchitecture::from_str_name("bert"),
+            ModelArchitecture::Unknown
+        );
     }
 
     #[test]

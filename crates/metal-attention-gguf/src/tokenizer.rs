@@ -135,10 +135,7 @@ impl GgufTokenizer {
         symbols
             .iter()
             .map(|tok| {
-                self.token_to_id
-                    .get(tok)
-                    .copied()
-                    .unwrap_or(0) // 0 = <unk> by convention
+                self.token_to_id.get(tok).copied().unwrap_or(0) // 0 = <unk> by convention
             })
             .collect()
     }

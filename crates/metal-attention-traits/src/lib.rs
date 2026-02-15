@@ -7,15 +7,15 @@
 //! This crate has **zero** Metal dependencies. GPU-specific implementations
 //! live in downstream crates (e.g., `metal-attention-kernels`).
 
-pub mod types;
-pub mod sequence;
-pub mod linear;
 pub mod attention;
+pub mod linear;
 pub mod schedule;
+pub mod sequence;
+pub mod types;
 
 // Re-export core types at crate root for convenience.
-pub use types::{TensorView, DType, BlockConfig};
+pub use attention::{GQAConfig, KVCacheMode, PositionEncoding, SoftmaxAttention};
+pub use linear::{LinearPositionEncoding, LinearSequenceModel};
+pub use schedule::{LayerSchedule, LayerType};
 pub use sequence::SequenceBlock;
-pub use linear::{LinearSequenceModel, LinearPositionEncoding};
-pub use attention::{SoftmaxAttention, PositionEncoding, KVCacheMode, GQAConfig};
-pub use schedule::{LayerType, LayerSchedule};
+pub use types::{BlockConfig, DType, TensorView};

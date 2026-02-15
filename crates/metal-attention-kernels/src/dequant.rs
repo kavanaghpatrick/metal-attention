@@ -49,8 +49,7 @@ pub fn dispatch_dequantize_q4_0(
     let total_elements = num_blocks * Q4_0_BLOCK_SIZE;
 
     let input_buf = alloc_buffer_with_data(&device.device, input);
-    let output_buf =
-        alloc_buffer(&device.device, total_elements * std::mem::size_of::<f32>());
+    let output_buf = alloc_buffer(&device.device, total_elements * std::mem::size_of::<f32>());
 
     let pso_key = PsoKey::simple("dequantize_q4_0");
     let pso = pso_cache.get_or_compile(&pso_key);
@@ -126,8 +125,7 @@ pub fn dispatch_dequantize_q8_0(
     let total_elements = num_blocks * Q8_0_BLOCK_SIZE;
 
     let input_buf = alloc_buffer_with_data(&device.device, input);
-    let output_buf =
-        alloc_buffer(&device.device, total_elements * std::mem::size_of::<f32>());
+    let output_buf = alloc_buffer(&device.device, total_elements * std::mem::size_of::<f32>());
 
     let pso_key = PsoKey::simple("dequantize_q8_0");
     let pso = pso_cache.get_or_compile(&pso_key);

@@ -47,7 +47,12 @@ pub fn dispatch_gqa_remap(
         "num_heads must be divisible by num_kv_heads"
     );
 
-    let params = AttentionParams::gqa(seq_len as u32, head_dim as u32, num_heads as u32, num_kv_heads as u32);
+    let params = AttentionParams::gqa(
+        seq_len as u32,
+        head_dim as u32,
+        num_heads as u32,
+        num_kv_heads as u32,
+    );
 
     let k_buf = alloc_buffer_with_data(&device.device, k_full);
     let out_size = num_heads * seq_len * head_dim * std::mem::size_of::<f32>();
@@ -167,7 +172,10 @@ mod tests {
             assert!(
                 diff < atol,
                 "GQA remap mismatch at {}: cpu={}, gpu={}, diff={}",
-                i, cpu_out[i], gpu_out[i], diff
+                i,
+                cpu_out[i],
+                gpu_out[i],
+                diff
             );
         }
     }

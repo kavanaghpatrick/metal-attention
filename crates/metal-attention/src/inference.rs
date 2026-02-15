@@ -54,11 +54,7 @@ fn sample_token(
 /// Full generation loop: prefill prompt, then autoregressively decode tokens.
 ///
 /// Returns an iterator-like vector of generated token IDs (not including prompt).
-pub fn generate(
-    model: &HybridModel,
-    prompt_tokens: &[u32],
-    config: &InferenceConfig,
-) -> Vec<u32> {
+pub fn generate(model: &HybridModel, prompt_tokens: &[u32], config: &InferenceConfig) -> Vec<u32> {
     let mut state = model.init_state();
     let mut rng = SimpleRng::new(config.seed.unwrap_or(42));
     let vocab_size = model.vocab_size();
@@ -200,7 +196,10 @@ mod tests {
         let tokens2 = generate(&model, &[1, 2], &config);
 
         // Greedy + same seed = identical output
-        assert_eq!(tokens1, tokens2, "deterministic generation should produce identical tokens");
+        assert_eq!(
+            tokens1, tokens2,
+            "deterministic generation should produce identical tokens"
+        );
     }
 
     #[test]
@@ -226,7 +225,10 @@ mod tests {
 
         // Should match non-streaming output
         let batch = generate(&model, &[1, 2], &config);
-        assert_eq!(collected, batch, "streaming and batch generation should match");
+        assert_eq!(
+            collected, batch,
+            "streaming and batch generation should match"
+        );
     }
 
     #[test]

@@ -62,10 +62,7 @@ pub fn sample_top_p(logits: &[f32], top_p: f32, temp: f32, rng: &mut SimpleRng) 
     // Renormalize the kept tokens
     let kept = &indexed[..cutoff_idx];
     let total: f32 = kept.iter().map(|&(_, p)| p).sum();
-    let renormed: Vec<(usize, f32)> = kept
-        .iter()
-        .map(|&(idx, p)| (idx, p / total))
-        .collect();
+    let renormed: Vec<(usize, f32)> = kept.iter().map(|&(idx, p)| (idx, p / total)).collect();
 
     // Sample from renormalized distribution
     let r = rng.next_f32();
@@ -137,10 +134,7 @@ pub fn apply_repetition_penalty(logits: &mut [f32], previous_tokens: &[u32], pen
 
 /// Compute softmax probabilities from logits.
 fn softmax(logits: &[f32]) -> Vec<f32> {
-    let max = logits
-        .iter()
-        .cloned()
-        .fold(f32::NEG_INFINITY, f32::max);
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
     let sum: f32 = exps.iter().sum();
     exps.iter().map(|&e| e / sum).collect()
@@ -214,7 +208,10 @@ mod tests {
     fn test_temperature_zero_equals_greedy() {
         let logits = vec![0.1, 0.5, 0.3, 0.9, 0.2];
         let mut rng = SimpleRng::new(42);
-        assert_eq!(sample_temperature(&logits, 0.0, &mut rng), sample_greedy(&logits));
+        assert_eq!(
+            sample_temperature(&logits, 0.0, &mut rng),
+            sample_greedy(&logits)
+        );
     }
 
     #[test]
@@ -306,7 +303,11 @@ mod tests {
         let logits = vec![1.0, 2.0, 3.0, 4.0];
         let probs = softmax(&logits);
         let sum: f32 = probs.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5, "softmax should sum to 1, got {}", sum);
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "softmax should sum to 1, got {}",
+            sum
+        );
     }
 
     #[test]

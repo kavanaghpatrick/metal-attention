@@ -4,9 +4,7 @@
 //! buffer binding, bytes upload, and threadgroup dispatch (1D and 2D).
 
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{
-    MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize,
-};
+use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
 use std::ptr::NonNull;
 
 /// Bind a buffer at the given argument index on a compute encoder.
@@ -35,8 +33,8 @@ pub fn set_bytes<T: Copy>(
 ) {
     let size = std::mem::size_of::<T>();
     unsafe {
-        let ptr = NonNull::new(data as *const T as *mut std::ffi::c_void)
-            .expect("data pointer is null");
+        let ptr =
+            NonNull::new(data as *const T as *mut std::ffi::c_void).expect("data pointer is null");
         encoder.setBytes_length_atIndex(ptr, size, index);
     }
 }
@@ -48,8 +46,8 @@ pub fn set_bytes_slice(
     index: usize,
 ) {
     unsafe {
-        let ptr = NonNull::new(data.as_ptr() as *mut std::ffi::c_void)
-            .expect("data pointer is null");
+        let ptr =
+            NonNull::new(data.as_ptr() as *mut std::ffi::c_void).expect("data pointer is null");
         encoder.setBytes_length_atIndex(ptr, data.len(), index);
     }
 }

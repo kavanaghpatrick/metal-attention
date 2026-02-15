@@ -61,11 +61,10 @@ impl CommandManager {
     /// finishes this command buffer, freeing a frame slot for `begin_frame`.
     pub fn end_frame(&self, cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>) {
         let sem = self.semaphore.clone();
-        let block = block2::RcBlock::new(
-            move |_buf: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+        let block =
+            block2::RcBlock::new(move |_buf: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
                 sem.signal();
-            },
-        );
+            });
         unsafe {
             cmd_buf.addCompletedHandler(block2::RcBlock::as_ptr(&block));
         }

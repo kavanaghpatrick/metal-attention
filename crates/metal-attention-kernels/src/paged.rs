@@ -83,18 +83,9 @@ pub fn dispatch_paged_attention(
     let o_partial_size = num_pb * block_r * head_dim;
     let ml_partial_size = num_pb * block_r;
 
-    let o_partial_buf = alloc_buffer(
-        &device.device,
-        o_partial_size * std::mem::size_of::<f32>(),
-    );
-    let m_partial_buf = alloc_buffer(
-        &device.device,
-        ml_partial_size * std::mem::size_of::<f32>(),
-    );
-    let l_partial_buf = alloc_buffer(
-        &device.device,
-        ml_partial_size * std::mem::size_of::<f32>(),
-    );
+    let o_partial_buf = alloc_buffer(&device.device, o_partial_size * std::mem::size_of::<f32>());
+    let m_partial_buf = alloc_buffer(&device.device, ml_partial_size * std::mem::size_of::<f32>());
+    let l_partial_buf = alloc_buffer(&device.device, ml_partial_size * std::mem::size_of::<f32>());
 
     // ====================================================================
     // Pass 1: paged_attention_partition
@@ -437,8 +428,15 @@ mod tests {
         let block_table: Vec<u32> = (0..num_pages as u32).collect();
 
         let kv_cache = interleave_kv_pages(&k_pages, &v_pages, num_pages, page_size, head_dim);
-        let paged_output =
-            cpu_paged_attention(&q, &kv_cache, &block_table, seq_len, head_dim, page_size, context_len);
+        let paged_output = cpu_paged_attention(
+            &q,
+            &kv_cache,
+            &block_table,
+            seq_len,
+            head_dim,
+            page_size,
+            context_len,
+        );
 
         let atol = 1e-5;
         for i in 0..dense_output.len() {
@@ -491,8 +489,15 @@ mod tests {
         let kv_cache = interleave_kv_pages(&k_pages, &v_pages, num_pages, page_size, head_dim);
 
         // CPU reference
-        let cpu_out =
-            cpu_paged_attention(&q, &kv_cache, &block_table, seq_len, head_dim, page_size, context_len);
+        let cpu_out = cpu_paged_attention(
+            &q,
+            &kv_cache,
+            &block_table,
+            seq_len,
+            head_dim,
+            page_size,
+            context_len,
+        );
 
         // GPU paged attention (with 1 partition = single pass + reduce)
         let gpu_out = dispatch_paged_attention(

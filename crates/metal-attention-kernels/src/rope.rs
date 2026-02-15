@@ -108,8 +108,7 @@ pub fn cpu_rope(q: &mut [f32], k: &mut [f32], seq_len: usize, head_dim: usize) {
     let theta_base: f32 = 10000.0;
     for token in 0..seq_len {
         for pair in 0..(head_dim / 2) {
-            let angle = token as f32
-                / theta_base.powf(2.0 * pair as f32 / head_dim as f32);
+            let angle = token as f32 / theta_base.powf(2.0 * pair as f32 / head_dim as f32);
             let cos_a = angle.cos();
             let sin_a = angle.sin();
 
@@ -175,7 +174,10 @@ mod tests {
             assert!(
                 diff < atol,
                 "Q mismatch at {}: cpu={}, gpu={}, diff={}",
-                i, q_cpu[i], q_gpu[i], diff
+                i,
+                q_cpu[i],
+                q_gpu[i],
+                diff
             );
         }
         for i in 0..k_cpu.len() {
@@ -183,7 +185,10 @@ mod tests {
             assert!(
                 diff < atol,
                 "K mismatch at {}: cpu={}, gpu={}, diff={}",
-                i, k_cpu[i], k_gpu[i], diff
+                i,
+                k_cpu[i],
+                k_gpu[i],
+                diff
             );
         }
     }

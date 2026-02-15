@@ -294,13 +294,8 @@ pub fn build_griffin_layers(
                 layers.push(GriffinLayer::RgLru(block));
             }
             LayerType::Attention => {
-                let llama = LlamaLayer::random(
-                    hidden_size,
-                    head_dim,
-                    num_heads,
-                    num_kv_heads,
-                    layer_seed,
-                );
+                let llama =
+                    LlamaLayer::random(hidden_size, head_dim, num_heads, num_kv_heads, layer_seed);
                 layers.push(GriffinLayer::Attention(llama));
             }
         }
@@ -388,7 +383,8 @@ mod tests {
                 assert!(
                     val.is_finite(),
                     "Output element {} is not finite: {}",
-                    i, val
+                    i,
+                    val
                 );
             }
         }
@@ -418,9 +414,7 @@ mod tests {
         let state_after_1 = state.hidden.clone();
 
         // Process second token -- state should change
-        let input2: Vec<f32> = (0..hidden_size)
-            .map(|i| (i as f32 + 1.0) * -0.2)
-            .collect();
+        let input2: Vec<f32> = (0..hidden_size).map(|i| (i as f32 + 1.0) * -0.2).collect();
         let _out2 = block.process_token(&input2, &mut state);
 
         // State should have changed from token 1 to token 2
@@ -429,10 +423,7 @@ mod tests {
             .iter()
             .zip(state_after_1.iter())
             .any(|(&a, &b)| (a - b).abs() > 1e-10);
-        assert!(
-            differs,
-            "State should change after processing second token"
-        );
+        assert!(differs, "State should change after processing second token");
     }
 
     #[test]
@@ -444,7 +435,12 @@ mod tests {
         let num_layers = 9;
 
         let (layers, schedule) = build_griffin_layers(
-            hidden_size, head_dim, num_heads, num_kv_heads, num_layers, 42,
+            hidden_size,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+            num_layers,
+            42,
         );
 
         assert_eq!(layers.len(), num_layers);
@@ -487,7 +483,12 @@ mod tests {
         let num_layers = 6;
 
         let (layers, _schedule) = build_griffin_layers(
-            hidden_size, head_dim, num_heads, num_kv_heads, num_layers, 42,
+            hidden_size,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+            num_layers,
+            42,
         );
 
         let config = make_config(hidden_size, head_dim, num_heads, num_kv_heads);
@@ -502,12 +503,19 @@ mod tests {
         let mut hidden = input;
         for (i, layer) in layers.iter().enumerate() {
             hidden = layer.process_token(&hidden, &mut states[i]);
-            assert_eq!(hidden.len(), hidden_size, "Layer {} output size mismatch", i);
+            assert_eq!(
+                hidden.len(),
+                hidden_size,
+                "Layer {} output size mismatch",
+                i
+            );
             for (j, &val) in hidden.iter().enumerate() {
                 assert!(
                     val.is_finite(),
                     "Layer {} output[{}] not finite: {}",
-                    i, j, val
+                    i,
+                    j,
+                    val
                 );
             }
         }

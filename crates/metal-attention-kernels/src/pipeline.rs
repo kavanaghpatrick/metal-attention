@@ -155,10 +155,7 @@ impl PsoCache {
     ///
     /// If a matching PSO exists in the cache, returns it immediately.
     /// Otherwise, compiles a new PSO using the Metal compiler and caches it.
-    pub fn get_or_compile(
-        &mut self,
-        key: &PsoKey,
-    ) -> &ProtocolObject<dyn MTLComputePipelineState> {
+    pub fn get_or_compile(&mut self, key: &PsoKey) -> &ProtocolObject<dyn MTLComputePipelineState> {
         if !self.cache.contains_key(key) {
             let pso = Self::compile_pso(&self.library, key);
             self.cache.insert(key.clone(), pso);
@@ -252,9 +249,7 @@ impl PsoCache {
         let device = library.device();
         device
             .newComputePipelineStateWithFunction_error(&function)
-            .unwrap_or_else(|e| {
-                panic!("Failed to create PSO for '{}': {:?}", key.function_name, e)
-            })
+            .unwrap_or_else(|e| panic!("Failed to create PSO for '{}': {:?}", key.function_name, e))
     }
 }
 

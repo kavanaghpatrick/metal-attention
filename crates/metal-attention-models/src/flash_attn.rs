@@ -161,8 +161,7 @@ impl FlashAttentionLayer {
             for (h, head) in heads.iter_mut().enumerate().take(total_heads) {
                 let src_start = t * total_heads * hd + h * hd;
                 let dst_start = t * hd;
-                head[dst_start..dst_start + hd]
-                    .copy_from_slice(&data[src_start..src_start + hd]);
+                head[dst_start..dst_start + hd].copy_from_slice(&data[src_start..src_start + hd]);
             }
         }
         heads
@@ -186,13 +185,7 @@ impl FlashAttentionLayer {
     ///
     /// Dispatches per-head since `dispatch_flash_attention` expects single-head
     /// layout `[seq_len, head_dim]`. Returns token-major `[seq_len, num_heads * head_dim]`.
-    fn run_attention_gpu(
-        &self,
-        q: &[f32],
-        k: &[f32],
-        v: &[f32],
-        seq_len: usize,
-    ) -> Vec<f32> {
+    fn run_attention_gpu(&self, q: &[f32], k: &[f32], v: &[f32], seq_len: usize) -> Vec<f32> {
         let gpu = GpuDevice::new();
         let mut pso_cache = PsoCache::new(gpu.library.clone());
 
@@ -250,13 +243,7 @@ impl FlashAttentionLayer {
     ///   O = P * V
     ///
     /// Returns: `[num_heads * head_dim]` (token-major, single token)
-    fn run_attention_cpu(
-        &self,
-        q: &[f32],
-        k: &[f32],
-        v: &[f32],
-        kv_seq_len: usize,
-    ) -> Vec<f32> {
+    fn run_attention_cpu(&self, q: &[f32], k: &[f32], v: &[f32], kv_seq_len: usize) -> Vec<f32> {
         let hd = self.head_dim;
         let nkv = self.num_kv_heads;
         let group_size = self.num_heads / nkv;
@@ -323,7 +310,10 @@ impl FlashAttentionLayer {
             self.run_attention_gpu(q, k, v, q_seq_len)
         } else {
             // Decode: use CPU softmax attention (Q_len=1)
-            assert_eq!(q_seq_len, 1, "Asymmetric attention only supports Q_len=1 (decode)");
+            assert_eq!(
+                q_seq_len, 1,
+                "Asymmetric attention only supports Q_len=1 (decode)"
+            );
             self.run_attention_cpu(q, k, v, kv_seq_len)
         }
     }
@@ -469,11 +459,7 @@ impl FlashAttentionLayer {
     ///
     /// Input: `[hidden_size]` flat f32 slice.
     /// Returns: `[hidden_size]` flat f32 output.
-    pub fn process_decode(
-        &self,
-        input: &[f32],
-        state: &mut FlashAttentionState,
-    ) -> Vec<f32> {
+    pub fn process_decode(&self, input: &[f32], state: &mut FlashAttentionState) -> Vec<f32> {
         assert_eq!(input.len(), self.hidden_size);
 
         // 1. Project Q/K/V
@@ -526,7 +512,12 @@ impl SimpleRng {
 mod tests {
     use super::*;
 
-    fn make_config(hidden_size: usize, head_dim: usize, num_heads: usize, num_kv_heads: usize) -> BlockConfig {
+    fn make_config(
+        hidden_size: usize,
+        head_dim: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+    ) -> BlockConfig {
         BlockConfig {
             hidden_size,
             head_dim,
@@ -562,7 +553,8 @@ mod tests {
         let num_kv_heads = 2;
         let seq_len = 8;
 
-        let layer = FlashAttentionLayer::random(hidden_size, head_dim, num_heads, num_kv_heads, 123);
+        let layer =
+            FlashAttentionLayer::random(hidden_size, head_dim, num_heads, num_kv_heads, 123);
         let config = make_config(hidden_size, head_dim, num_heads, num_kv_heads);
         let mut state = layer.init_state(&config);
 
@@ -586,7 +578,8 @@ mod tests {
             assert!(
                 val.is_finite(),
                 "Output element {} is not finite: {}",
-                i, val
+                i,
+                val
             );
         }
 
@@ -603,7 +596,8 @@ mod tests {
         let prefill_len = 8;
         let decode_steps = 4;
 
-        let layer = FlashAttentionLayer::random(hidden_size, head_dim, num_heads, num_kv_heads, 789);
+        let layer =
+            FlashAttentionLayer::random(hidden_size, head_dim, num_heads, num_kv_heads, 789);
         let config = make_config(hidden_size, head_dim, num_heads, num_kv_heads);
         let mut state = layer.init_state(&config);
 
@@ -636,7 +630,9 @@ mod tests {
                 assert!(
                     val.is_finite(),
                     "Decode step {} output[{}] is not finite: {}",
-                    step, i, val
+                    step,
+                    i,
+                    val
                 );
             }
 
@@ -679,7 +675,11 @@ mod tests {
         let prefill_out = layer.process_prefill(&prefill_input, &mut state, prefill_len);
         assert_eq!(prefill_out.len(), prefill_len * hidden_size);
         for &val in &prefill_out {
-            assert!(val.is_finite(), "Prefill output contains non-finite: {}", val);
+            assert!(
+                val.is_finite(),
+                "Prefill output contains non-finite: {}",
+                val
+            );
         }
 
         // Decode 10 tokens
@@ -693,7 +693,8 @@ mod tests {
                 assert!(
                     val.is_finite(),
                     "Decode step {} output contains non-finite: {}",
-                    step, val
+                    step,
+                    val
                 );
             }
         }

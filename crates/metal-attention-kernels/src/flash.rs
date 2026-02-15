@@ -59,7 +59,10 @@ pub fn dispatch_flash_attention(
     let q_buf = alloc_buffer_with_data(&device.device, q);
     let k_buf = alloc_buffer_with_data(&device.device, k);
     let v_buf = alloc_buffer_with_data(&device.device, v);
-    let o_buf = alloc_buffer(&device.device, seq_len * head_dim * std::mem::size_of::<f32>());
+    let o_buf = alloc_buffer(
+        &device.device,
+        seq_len * head_dim * std::mem::size_of::<f32>(),
+    );
     let params_buf = alloc_buffer_with_data(&device.device, std::slice::from_ref(&params));
 
     // Compile PSO with function constants
@@ -108,10 +111,8 @@ pub fn dispatch_flash_attention(
         depth: 1,
     };
 
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        threadgroups_per_grid,
-        threads_per_threadgroup,
-    );
+    encoder
+        .dispatchThreadgroups_threadsPerThreadgroup(threadgroups_per_grid, threads_per_threadgroup);
     encoder.endEncoding();
 
     // Commit and wait
