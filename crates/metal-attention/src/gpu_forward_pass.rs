@@ -6,12 +6,13 @@
 //!   1. Embedding lookup (CPU) -> hidden_a buffer write (2.3KB)
 //!   2. Logits buffer readback (192KB) -> CPU argmax
 //!
-//! For POC, uses one command buffer per encoding block (attention projections,
-//! attention output, FFN, final logits) to allow CPU-side KV cache append
-//! between attention projection and decode attention. Within each command
-//! buffer, all kernel dispatches are inline-encoded (no per-op command buffers).
-//! Task 2.1 will optimize to truly single command buffer using a GPU-side
-//! copy kernel for KV cache append.
+//! Uses a single command buffer and compute encoder for the entire forward pass
+//! (all 30 layers). KV cache append and hidden-state ping-pong copies are
+//! performed GPU-side via `kv_cache_copy` and `buffer_copy` Metal kernels,
+//! eliminating all CPU-GPU sync points from the decode hot path.
+//!
+//! A separate `forward_token_debug` path retains the multi-command-buffer
+//! architecture for per-layer debug readback (activated via GPU_DEBUG=1).
 
 use std::path::Path;
 use std::sync::Arc;

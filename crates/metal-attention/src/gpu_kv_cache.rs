@@ -3,9 +3,12 @@
 //! `GpuKVCache` stores K and V projections for all sequence positions
 //! in Metal buffers. `GpuKVCacheSet` wraps one cache per transformer layer.
 //!
-//! For POC, append uses CPU-side memcpy via `contents()` pointer since
-//! K/V vectors are small (kv_dim * 4 bytes = 768 bytes for SmolLM).
-//! This avoids breaking the compute encoder or needing a separate copy kernel.
+//! Append supports two modes:
+//!   - **GPU-side** (`encode_kv_append`): dispatches the `kv_cache_copy` Metal
+//!     kernel within a shared compute encoder, keeping the entire forward pass
+//!     in a single command buffer with zero CPU-GPU sync.
+//!   - **CPU-side** (`append_kv`): uses `contents()` pointer memcpy, retained
+//!     for the debug path (`forward_token_debug`) which needs per-layer readback.
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -18,7 +21,8 @@ use metal_attention_kernels::dispatch::{set_buffer, set_bytes};
 ///
 /// Stores key and value projections as contiguous F32 buffers
 /// with shape `[max_len, kv_dim]`. New K/V rows are appended
-/// at position `len` via CPU memcpy.
+/// at position `len` via GPU-side `kv_cache_copy` kernel (or CPU
+/// memcpy in the debug path).
 pub struct GpuKVCache {
     /// Key cache buffer: `[max_len, kv_dim]` F32.
     k_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
