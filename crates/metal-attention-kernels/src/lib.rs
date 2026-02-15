@@ -5,6 +5,7 @@
 
 pub mod buffer;
 pub mod command;
+pub mod decode_attention;
 pub mod dequant;
 pub mod device;
 pub mod dispatch;
@@ -30,6 +31,7 @@ pub mod types;
 // Re-export primary types for convenience
 pub use buffer::{alloc_buffer, alloc_buffer_with_data, BufferPool};
 pub use command::CommandManager;
+pub use decode_attention::dispatch_decode_attention;
 pub use dequant::{dispatch_dequantize_q4_0, dispatch_dequantize_q8_0};
 pub use device::GpuDevice;
 pub use dispatch::{dispatch_1d, dispatch_2d, dispatch_threadgroups, set_buffer, set_bytes};
