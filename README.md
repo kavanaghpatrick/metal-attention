@@ -94,8 +94,9 @@ HybridModel<R: LinearSequenceModel, A: SoftmaxAttention, const RATIO: usize>
 
 **Phase**: Pre-implementation (PRD complete, prototypes validated)
 
-See [PRD.md](PRD.md) for full product requirements and implementation phases.
-See [SYNTHESIS.md](SYNTHESIS.md) for detailed prototype results and architecture recommendations.
+- [PRD.md](PRD.md) — Full product requirements and implementation phases
+- [SYNTHESIS.md](SYNTHESIS.md) — Detailed prototype results and architecture recommendations
+- [proto/](proto/) — 8 working GPU kernel prototypes with benchmarks (runnable on any Apple Silicon Mac)
 
 ### Roadmap
 
@@ -113,6 +114,22 @@ See [SYNTHESIS.md](SYNTHESIS.md) for detailed prototype results and architecture
 - macOS 14+ (Sonoma)
 - Rust stable toolchain
 - Xcode Command Line Tools (for Metal compiler)
+
+## Project structure
+
+```
+metal-attention/
+├── README.md           # This file
+├── PRD.md              # Product requirements document
+├── SYNTHESIS.md        # Prototype results & architecture recommendations
+└── proto/              # Validation prototypes (8 kernels, 48 benchmarks)
+    ├── shaders/        # Hand-written Metal shaders (production-bound)
+    ├── src/            # Rust prototype implementations
+    ├── benches/        # Criterion benchmarks (reproducible)
+    ├── tests/          # Integration tests
+    ├── findings.jsonl  # 58 KB findings (raw investigation data)
+    └── bench.json      # Benchmark results
+```
 
 ## Related
 

@@ -1,0 +1,6 @@
+/target
+/proto/target
+**/*.metallib
+*.o
+*.d
+.DS_Store
