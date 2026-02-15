@@ -513,4 +513,130 @@ mod tests {
             assert!(val.is_finite(), "Output should be finite: {}", val);
         }
     }
+
+    /// Test: Multi-head WKV with 4 heads processes each head separately.
+    ///
+    /// Verifies that the multi-head path (hd != hs) correctly:
+    /// - Produces output of hidden_size length
+    /// - All values are finite
+    /// - State is updated across all heads
+    #[test]
+    fn test_multi_head_wkv() {
+        let num_heads = 4;
+        let head_dim = 64;
+        let hidden_size = num_heads * head_dim; // 256
+
+        let mut block = Rwkv7Block::random(hidden_size, head_dim, num_heads, 4242);
+        block.use_gpu = false; // CPU path for multi-head
+
+        let config = BlockConfig {
+            hidden_size,
+            head_dim,
+            num_heads,
+            num_kv_heads: num_heads,
+            layer_index: 0,
+        };
+
+        let mut state = block.init_state(&config);
+
+        // Verify initial state dimensions
+        assert_eq!(
+            state.wkv_state.len(),
+            num_heads * head_dim * head_dim,
+            "WKV state should be num_heads * head_dim^2"
+        );
+        assert_eq!(state.prev_token.len(), hidden_size);
+
+        // Process several tokens
+        let mut rng = SimpleRng::new(1234);
+        for t in 0..4 {
+            let input: Vec<f32> = (0..hidden_size)
+                .map(|_| rng.next_f32_range(-1.0, 1.0))
+                .collect();
+
+            let output = block.process_token(&input, &mut state);
+
+            assert_eq!(
+                output.len(),
+                hidden_size,
+                "token {t}: output should be hidden_size={hidden_size}"
+            );
+
+            for (i, &val) in output.iter().enumerate() {
+                assert!(
+                    val.is_finite(),
+                    "token {t}: output element {i} is not finite: {val}"
+                );
+            }
+        }
+
+        // Verify state was updated across all heads
+        for h in 0..num_heads {
+            let state_start = h * head_dim * head_dim;
+            let state_end = state_start + head_dim * head_dim;
+            let head_state = &state.wkv_state[state_start..state_end];
+            let head_nonzero = head_state.iter().any(|&x| x != 0.0);
+            assert!(
+                head_nonzero,
+                "Head {h} WKV state should be non-zero after processing tokens"
+            );
+        }
+    }
+
+    /// Test: Single-head path remains correct when head_dim == hidden_size.
+    ///
+    /// Verifies the fast path (no per-head slicing) still works.
+    #[test]
+    fn test_single_head_wkv_unchanged() {
+        let hidden_size = 64;
+        let head_dim = hidden_size;
+        let num_heads = 1;
+
+        let mut block = Rwkv7Block::random(hidden_size, head_dim, num_heads, 5555);
+        block.use_gpu = false;
+
+        let config = BlockConfig {
+            hidden_size,
+            head_dim,
+            num_heads,
+            num_kv_heads: num_heads,
+            layer_index: 0,
+        };
+
+        let mut state = block.init_state(&config);
+
+        // State should be head_dim^2 = hidden_size^2 for single head
+        assert_eq!(
+            state.wkv_state.len(),
+            num_heads * head_dim * head_dim,
+            "Single-head state size"
+        );
+
+        let mut rng = SimpleRng::new(6789);
+        for t in 0..3 {
+            let input: Vec<f32> = (0..hidden_size)
+                .map(|_| rng.next_f32_range(-0.5, 0.5))
+                .collect();
+
+            let output = block.process_token(&input, &mut state);
+
+            assert_eq!(
+                output.len(),
+                hidden_size,
+                "token {t}: output should have hidden_size elements"
+            );
+            for (i, &val) in output.iter().enumerate() {
+                assert!(
+                    val.is_finite(),
+                    "token {t}: single-head output {i} not finite: {val}"
+                );
+            }
+        }
+
+        // State should be updated
+        assert!(
+            state.wkv_state.iter().any(|&x| x != 0.0),
+            "Single-head state should be non-zero after tokens"
+        );
+    }
 }
