@@ -19,8 +19,8 @@ use std::sync::Arc;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLSize,
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLDevice, MTLGPUFamily, MTLSize,
 };
 
 use metal_attention_gguf::GgufFile;
@@ -87,6 +87,14 @@ impl GpuForwardPass {
     /// KV caches, and prewarms PSOs.
     pub fn from_gguf(path: &Path) -> Result<Self, String> {
         let device = GpuDevice::shared();
+
+        // Verify GPU supports Apple Family 7+ (M1 and later) for simd_sum
+        if !device.device.supportsFamily(MTLGPUFamily::Apple7) {
+            return Err(
+                "GPU does not support Apple Family 7 (M1+). simd_sum requires Apple7 or later."
+                    .to_string(),
+            );
+        }
 
         // Open GGUF and extract config
         let gguf = Arc::new(
@@ -231,13 +239,21 @@ impl GpuForwardPass {
 
     /// Run a single-token forward pass through all layers.
     ///
-    /// Returns logits [vocab_size] as Vec<f32>.
+    /// Returns logits [vocab_size] as `Result<Vec<f32>, String>`.
     ///
     /// For POC, uses one command buffer per encoding block to allow CPU-side
     /// KV cache append between attention projection and decode attention.
     /// Within each command buffer, all kernel dispatches are inline-encoded.
-    pub fn forward_token(&mut self, token_id: u32) -> Vec<f32> {
+    pub fn forward_token(&mut self, token_id: u32) -> Result<Vec<f32>, String> {
         let debug = std::env::var("GPU_DEBUG").is_ok();
+
+        // Validate token_id is within vocab range
+        if token_id as usize >= self.vocab_size {
+            return Err(format!(
+                "token_id {} out of range (vocab_size={})",
+                token_id, self.vocab_size
+            ));
+        }
 
         // 1. CPU embedding lookup -> write to hidden_a via contents() memcpy
         self.embed_lookup(token_id);
@@ -252,7 +268,7 @@ impl GpuForwardPass {
         for layer_idx in 0..self.num_layers {
             // --- Attention block ---
             // Encode rmsnorm + Q/K/V projections + RoPE, commit+wait
-            self.encode_attention_projections(layer_idx);
+            self.encode_attention_projections(layer_idx)?;
 
             if debug && layer_idx < 2 {
                 let q = unsafe { read_buffer_slice(&self.scratch_q, self.num_heads * self.head_dim) };
@@ -268,7 +284,7 @@ impl GpuForwardPass {
                 .append_kv(&self.scratch_k, &self.scratch_v);
 
             // Decode attention + O projection + residual add
-            self.encode_attention_output(layer_idx);
+            self.encode_attention_output(layer_idx)?;
 
             if debug && layer_idx < 2 {
                 let h = unsafe { read_buffer_slice(&self.hidden_a, self.hidden_size) };
@@ -277,7 +293,7 @@ impl GpuForwardPass {
             }
 
             // --- FFN block ---
-            self.encode_ffn_block(layer_idx);
+            self.encode_ffn_block(layer_idx)?;
 
             if debug && layer_idx < 2 {
                 let h = unsafe { read_buffer_slice(&self.hidden_a, self.hidden_size) };
@@ -287,7 +303,7 @@ impl GpuForwardPass {
         }
 
         // 3. Final norm + lm_head
-        self.encode_final_logits();
+        self.encode_final_logits()?;
 
         // 4. Read back logits and increment position
         let logits = unsafe { read_buffer_slice(&self.logits_buf, self.vocab_size) };
@@ -298,7 +314,7 @@ impl GpuForwardPass {
         }
 
         self.position += 1;
-        logits
+        Ok(logits)
     }
 
     /// CPU embedding lookup: write embedding vector to hidden_a.
@@ -318,7 +334,7 @@ impl GpuForwardPass {
     ///
     /// After this, scratch_q has RoPE'd Q, scratch_k has RoPE'd K,
     /// scratch_v has V. Commits and waits so KV cache append can happen.
-    fn encode_attention_projections(&self, layer_idx: usize) {
+    fn encode_attention_projections(&self, layer_idx: usize) -> Result<(), String> {
         let cmd_buf = self
             .device
             .command_queue
@@ -378,10 +394,11 @@ impl GpuForwardPass {
         encoder.endEncoding();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
+        validate_command_buffer(&cmd_buf, "attention_projections", layer_idx)
     }
 
     /// Encode decode attention + O projection + residual add.
-    fn encode_attention_output(&self, layer_idx: usize) {
+    fn encode_attention_output(&self, layer_idx: usize) -> Result<(), String> {
         let cmd_buf = self
             .device
             .command_queue
@@ -426,13 +443,15 @@ impl GpuForwardPass {
         encoder.endEncoding();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
+        validate_command_buffer(&cmd_buf, "attention_output", layer_idx)?;
 
         // Copy scratch_residual -> hidden_a (both shared-mode, CPU memcpy)
         copy_buffer(&self.scratch_residual, &self.hidden_a, self.hidden_size * 4);
+        Ok(())
     }
 
     /// Encode FFN block: rmsnorm -> gate/up matvec -> SwiGLU -> down matvec -> residual add.
-    fn encode_ffn_block(&self, layer_idx: usize) {
+    fn encode_ffn_block(&self, layer_idx: usize) -> Result<(), String> {
         let cmd_buf = self
             .device
             .command_queue
@@ -497,13 +516,15 @@ impl GpuForwardPass {
         encoder.endEncoding();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
+        validate_command_buffer(&cmd_buf, "ffn_block", layer_idx)?;
 
         // Copy scratch_residual -> hidden_a
         copy_buffer(&self.scratch_residual, &self.hidden_a, self.hidden_size * 4);
+        Ok(())
     }
 
     /// Encode final RMSNorm + lm_head matvec to produce logits.
-    fn encode_final_logits(&self) {
+    fn encode_final_logits(&self) -> Result<(), String> {
         let cmd_buf = self
             .device
             .command_queue
@@ -547,6 +568,7 @@ impl GpuForwardPass {
         encoder.endEncoding();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
+        validate_command_buffer(&cmd_buf, "final_logits", 0)
     }
 
     // -----------------------------------------------------------------------
@@ -857,6 +879,29 @@ fn buf_stats(data: &[f32]) -> (bool, f32, f32) {
     let min = data.iter().cloned().fold(f32::INFINITY, f32::min);
     let max = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     (has_nan, min, max)
+}
+
+/// Validate that a command buffer completed successfully after waitUntilCompleted.
+///
+/// Returns `Err` with a descriptive message if the command buffer failed.
+fn validate_command_buffer(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    stage: &str,
+    layer_idx: usize,
+) -> Result<(), String> {
+    let status = cmd_buf.status();
+    if status == MTLCommandBufferStatus::Completed {
+        Ok(())
+    } else {
+        let error_desc = cmd_buf
+            .error()
+            .map(|e| e.localizedDescription().to_string())
+            .unwrap_or_else(|| "unknown error".to_string());
+        Err(format!(
+            "GPU command buffer failed at {stage} (layer {layer_idx}): status={:?}, error={error_desc}",
+            status
+        ))
+    }
 }
 
 /// CPU-side buffer copy between shared-mode Metal buffers.

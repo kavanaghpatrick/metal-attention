@@ -697,7 +697,7 @@ fn run_inference_gpu(
     let prefill_start = Instant::now();
     let mut logits = Vec::new();
     for &tok in &prompt_tokens {
-        logits = gpu.forward_token(tok);
+        logits = gpu.forward_token(tok)?;
     }
     let prefill_elapsed = prefill_start.elapsed();
 
@@ -720,7 +720,7 @@ fn run_inference_gpu(
         let _ = stdout.flush();
 
         // Forward next token
-        logits = gpu.forward_token(next_token);
+        logits = gpu.forward_token(next_token)?;
     }
     let decode_elapsed = decode_start.elapsed();
 
@@ -803,23 +803,23 @@ fn run_bench_gpu(
                 .collect();
 
             for &tok in &prompt_tokens {
-                let _ = gpu.forward_token(tok);
+                gpu.forward_token(tok)?;
             }
 
             // Warmup: 3 decode steps (only on first iteration)
             if iter == 0 {
                 for w in 0..3u32 {
-                    let logits = gpu.forward_token(w + 1);
+                    let logits = gpu.forward_token(w + 1)?;
                     let _ = argmax(&logits);
                 }
             }
 
             // Timed decode loop
-            let mut logits = gpu.forward_token(1u32); // seed token
+            let mut logits = gpu.forward_token(1u32)?; // seed token
             let decode_start = Instant::now();
             for _ in 0..gen_length {
                 let next = argmax(&logits);
-                logits = gpu.forward_token(next);
+                logits = gpu.forward_token(next)?;
             }
             let decode_elapsed = decode_start.elapsed();
             decode_times.push(decode_elapsed.as_secs_f64());

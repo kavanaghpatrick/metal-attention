@@ -19,6 +19,9 @@ use metal_attention_gguf::GgufFile;
 use metal_attention_kernels::buffer::{alloc_buffer_with_data, create_weight_buffer};
 use metal_attention_models::registry::ModelConfig;
 
+/// Q4_0 block size in bytes: 2 byte fp16 scale + 16 byte nibbles = 18 bytes per 32 elements.
+const Q4_0_BLOCK_BYTES: usize = 18;
+
 /// Per-layer attention projection buffers (Q/K/V/O weights, raw Q4_0).
 pub struct AttnProjBuffers {
     pub q: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -66,6 +69,23 @@ pub struct GpuWeightStore {
 /// Get the system page size at runtime.
 fn system_page_size() -> usize {
     unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) as usize }
+}
+
+/// Validate that a Q4_0 tensor has the expected byte count for its element count.
+///
+/// Each Q4_0 block encodes 32 elements in 18 bytes (2-byte fp16 scale + 16-byte nibbles).
+/// Returns `Err` if the byte length doesn't match the expected block count.
+fn validate_q4_0_size(tensor_name: &str, data_len: usize, n_elements: u64) -> Result<(), String> {
+    let expected_blocks = (n_elements as usize).div_ceil(32);
+    let expected_bytes = expected_blocks * Q4_0_BLOCK_BYTES;
+    if data_len != expected_bytes {
+        return Err(format!(
+            "Q4_0 block count mismatch for {tensor_name}: \
+             data_len={data_len} but expected {expected_blocks} blocks * {Q4_0_BLOCK_BYTES} = {expected_bytes} bytes \
+             (n_elements={n_elements})"
+        ));
+    }
+    Ok(())
 }
 
 /// Create a Metal buffer from GGUF tensor data, using zero-copy when page-aligned.
@@ -174,6 +194,24 @@ impl GpuWeightStore {
             let v_data = gguf.tensor_data(v_info);
             let o_data = gguf.tensor_data(o_info);
 
+            // Validate Q4_0 block counts for quantized attention weights
+            if q_info.gguf_type == GgufType::Q4_0 {
+                let n_elem = q_info.shape.iter().product::<u64>();
+                validate_q4_0_size(&format!("blk.{i}.attn_q.weight"), q_data.len(), n_elem)?;
+            }
+            if k_info.gguf_type == GgufType::Q4_0 {
+                let n_elem = k_info.shape.iter().product::<u64>();
+                validate_q4_0_size(&format!("blk.{i}.attn_k.weight"), k_data.len(), n_elem)?;
+            }
+            if v_info.gguf_type == GgufType::Q4_0 {
+                let n_elem = v_info.shape.iter().product::<u64>();
+                validate_q4_0_size(&format!("blk.{i}.attn_v.weight"), v_data.len(), n_elem)?;
+            }
+            if o_info.gguf_type == GgufType::Q4_0 {
+                let n_elem = o_info.shape.iter().product::<u64>();
+                validate_q4_0_size(&format!("blk.{i}.attn_output.weight"), o_data.len(), n_elem)?;
+            }
+
             attn_projs.push(AttnProjBuffers {
                 q: make_weight_buffer(device, q_data, &format!("blk.{i}.attn_q.weight"), page_size),
                 k: make_weight_buffer(device, k_data, &format!("blk.{i}.attn_k.weight"), page_size),
@@ -200,6 +238,20 @@ impl GpuWeightStore {
             let gate_data = gguf.tensor_data(gate_info);
             let up_data = gguf.tensor_data(up_info);
             let down_data = gguf.tensor_data(down_info);
+
+            // Validate Q4_0 block counts for quantized FFN weights
+            if gate_info.gguf_type == GgufType::Q4_0 {
+                let n_elem = gate_info.shape.iter().product::<u64>();
+                validate_q4_0_size(&format!("blk.{i}.ffn_gate.weight"), gate_data.len(), n_elem)?;
+            }
+            if up_info.gguf_type == GgufType::Q4_0 {
+                let n_elem = up_info.shape.iter().product::<u64>();
+                validate_q4_0_size(&format!("blk.{i}.ffn_up.weight"), up_data.len(), n_elem)?;
+            }
+            if down_info.gguf_type == GgufType::Q4_0 {
+                let n_elem = down_info.shape.iter().product::<u64>();
+                validate_q4_0_size(&format!("blk.{i}.ffn_down.weight"), down_data.len(), n_elem)?;
+            }
 
             ffns.push(FfnBuffers {
                 gate: make_weight_buffer(
