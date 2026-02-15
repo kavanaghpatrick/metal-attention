@@ -43,7 +43,7 @@ pub fn dispatch_gqa_remap(
         "k_full length mismatch"
     );
     assert!(
-        num_heads % num_kv_heads == 0,
+        num_heads.is_multiple_of(num_kv_heads),
         "num_heads must be divisible by num_kv_heads"
     );
 

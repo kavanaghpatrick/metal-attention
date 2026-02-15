@@ -3,6 +3,7 @@
 //! Constructs a full model from GGUF-loaded weights (or random weights for testing).
 //! Supports schedule-driven dispatch through RWKV-7 blocks.
 
+use metal_attention_models::llama::{LlamaLayer, LlamaState};
 use metal_attention_models::rwkv7::{Rwkv7Block, Rwkv7State};
 use metal_attention_models::registry::ModelConfig;
 use metal_attention_gguf::ModelArchitecture;
@@ -18,18 +19,21 @@ use crate::sampling::SimpleRng;
 pub enum ModelLayer {
     /// RWKV-7 linear recurrent block.
     Rwkv7(Rwkv7Block),
-    // Future: Flash, Jamba, Griffin, etc.
+    /// Llama/Mistral pure transformer block.
+    Llama(LlamaLayer),
 }
 
 /// Per-layer state, mirroring the ModelLayer enum.
 pub enum LayerState {
     Rwkv7(Rwkv7State),
+    Llama(LlamaState),
 }
 
 impl Clone for LayerState {
     fn clone(&self) -> Self {
         match self {
             LayerState::Rwkv7(s) => LayerState::Rwkv7(s.clone()),
+            LayerState::Llama(s) => LayerState::Llama(s.clone()),
         }
     }
 }
@@ -104,6 +108,7 @@ impl HybridModel {
             hidden_size,
             head_dim,
             num_heads,
+            num_kv_heads: num_heads,
             num_layers,
         };
 
@@ -133,6 +138,9 @@ impl HybridModel {
             .map(|layer| match layer {
                 ModelLayer::Rwkv7(block) => {
                     LayerState::Rwkv7(block.init_state(&self.block_config))
+                }
+                ModelLayer::Llama(layer) => {
+                    LayerState::Llama(layer.init_state(&self.block_config))
                 }
             })
             .collect();
@@ -187,8 +195,16 @@ impl HybridModel {
         for (i, layer) in self.layers.iter().enumerate() {
             match layer {
                 ModelLayer::Rwkv7(block) => {
-                    let LayerState::Rwkv7(ref mut layer_state) = state.layer_states[i];
+                    let LayerState::Rwkv7(ref mut layer_state) = state.layer_states[i] else {
+                        panic!("Layer state mismatch: expected Rwkv7 for layer {}", i);
+                    };
                     hidden = block.process_token(&hidden, layer_state);
+                }
+                ModelLayer::Llama(llama_layer) => {
+                    let LayerState::Llama(ref mut layer_state) = state.layer_states[i] else {
+                        panic!("Layer state mismatch: expected Llama for layer {}", i);
+                    };
+                    hidden = llama_layer.process_token(&hidden, layer_state);
                 }
             }
         }

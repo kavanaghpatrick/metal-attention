@@ -4,10 +4,12 @@
 //! Llama/Mistral, Jamba, Griffin, and Zamba architectures.
 
 pub mod flash_attn;
+pub mod llama;
 pub mod registry;
 pub mod rwkv7;
 
 // Re-exports
 pub use flash_attn::{FlashAttentionLayer, FlashAttentionState};
-pub use registry::{create_rwkv7_block, is_supported, supported_architectures, ModelConfig};
+pub use llama::{LlamaLayer, LlamaState};
+pub use registry::{create_llama_layer, create_rwkv7_block, is_supported, supported_architectures, ModelConfig};
 pub use rwkv7::{Rwkv7Block, Rwkv7State};

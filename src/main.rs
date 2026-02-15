@@ -167,12 +167,17 @@ fn run_inference(
         .get_u32("general.num_layers")
         .or_else(|| gguf.metadata.get_u32("rwkv.block_count"))
         .unwrap_or(12) as usize;
+    let num_kv_heads = gguf
+        .metadata
+        .get_u32("general.num_kv_heads")
+        .unwrap_or(num_heads as u32) as usize;
 
     let model_config = ModelConfig {
         architecture: arch,
         hidden_size,
         head_dim,
         num_heads,
+        num_kv_heads,
         num_layers,
     };
 

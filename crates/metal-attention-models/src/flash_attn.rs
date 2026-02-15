@@ -158,10 +158,10 @@ impl FlashAttentionLayer {
         let hd = self.head_dim;
         let mut heads = vec![vec![0.0f32; seq_len * hd]; total_heads];
         for t in 0..seq_len {
-            for h in 0..total_heads {
+            for (h, head) in heads.iter_mut().enumerate().take(total_heads) {
                 let src_start = t * total_heads * hd + h * hd;
                 let dst_start = t * hd;
-                heads[h][dst_start..dst_start + hd]
+                head[dst_start..dst_start + hd]
                     .copy_from_slice(&data[src_start..src_start + hd]);
             }
         }
@@ -227,12 +227,12 @@ impl FlashAttentionLayer {
         // Merge per-head outputs to token-major:
         // [num_heads][seq_len, head_dim] -> [seq_len, num_heads * head_dim]
         let mut result = vec![0.0f32; seq_len * nh * hd];
-        for h in 0..nh {
+        for (h, head_out) in head_outputs.iter().enumerate().take(nh) {
             for t in 0..seq_len {
                 let src_start = t * hd;
                 let dst_start = t * nh * hd + h * hd;
                 result[dst_start..dst_start + hd]
-                    .copy_from_slice(&head_outputs[h][src_start..src_start + hd]);
+                    .copy_from_slice(&head_out[src_start..src_start + hd]);
             }
         }
 
@@ -271,23 +271,23 @@ impl FlashAttentionLayer {
             // K is token-major: K[n, kv_head] at offset n * nkv * hd + kv_head * hd
             let mut scores = vec![0.0f32; kv_seq_len];
             let mut max_score = f32::NEG_INFINITY;
-            for n in 0..kv_seq_len {
+            for (n, score) in scores.iter_mut().enumerate().take(kv_seq_len) {
                 let k_off = n * nkv * hd + kv_head * hd;
                 let mut dot = 0.0f32;
                 for d in 0..hd {
                     dot += q[q_off + d] * k[k_off + d];
                 }
-                scores[n] = dot * scale;
-                if scores[n] > max_score {
-                    max_score = scores[n];
+                *score = dot * scale;
+                if *score > max_score {
+                    max_score = *score;
                 }
             }
 
             // Softmax
             let mut sum_exp = 0.0f32;
-            for n in 0..kv_seq_len {
-                scores[n] = (scores[n] - max_score).exp();
-                sum_exp += scores[n];
+            for score in scores.iter_mut() {
+                *score = (*score - max_score).exp();
+                sum_exp += *score;
             }
             if sum_exp > 0.0 {
                 for s in &mut scores {
@@ -298,9 +298,9 @@ impl FlashAttentionLayer {
             // Output: P * V -> [1, D]
             for d in 0..hd {
                 let mut acc = 0.0f32;
-                for n in 0..kv_seq_len {
+                for (n, &score) in scores.iter().enumerate().take(kv_seq_len) {
                     let v_off = n * nkv * hd + kv_head * hd;
-                    acc += scores[n] * v[v_off + d];
+                    acc += score * v[v_off + d];
                 }
                 output[q_off + d] = acc;
             }
