@@ -693,22 +693,20 @@ fn run_inference_gpu(
     let start = Instant::now();
     let mut stdout = std::io::stdout();
 
-    // Prefill: run forward_token for each prompt token (discard logits except last)
+    // Prefill: run forward_token for each prompt token except last (discard logits)
     let prefill_start = Instant::now();
-    let mut logits = Vec::new();
-    for &tok in &prompt_tokens {
-        logits = gpu.forward_token(tok)?;
+    for &tok in &prompt_tokens[..prompt_tokens.len() - 1] {
+        gpu.forward_token(tok)?;
     }
+    // Last prompt token uses greedy path to get first generated token
+    let mut next_token = gpu.forward_token_greedy(*prompt_tokens.last().unwrap())?;
     let prefill_elapsed = prefill_start.elapsed();
 
-    // Decode loop: greedy argmax
+    // Decode loop: GPU-side greedy argmax
     let mut token_count: usize = 0;
     let decode_start = Instant::now();
 
     for _ in 0..max_tokens {
-        // Greedy sample: argmax of logits
-        let next_token = argmax(&logits);
-
         // Stop on EOS
         if next_token == eos_id {
             break;
@@ -719,8 +717,8 @@ fn run_inference_gpu(
         print!("{text}");
         let _ = stdout.flush();
 
-        // Forward next token
-        logits = gpu.forward_token(next_token)?;
+        // Forward next token with GPU-side argmax
+        next_token = gpu.forward_token_greedy(next_token)?;
     }
     let decode_elapsed = decode_start.elapsed();
 
@@ -809,17 +807,15 @@ fn run_bench_gpu(
             // Warmup: 3 decode steps (only on first iteration)
             if iter == 0 {
                 for w in 0..3u32 {
-                    let logits = gpu.forward_token(w + 1)?;
-                    let _ = argmax(&logits);
+                    let _ = gpu.forward_token_greedy(w + 1)?;
                 }
             }
 
             // Timed decode loop
-            let mut logits = gpu.forward_token(1u32)?; // seed token
+            let mut next = gpu.forward_token_greedy(1u32)?; // seed token
             let decode_start = Instant::now();
             for _ in 0..gen_length {
-                let next = argmax(&logits);
-                logits = gpu.forward_token(next)?;
+                next = gpu.forward_token_greedy(next)?;
             }
             let decode_elapsed = decode_start.elapsed();
             decode_times.push(decode_elapsed.as_secs_f64());
@@ -860,6 +856,7 @@ fn run_bench_gpu(
 // Utility: greedy argmax
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 fn argmax(logits: &[f32]) -> u32 {
     let mut best_idx = 0u32;
     let mut best_val = f32::NEG_INFINITY;

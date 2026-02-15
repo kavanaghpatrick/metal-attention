@@ -1196,6 +1196,222 @@ impl GpuForwardPass {
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_final, tg);
     }
 
+    /// Run a single-token forward pass and return the greedy argmax token ID.
+    ///
+    /// Identical to `forward_token()` but appends a GPU-side argmax reduction
+    /// after the lm_head matvec, avoiding the 192KB logits readback. Only the
+    /// 4-byte `argmax_result` buffer (a single `u32` token_id) is read back.
+    pub fn forward_token_greedy(&mut self, token_id: u32) -> Result<u32, String> {
+        // Validate token_id is within vocab range
+        if token_id as usize >= self.vocab_size {
+            return Err(format!(
+                "token_id {} out of range (vocab_size={})",
+                token_id, self.vocab_size
+            ));
+        }
+
+        // 1. CPU embedding lookup -> write to hidden_a via contents() memcpy
+        self.embed_lookup(token_id);
+
+        // Pre-look up kv_cache_copy PSO before the layer loop
+        let kv_copy_pso = self
+            .pso_cache
+            .get(&PsoKey::simple("kv_cache_copy"))
+            .expect("kv_cache_copy PSO not prewarmed");
+
+        // 2. Create single command buffer + encoder for all layers + argmax
+        let cmd_buf = self
+            .device
+            .command_queue
+            .commandBuffer()
+            .expect("Failed to create command buffer");
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("Failed to create compute encoder");
+
+        // 3. Per-layer forward (all encoded into the single encoder)
+        for layer_idx in 0..self.num_layers {
+            let norms = self.weight_store.norm(layer_idx);
+            let attn = self.weight_store.attn_proj(layer_idx);
+
+            self.encode_rmsnorm(
+                &encoder,
+                &self.hidden_a,
+                &norms.attn_norm,
+                &self.hidden_b,
+            );
+
+            self.encode_matvec_q4_0(
+                &encoder,
+                &attn.q,
+                &self.hidden_b,
+                &self.scratch_q,
+                self.num_heads * self.head_dim,
+                self.hidden_size,
+            );
+
+            self.encode_matvec_q4_0(
+                &encoder,
+                &attn.k,
+                &self.hidden_b,
+                &self.scratch_k,
+                self.num_kv_heads * self.head_dim,
+                self.hidden_size,
+            );
+
+            self.encode_matvec_q4_0(
+                &encoder,
+                &attn.v,
+                &self.hidden_b,
+                &self.scratch_v,
+                self.num_kv_heads * self.head_dim,
+                self.hidden_size,
+            );
+
+            self.encode_rope(&encoder, &self.scratch_q, self.num_heads);
+            self.encode_rope(&encoder, &self.scratch_k, self.num_kv_heads);
+
+            self.kv_caches.cache_mut(layer_idx).encode_kv_append(
+                &encoder,
+                kv_copy_pso,
+                &self.scratch_k,
+                &self.scratch_v,
+            );
+
+            let kv_cache = self.kv_caches.cache(layer_idx);
+            let kv_len = kv_cache.current_len() as u32;
+
+            self.encode_decode_attention(
+                &encoder,
+                &self.scratch_q,
+                kv_cache.k_buffer(),
+                kv_cache.v_buffer(),
+                &self.scratch_attn_out,
+                kv_len,
+            );
+
+            let attn = self.weight_store.attn_proj(layer_idx);
+
+            self.encode_matvec_q4_0(
+                &encoder,
+                &attn.o,
+                &self.scratch_attn_out,
+                &self.scratch_o,
+                self.hidden_size,
+                self.num_heads * self.head_dim,
+            );
+
+            self.encode_residual_add(
+                &encoder,
+                &self.hidden_a,
+                &self.scratch_o,
+                &self.scratch_residual,
+            );
+
+            self.encode_buffer_copy(
+                &encoder,
+                &self.scratch_residual,
+                &self.hidden_a,
+                self.hidden_size,
+            );
+
+            let norms = self.weight_store.norm(layer_idx);
+            let ffn = self.weight_store.ffn(layer_idx);
+
+            self.encode_rmsnorm(
+                &encoder,
+                &self.hidden_a,
+                &norms.ffn_norm,
+                &self.hidden_b,
+            );
+
+            self.encode_matvec_q4_0(
+                &encoder,
+                &ffn.gate,
+                &self.hidden_b,
+                &self.scratch_gate,
+                self.intermediate_size,
+                self.hidden_size,
+            );
+
+            self.encode_matvec_q4_0(
+                &encoder,
+                &ffn.up,
+                &self.hidden_b,
+                &self.scratch_up,
+                self.intermediate_size,
+                self.hidden_size,
+            );
+
+            self.encode_ffn_silu(&encoder);
+
+            self.encode_matvec_q4_0(
+                &encoder,
+                &ffn.down,
+                &self.scratch_silu,
+                &self.scratch_ffn,
+                self.hidden_size,
+                self.intermediate_size,
+            );
+
+            self.encode_residual_add(
+                &encoder,
+                &self.hidden_a,
+                &self.scratch_ffn,
+                &self.scratch_residual,
+            );
+
+            self.encode_buffer_copy(
+                &encoder,
+                &self.scratch_residual,
+                &self.hidden_a,
+                self.hidden_size,
+            );
+        }
+
+        // 4. Final norm + lm_head
+        self.encode_rmsnorm(
+            &encoder,
+            &self.hidden_a,
+            self.weight_store.final_norm(),
+            &self.hidden_b,
+        );
+
+        if self.weight_store.lm_head_is_f32() {
+            self.encode_matvec_f32(
+                &encoder,
+                self.weight_store.lm_head(),
+                &self.hidden_b,
+                &self.logits_buf,
+                self.vocab_size,
+                self.hidden_size,
+            );
+        } else {
+            self.encode_matvec_q4_0(
+                &encoder,
+                self.weight_store.lm_head(),
+                &self.hidden_b,
+                &self.logits_buf,
+                self.vocab_size,
+                self.hidden_size,
+            );
+        }
+
+        // 5. GPU-side argmax on logits (avoids 192KB readback)
+        self.encode_argmax(&encoder, &self.logits_buf);
+
+        // 6. Single submit: endEncoding + commit + wait
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        validate_command_buffer(&cmd_buf, "forward_token_greedy", 0)?;
+
+        // 7. Read back only the 4-byte argmax result and increment position
+        let result = unsafe { read_buffer_slice::<u32>(&self.argmax_result, 1) };
+        self.position += 1;
+        Ok(result[0])
+    }
+
     /// Get the current decode position.
     pub fn position(&self) -> usize {
         self.position
