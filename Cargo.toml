@@ -1,0 +1,81 @@
+[workspace]
+members = [
+    "crates/metal-attention-traits",
+    "crates/metal-attention-kernels",
+    "crates/metal-attention-gguf",
+    "crates/metal-attention-models",
+    "crates/metal-attention",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Objective-C / Metal bindings
+objc2 = "0.6"
+objc2-metal = "0.3"
+objc2-foundation = "0.3"
+block2 = "0.6"
+
+# Memory-mapped I/O
+memmap2 = "0.9"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+thiserror = "2"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Half-precision floats (for dequantization tests)
+half = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# Property-based testing
+proptest = "1"
+
+# Internal crates
+metal-attention-traits = { path = "crates/metal-attention-traits" }
+metal-attention-kernels = { path = "crates/metal-attention-kernels" }
+metal-attention-gguf = { path = "crates/metal-attention-gguf" }
+metal-attention-models = { path = "crates/metal-attention-models" }
+metal-attention = { path = "crates/metal-attention" }
+
+[package]
+name = "metal-attention-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+metal-attention.workspace = true
+metal-attention-gguf.workspace = true
+metal-attention-models.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+metal-attention-traits.workspace = true
+
+[[bench]]
+name = "attention"
+harness = false
+
+[[bench]]
+name = "inference"
+harness = false

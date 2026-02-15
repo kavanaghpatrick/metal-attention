@@ -1,0 +1,19 @@
+[package]
+name = "metal-attention-kernels"
+version.workspace = true
+edition.workspace = true
+description = "Metal GPU compute kernels for attention, normalization, and inference primitives"
+
+[dependencies]
+metal-attention-traits.workspace = true
+objc2.workspace = true
+objc2-metal.workspace = true
+objc2-foundation.workspace = true
+block2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+dispatch = "0.2.0"
+
+[dev-dependencies]
+half.workspace = true
+proptest.workspace = true
