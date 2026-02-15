@@ -33,6 +33,9 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Half-precision floats (for dequantization tests)
+half = "2"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

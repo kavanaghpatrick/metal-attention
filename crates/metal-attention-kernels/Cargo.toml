@@ -13,3 +13,6 @@ block2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 dispatch = "0.2.0"
+
+[dev-dependencies]
+half.workspace = true
