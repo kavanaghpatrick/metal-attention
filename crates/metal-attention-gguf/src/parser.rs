@@ -416,6 +416,19 @@ impl GgufBuilder {
         self
     }
 
+    pub fn add_f32_array(mut self, key: &str, values: &[f32]) -> Self {
+        let mut val_bytes = Vec::new();
+        // Array header: element type (Float32=6) + count
+        val_bytes.extend_from_slice(&(GgufMetadataValueType::Float32 as u32).to_le_bytes());
+        val_bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        for &f in values {
+            val_bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        self.metadata
+            .push((key.to_string(), GgufMetadataValueType::Array, val_bytes));
+        self
+    }
+
     pub fn add_string_array(mut self, key: &str, values: &[&str]) -> Self {
         let mut val_bytes = Vec::new();
         // Array header: element type (string=8) + count

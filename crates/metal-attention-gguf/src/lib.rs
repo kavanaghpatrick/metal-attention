@@ -9,6 +9,7 @@ pub mod metadata;
 pub mod parser;
 pub mod quantize;
 pub mod tensor;
+pub mod tokenizer;
 
 // Re-exports for convenience
 pub use architectures::{ModelArchitecture, WeightRole, map_tensor_name};
@@ -17,3 +18,4 @@ pub use metadata::{GgufMetadata, GgufMetadataValue};
 pub use parser::{GgufBuilder, GgufError, GgufFile};
 pub use quantize::GgufType;
 pub use tensor::GgufTensorInfo;
+pub use tokenizer::GgufTokenizer;

@@ -128,6 +128,23 @@ impl GgufMetadata {
         }
     }
 
+    /// Get an f32 array metadata value.
+    pub fn get_array_f32(&self, key: &str) -> Option<Vec<f32>> {
+        match self.map.get(key) {
+            Some(GgufMetadataValue::Array(arr)) => {
+                let mut result = Vec::with_capacity(arr.len());
+                for v in arr {
+                    match v {
+                        GgufMetadataValue::Float32(f) => result.push(*f),
+                        _ => return None,
+                    }
+                }
+                Some(result)
+            }
+            _ => None,
+        }
+    }
+
     /// Get a raw metadata value.
     pub fn get(&self, key: &str) -> Option<&GgufMetadataValue> {
         self.map.get(key)

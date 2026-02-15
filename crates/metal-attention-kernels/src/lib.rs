@@ -20,7 +20,7 @@ pub mod types;
 // Re-export primary types for convenience
 pub use buffer::{alloc_buffer, alloc_buffer_with_data, BufferPool};
 pub use command::CommandManager;
-pub use dequant::dispatch_dequantize_q4_0;
+pub use dequant::{dispatch_dequantize_q4_0, dispatch_dequantize_q8_0};
 pub use device::GpuDevice;
 pub use dispatch::{dispatch_1d, dispatch_2d, dispatch_threadgroups, set_buffer, set_bytes};
 pub use embed::dispatch_embedding_lookup;

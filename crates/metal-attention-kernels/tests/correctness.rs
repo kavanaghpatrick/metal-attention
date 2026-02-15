@@ -5,7 +5,7 @@
 //!
 //! Run: MTL_SHADER_VALIDATION=1 cargo test --test correctness -- --test-threads=1
 
-use metal_attention_kernels::dequant::dispatch_dequantize_q4_0;
+use metal_attention_kernels::dequant::{dispatch_dequantize_q4_0, dispatch_dequantize_q8_0};
 use metal_attention_kernels::device::GpuDevice;
 use metal_attention_kernels::embed::dispatch_embedding_lookup;
 use metal_attention_kernels::ffn::dispatch_ffn_silu;
@@ -738,4 +738,91 @@ fn test_dequantize_q4_0_zero_scale() {
     let gpu_out = dispatch_dequantize_q4_0(&device, &mut pso_cache, &input, 1);
 
     assert_allclose(&gpu_out, &cpu_out, 1e-6, 1e-5, "dequantize_q4_0 zero scale");
+}
+
+// ---------------------------------------------------------------------------
+// GPU correctness tests: Q8_0 Dequantization
+// ---------------------------------------------------------------------------
+
+/// Pack a Q8_0 block from a scale and 32 int8 quantized values.
+fn pack_q8_0_block(scale: f32, values: &[i8; 32]) -> [u8; 34] {
+    let mut block = [0u8; 34];
+    // Write scale as f16
+    let scale_f16 = half::f16::from_f32(scale);
+    let scale_bytes = scale_f16.to_bits().to_le_bytes();
+    block[0] = scale_bytes[0];
+    block[1] = scale_bytes[1];
+    // Write 32 int8 values
+    for i in 0..32 {
+        block[2 + i] = values[i] as u8;
+    }
+    block
+}
+
+/// CPU reference for Q8_0 dequantization.
+fn cpu_dequantize_q8_0(input: &[u8], num_blocks: usize) -> Vec<f32> {
+    let mut output = Vec::with_capacity(num_blocks * 32);
+    for block in 0..num_blocks {
+        let block_offset = block * 34;
+        // Read scale as f16 (stored as 2 little-endian bytes)
+        let scale_bits = u16::from_le_bytes([input[block_offset], input[block_offset + 1]]);
+        let scale = half::f16::from_bits(scale_bits).to_f32();
+        let quants = &input[block_offset + 2..block_offset + 34];
+        for i in 0..32 {
+            let q = quants[i] as i8;
+            output.push(q as f32 * scale);
+        }
+    }
+    output
+}
+
+#[test]
+fn test_dequantize_q8_0_gpu_vs_cpu() {
+    // Create 2 blocks of Q8_0 data
+    let scale1 = 0.25f32;
+    let vals1: [i8; 32] = [
+        -128, -100, -80, -60, -40, -20, -10, -5, -1, 0, 1, 5, 10, 20, 40, 60,
+        80, 100, 127, -127, -64, -32, -16, -8, -4, -2, 2, 4, 8, 16, 32, 64,
+    ];
+    let block1 = pack_q8_0_block(scale1, &vals1);
+
+    let scale2 = 1.0f32;
+    let vals2: [i8; 32] = [
+        0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8,
+        -8, 16, -16, 32, -32, 64, -64, 127, -127, -128, 100, -100, 50, -50, 25, -25,
+    ];
+    let block2 = pack_q8_0_block(scale2, &vals2);
+
+    let mut input = Vec::with_capacity(68);
+    input.extend_from_slice(&block1);
+    input.extend_from_slice(&block2);
+
+    let num_blocks = 2;
+    let cpu_out = cpu_dequantize_q8_0(&input, num_blocks);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_dequantize_q8_0(&device, &mut pso_cache, &input, num_blocks);
+
+    assert_allclose(&gpu_out, &cpu_out, 1e-3, 1e-2, "dequantize_q8_0 2 blocks");
+}
+
+#[test]
+fn test_dequantize_q8_0_zero_scale() {
+    // Zero scale should produce all zeros
+    let vals: [i8; 32] = [
+        -128, -100, -80, -60, -40, -20, -10, -5, -1, 0, 1, 5, 10, 20, 40, 60,
+        80, 100, 127, -127, -64, -32, -16, -8, -4, -2, 2, 4, 8, 16, 32, 64,
+    ];
+    let block = pack_q8_0_block(0.0, &vals);
+    let input = block.to_vec();
+
+    let cpu_out = cpu_dequantize_q8_0(&input, 1);
+    assert!(cpu_out.iter().all(|&v| v == 0.0), "CPU: zero scale should give zeros");
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_dequantize_q8_0(&device, &mut pso_cache, &input, 1);
+
+    assert_allclose(&gpu_out, &cpu_out, 1e-6, 1e-5, "dequantize_q8_0 zero scale");
 }
