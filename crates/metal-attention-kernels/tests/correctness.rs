@@ -15,6 +15,11 @@ use metal_attention_kernels::matmul::dispatch_matmul;
 use metal_attention_kernels::norm::dispatch_rmsnorm;
 use metal_attention_kernels::pipeline::PsoCache;
 
+// Imports for low-level Metal dispatch (kv_cache_copy / buffer_copy tests)
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+};
+
 // ---------------------------------------------------------------------------
 // QA tolerance constants (from QA.md specification)
 // ---------------------------------------------------------------------------
@@ -1249,6 +1254,309 @@ fn test_linear_attention_output_finiteness() {
             "linear_attention output[{i}] is not finite: {val}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// GPU correctness tests: kv_cache_copy and buffer_copy kernels
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_kv_cache_copy_gpu_vs_cpu() {
+    use metal_attention_kernels::buffer::{alloc_buffer, alloc_buffer_with_data, read_buffer_slice};
+    use metal_attention_kernels::dispatch::{set_buffer, set_bytes};
+
+    let kv_dim: u32 = 192;
+    let max_rows: usize = 4;
+    let kv_dim_usize = kv_dim as usize;
+
+    // Generate known source data for K and V
+    let scratch_k = gen_data(kv_dim_usize, 0.0);
+    let scratch_v = gen_data(kv_dim_usize, 1.0);
+
+    // Allocate GPU buffers
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let pso_key = metal_attention_kernels::pipeline::PsoKey::simple("kv_cache_copy");
+    let pso = pso_cache.get_or_compile(&pso_key);
+    // Hold a reference to the PSO for use across dispatches
+    let pso_ptr = pso;
+
+    let k_src_buf = alloc_buffer_with_data(&device.device, &scratch_k);
+    let v_src_buf = alloc_buffer_with_data(&device.device, &scratch_v);
+    let cache_size = max_rows * kv_dim_usize * std::mem::size_of::<f32>();
+    let k_dst_buf = alloc_buffer(&device.device, cache_size);
+    let v_dst_buf = alloc_buffer(&device.device, cache_size);
+
+    // Zero-init the cache buffers
+    unsafe {
+        std::ptr::write_bytes(k_dst_buf.contents().as_ptr() as *mut u8, 0, cache_size);
+        std::ptr::write_bytes(v_dst_buf.contents().as_ptr() as *mut u8, 0, cache_size);
+    }
+
+    // Dispatch kv_cache_copy at row_idx=0
+    let row_idx_0: u32 = 0;
+    {
+        let cmd_buf = device
+            .command_queue
+            .commandBuffer()
+            .expect("Failed to create command buffer");
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("Failed to create compute encoder");
+        encoder.setComputePipelineState(pso_ptr);
+        set_buffer(&encoder, &k_src_buf, 0, 0);
+        set_buffer(&encoder, &v_src_buf, 0, 1);
+        set_buffer(&encoder, &k_dst_buf, 0, 2);
+        set_buffer(&encoder, &v_dst_buf, 0, 3);
+        set_bytes(&encoder, &kv_dim, 4);
+        set_bytes(&encoder, &row_idx_0, 5);
+        let grid = objc2_metal::MTLSize {
+            width: kv_dim_usize,
+            height: 1,
+            depth: 1,
+        };
+        let tg = objc2_metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+    }
+
+    // Read back and verify row 0
+    let k_cache: Vec<f32> =
+        unsafe { read_buffer_slice(&k_dst_buf, max_rows * kv_dim_usize) };
+    let v_cache: Vec<f32> =
+        unsafe { read_buffer_slice(&v_dst_buf, max_rows * kv_dim_usize) };
+
+    // Row 0 should match scratch data exactly (bit-for-bit copy)
+    assert_eq!(
+        &k_cache[..kv_dim_usize],
+        &scratch_k[..],
+        "kv_cache_copy: K row 0 mismatch"
+    );
+    assert_eq!(
+        &v_cache[..kv_dim_usize],
+        &scratch_v[..],
+        "kv_cache_copy: V row 0 mismatch"
+    );
+
+    // Rows 1+ should still be zero
+    for i in kv_dim_usize..max_rows * kv_dim_usize {
+        assert_eq!(k_cache[i], 0.0, "kv_cache_copy: K cache row >0 should be zero at idx {i}");
+        assert_eq!(v_cache[i], 0.0, "kv_cache_copy: V cache row >0 should be zero at idx {i}");
+    }
+
+    // Now dispatch at row_idx=1 with different data
+    let scratch_k2 = gen_data(kv_dim_usize, 2.0);
+    let scratch_v2 = gen_data(kv_dim_usize, 3.0);
+    let k_src_buf2 = alloc_buffer_with_data(&device.device, &scratch_k2);
+    let v_src_buf2 = alloc_buffer_with_data(&device.device, &scratch_v2);
+    let row_idx_1: u32 = 1;
+    {
+        let cmd_buf = device
+            .command_queue
+            .commandBuffer()
+            .expect("Failed to create command buffer");
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("Failed to create compute encoder");
+        encoder.setComputePipelineState(pso_ptr);
+        set_buffer(&encoder, &k_src_buf2, 0, 0);
+        set_buffer(&encoder, &v_src_buf2, 0, 1);
+        set_buffer(&encoder, &k_dst_buf, 0, 2);
+        set_buffer(&encoder, &v_dst_buf, 0, 3);
+        set_bytes(&encoder, &kv_dim, 4);
+        set_bytes(&encoder, &row_idx_1, 5);
+        let grid = objc2_metal::MTLSize {
+            width: kv_dim_usize,
+            height: 1,
+            depth: 1,
+        };
+        let tg = objc2_metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+    }
+
+    // Read back again
+    let k_cache2: Vec<f32> =
+        unsafe { read_buffer_slice(&k_dst_buf, max_rows * kv_dim_usize) };
+    let v_cache2: Vec<f32> =
+        unsafe { read_buffer_slice(&v_dst_buf, max_rows * kv_dim_usize) };
+
+    // Row 0 should be UNCHANGED (still matches scratch_k/scratch_v)
+    assert_eq!(
+        &k_cache2[..kv_dim_usize],
+        &scratch_k[..],
+        "kv_cache_copy: K row 0 should be unchanged after row 1 write"
+    );
+    assert_eq!(
+        &v_cache2[..kv_dim_usize],
+        &scratch_v[..],
+        "kv_cache_copy: V row 0 should be unchanged after row 1 write"
+    );
+
+    // Row 1 should match scratch_k2/scratch_v2
+    assert_eq!(
+        &k_cache2[kv_dim_usize..2 * kv_dim_usize],
+        &scratch_k2[..],
+        "kv_cache_copy: K row 1 mismatch"
+    );
+    assert_eq!(
+        &v_cache2[kv_dim_usize..2 * kv_dim_usize],
+        &scratch_v2[..],
+        "kv_cache_copy: V row 1 mismatch"
+    );
+
+    // Rows 2+ should still be zero
+    for i in 2 * kv_dim_usize..max_rows * kv_dim_usize {
+        assert_eq!(k_cache2[i], 0.0, "kv_cache_copy: K row >=2 should be zero at idx {i}");
+        assert_eq!(v_cache2[i], 0.0, "kv_cache_copy: V row >=2 should be zero at idx {i}");
+    }
+
+    eprintln!("kv_cache_copy: PASS (2 rows verified bit-for-bit, kv_dim={kv_dim})");
+}
+
+#[test]
+fn test_buffer_copy_gpu_vs_cpu() {
+    use metal_attention_kernels::buffer::{alloc_buffer, alloc_buffer_with_data, read_buffer_slice};
+    use metal_attention_kernels::dispatch::{set_buffer, set_bytes};
+
+    let count: u32 = 576;
+    let count_usize = count as usize;
+
+    // Generate known source data
+    let src_data = gen_data(count_usize, 5.0);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let pso_key = metal_attention_kernels::pipeline::PsoKey::simple("buffer_copy");
+    let pso = pso_cache.get_or_compile(&pso_key);
+
+    let src_buf = alloc_buffer_with_data(&device.device, &src_data);
+    let dst_buf = alloc_buffer(&device.device, count_usize * std::mem::size_of::<f32>());
+
+    // Zero-init dst
+    unsafe {
+        std::ptr::write_bytes(
+            dst_buf.contents().as_ptr() as *mut u8,
+            0,
+            count_usize * std::mem::size_of::<f32>(),
+        );
+    }
+
+    // Dispatch buffer_copy
+    {
+        let cmd_buf = device
+            .command_queue
+            .commandBuffer()
+            .expect("Failed to create command buffer");
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("Failed to create compute encoder");
+        encoder.setComputePipelineState(pso);
+        set_buffer(&encoder, &src_buf, 0, 0);
+        set_buffer(&encoder, &dst_buf, 0, 1);
+        set_bytes(&encoder, &count, 2);
+        let grid = objc2_metal::MTLSize {
+            width: count_usize,
+            height: 1,
+            depth: 1,
+        };
+        let tg = objc2_metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+    }
+
+    // Read back and compare bit-for-bit
+    let dst_data: Vec<f32> = unsafe { read_buffer_slice(&dst_buf, count_usize) };
+    assert_eq!(
+        dst_data, src_data,
+        "buffer_copy: dst should match src bit-for-bit (count={count})"
+    );
+
+    eprintln!("buffer_copy: PASS (count={count}, bit-for-bit match)");
+}
+
+#[test]
+fn test_buffer_copy_small() {
+    use metal_attention_kernels::buffer::{alloc_buffer, alloc_buffer_with_data, read_buffer_slice};
+    use metal_attention_kernels::dispatch::{set_buffer, set_bytes};
+
+    let count: u32 = 1;
+    let count_usize = count as usize;
+
+    let src_data = vec![42.0f32];
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let pso_key = metal_attention_kernels::pipeline::PsoKey::simple("buffer_copy");
+    let pso = pso_cache.get_or_compile(&pso_key);
+
+    let src_buf = alloc_buffer_with_data(&device.device, &src_data);
+    let dst_buf = alloc_buffer(&device.device, std::mem::size_of::<f32>());
+
+    // Zero-init dst
+    unsafe {
+        std::ptr::write_bytes(
+            dst_buf.contents().as_ptr() as *mut u8,
+            0,
+            std::mem::size_of::<f32>(),
+        );
+    }
+
+    // Dispatch buffer_copy with count=1
+    {
+        let cmd_buf = device
+            .command_queue
+            .commandBuffer()
+            .expect("Failed to create command buffer");
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("Failed to create compute encoder");
+        encoder.setComputePipelineState(pso);
+        set_buffer(&encoder, &src_buf, 0, 0);
+        set_buffer(&encoder, &dst_buf, 0, 1);
+        set_bytes(&encoder, &count, 2);
+        let grid = objc2_metal::MTLSize {
+            width: count_usize,
+            height: 1,
+            depth: 1,
+        };
+        let tg = objc2_metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+    }
+
+    // Read back and compare
+    let dst_data: Vec<f32> = unsafe { read_buffer_slice(&dst_buf, count_usize) };
+    assert_eq!(
+        dst_data, src_data,
+        "buffer_copy_small: dst should match src (count=1)"
+    );
+
+    eprintln!("buffer_copy_small: PASS (count=1, edge case)");
 }
 
 /// Verify tolerance constants match QA spec requirements.
