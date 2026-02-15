@@ -70,6 +70,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+metal-attention-traits.workspace = true
 
 [[bench]]
 name = "attention"
