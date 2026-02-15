@@ -158,6 +158,7 @@ impl HybridModel {
     /// using the appropriate architecture loader.
     ///
     /// Currently only supports Llama architecture.
+    #[allow(clippy::needless_option_as_deref)]
     pub fn from_gguf(
         path: &Path,
         device: Option<&GpuDevice>,
@@ -224,8 +225,7 @@ impl HybridModel {
 
         let embed_weight =
             dequantize_tensor(&gguf, "token_embd.weight", device, pso.as_deref_mut())?;
-        let final_norm_weight =
-            dequantize_tensor(&gguf, "output_norm.weight", device, None)?;
+        let final_norm_weight = dequantize_tensor(&gguf, "output_norm.weight", device, None)?;
 
         // lm_head: try output.weight, fall back to tied embeddings
         let lm_head_weight =

@@ -59,16 +59,14 @@ pub fn dequantize_tensor(
         }
         GgufType::Q4_0 => {
             let device = device.ok_or("GPU device required for Q4_0 dequantization")?;
-            let pso_cache =
-                pso_cache.ok_or("PSO cache required for Q4_0 dequantization")?;
+            let pso_cache = pso_cache.ok_or("PSO cache required for Q4_0 dequantization")?;
             let block_size = tensor_info.gguf_type.block_size();
             let n_blocks = n_elements / block_size;
             Ok(dispatch_dequantize_q4_0(device, pso_cache, bytes, n_blocks))
         }
         GgufType::Q8_0 => {
             let device = device.ok_or("GPU device required for Q8_0 dequantization")?;
-            let pso_cache =
-                pso_cache.ok_or("PSO cache required for Q8_0 dequantization")?;
+            let pso_cache = pso_cache.ok_or("PSO cache required for Q8_0 dequantization")?;
             let block_size = tensor_info.gguf_type.block_size();
             let n_blocks = n_elements / block_size;
             Ok(dispatch_dequantize_q8_0(device, pso_cache, bytes, n_blocks))

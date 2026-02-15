@@ -15,6 +15,10 @@ use metal_attention_gguf::quantize::GgufType;
 use metal_attention_gguf::tokenizer::GgufTokenizer;
 use metal_attention_models::registry::{self, ModelConfig};
 
+// GPU device and pipeline state cache for weight dequantization
+use metal_attention_kernels::device::GpuDevice;
+use metal_attention_kernels::pipeline::PsoCache;
+
 #[derive(Parser)]
 #[command(name = "metal-attention")]
 #[command(about = "Hybrid model inference engine for Apple Silicon")]
@@ -590,16 +594,11 @@ fn run_inference(
     let tokenizer = GgufTokenizer::from_metadata(&gguf.metadata)
         .map_err(|e| format!("Error: Failed to build tokenizer from GGUF metadata: {e}"))?;
 
-    // 6. Construct model (random weights for now -- real weight loading in later phase)
-    let vocab_size = tokenizer.vocab_size();
-    let hybrid_model = HybridModel::random(
-        vocab_size,
-        hidden_size,
-        head_dim,
-        num_heads,
-        num_layers,
-        seed.unwrap_or(42),
-    );
+    // 6. Construct model from GGUF weights
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let hybrid_model = HybridModel::from_gguf(&model_path, Some(&device), Some(&mut pso_cache))
+        .map_err(|e| format!("Error: Failed to load model from GGUF: {e}"))?;
 
     // 7. Build inference config
     let config = InferenceConfig {

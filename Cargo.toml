@@ -64,6 +64,7 @@ edition.workspace = true
 [dependencies]
 metal-attention.workspace = true
 metal-attention-gguf.workspace = true
+metal-attention-kernels.workspace = true
 metal-attention-models.workspace = true
 clap.workspace = true
 tracing.workspace = true

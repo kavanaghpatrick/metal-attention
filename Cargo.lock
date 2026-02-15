@@ -547,6 +547,7 @@ dependencies = [
  "criterion",
  "metal-attention",
  "metal-attention-gguf",
+ "metal-attention-kernels",
  "metal-attention-models",
  "metal-attention-traits",
  "serde",
@@ -585,6 +586,8 @@ dependencies = [
 name = "metal-attention-models"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
+ "half",
  "metal-attention-gguf",
  "metal-attention-kernels",
  "metal-attention-traits",

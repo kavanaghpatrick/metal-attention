@@ -171,6 +171,7 @@ impl LlamaLayer {
     /// - `config`: Model configuration with dimensions.
     /// - `device`: GPU device for quantized tensor dispatch.
     /// - `pso_cache`: Pipeline state cache for GPU kernels.
+    #[allow(clippy::needless_option_as_deref)]
     pub fn from_gguf(
         gguf_file: &GgufFile,
         layer_idx: usize,
@@ -184,18 +185,34 @@ impl LlamaLayer {
         let n = layer_idx;
 
         // Norm weights (usually F32, no GPU needed)
-        let attn_norm_weight =
-            dequant_tensor(gguf_file, &format!("blk.{n}.attn_norm.weight"), device, None)?;
+        let attn_norm_weight = dequant_tensor(
+            gguf_file,
+            &format!("blk.{n}.attn_norm.weight"),
+            device,
+            None,
+        )?;
         let ffn_norm_weight =
             dequant_tensor(gguf_file, &format!("blk.{n}.ffn_norm.weight"), device, None)?;
 
         // Attention weights (may be quantized)
-        let w_q =
-            dequant_tensor(gguf_file, &format!("blk.{n}.attn_q.weight"), device, pso.as_deref_mut())?;
-        let w_k =
-            dequant_tensor(gguf_file, &format!("blk.{n}.attn_k.weight"), device, pso.as_deref_mut())?;
-        let w_v =
-            dequant_tensor(gguf_file, &format!("blk.{n}.attn_v.weight"), device, pso.as_deref_mut())?;
+        let w_q = dequant_tensor(
+            gguf_file,
+            &format!("blk.{n}.attn_q.weight"),
+            device,
+            pso.as_deref_mut(),
+        )?;
+        let w_k = dequant_tensor(
+            gguf_file,
+            &format!("blk.{n}.attn_k.weight"),
+            device,
+            pso.as_deref_mut(),
+        )?;
+        let w_v = dequant_tensor(
+            gguf_file,
+            &format!("blk.{n}.attn_v.weight"),
+            device,
+            pso.as_deref_mut(),
+        )?;
         let w_o = dequant_tensor(
             gguf_file,
             &format!("blk.{n}.attn_output.weight"),
@@ -210,8 +227,12 @@ impl LlamaLayer {
             device,
             pso.as_deref_mut(),
         )?;
-        let w_up =
-            dequant_tensor(gguf_file, &format!("blk.{n}.ffn_up.weight"), device, pso.as_deref_mut())?;
+        let w_up = dequant_tensor(
+            gguf_file,
+            &format!("blk.{n}.ffn_up.weight"),
+            device,
+            pso.as_deref_mut(),
+        )?;
         let w_down = dequant_tensor(
             gguf_file,
             &format!("blk.{n}.ffn_down.weight"),
