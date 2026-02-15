@@ -9,6 +9,8 @@ metal-attention-traits.workspace = true
 metal-attention-kernels.workspace = true
 metal-attention-gguf.workspace = true
 metal-attention-models.workspace = true
+objc2.workspace = true
+objc2-metal.workspace = true
 half.workspace = true
 bytemuck.workspace = true
 clap.workspace = true
@@ -17,6 +19,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 proptest.workspace = true
