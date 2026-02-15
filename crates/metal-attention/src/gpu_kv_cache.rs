@@ -9,9 +9,10 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLDevice};
+use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLSize};
 
 use metal_attention_kernels::buffer::alloc_buffer;
+use metal_attention_kernels::dispatch::{set_buffer, set_bytes};
 
 /// GPU-resident KV cache for a single transformer layer.
 ///
@@ -105,6 +106,68 @@ impl GpuKVCache {
             let v_dst = (self.v_buf.contents().as_ptr() as *mut u8).add(offset);
             std::ptr::copy_nonoverlapping(v_src, v_dst, row_bytes);
         }
+
+        self.len += 1;
+    }
+
+    /// Append a single K/V row to the cache via GPU-side compute kernel.
+    ///
+    /// Encodes a `kv_cache_copy` kernel dispatch that copies `kv_dim` floats
+    /// from scratch K/V buffers into the cache at position `self.len`, then
+    /// increments `len` on the CPU side.
+    ///
+    /// The kernel is dispatched but not yet executed — CPU-side `len` increment
+    /// is safe because subsequent dispatches read `kv_len` as a parameter,
+    /// not from GPU memory.
+    ///
+    /// # Arguments
+    /// - `encoder`: Active compute command encoder (shared across all layers).
+    /// - `pso`: Pre-compiled pipeline state for `kv_cache_copy` kernel.
+    /// - `k_src`: Scratch buffer containing the new K vector (from forward pass).
+    /// - `v_src`: Scratch buffer containing the new V vector (from forward pass).
+    ///
+    /// # Panics
+    /// If the cache is full (`len >= max_len`).
+    pub fn encode_kv_append(
+        &mut self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        pso: &ProtocolObject<dyn MTLComputePipelineState>,
+        k_src: &ProtocolObject<dyn MTLBuffer>,
+        v_src: &ProtocolObject<dyn MTLBuffer>,
+    ) {
+        assert!(
+            self.len < self.max_len,
+            "KV cache full: len={} >= max_len={}",
+            self.len,
+            self.max_len
+        );
+
+        encoder.setComputePipelineState(pso);
+
+        // Buffer bindings: k_src(0), v_src(1), k_dst(2), v_dst(3)
+        set_buffer(encoder, k_src, 0, 0);
+        set_buffer(encoder, v_src, 0, 1);
+        set_buffer(encoder, &self.k_buf, 0, 2);
+        set_buffer(encoder, &self.v_buf, 0, 3);
+
+        // Scalar params: kv_dim(4), row_idx(5)
+        let kv_dim_u32 = self.kv_dim as u32;
+        let row_idx_u32 = self.len as u32;
+        set_bytes(encoder, &kv_dim_u32, 4);
+        set_bytes(encoder, &row_idx_u32, 5);
+
+        // Dispatch: one thread per KV dimension element
+        let grid_size = MTLSize {
+            width: self.kv_dim,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup_size = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
         self.len += 1;
     }
