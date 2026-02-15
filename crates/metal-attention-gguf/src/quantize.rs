@@ -124,7 +124,7 @@ impl GgufType {
     /// Calculate the total byte size for `n_elements` values of this type.
     pub fn tensor_byte_size(&self, n_elements: usize) -> usize {
         let bs = self.block_size();
-        let n_blocks = (n_elements + bs - 1) / bs;
+        let n_blocks = n_elements.div_ceil(bs);
         n_blocks * self.bytes_per_block()
     }
 }

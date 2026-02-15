@@ -354,6 +354,7 @@ fn align_up(value: usize, alignment: usize) -> usize {
 // ─── Synthetic GGUF builder (for tests) ──────────────────────────────────────
 
 /// Builder for creating synthetic GGUF files in-memory for testing.
+#[derive(Default)]
 pub struct GgufBuilder {
     version: u32,
     metadata: Vec<(String, GgufMetadataValueType, Vec<u8>)>,
