@@ -16,6 +16,19 @@ use metal_attention_kernels::norm::dispatch_rmsnorm;
 use metal_attention_kernels::pipeline::PsoCache;
 
 // ---------------------------------------------------------------------------
+// QA tolerance constants (from QA.md specification)
+// ---------------------------------------------------------------------------
+
+/// Absolute tolerance for flash (softmax) attention GPU vs CPU.
+const FLASH_ATOL: f64 = 5e-3;
+/// Absolute tolerance for linear (chunk-based) attention GPU vs CPU.
+const LINEAR_ATOL: f64 = 1e-3;
+/// Absolute tolerance for RoPE positional encoding GPU vs CPU.
+const ROPE_ATOL: f64 = 1e-4;
+/// Absolute tolerance for grouped-query attention GPU vs CPU.
+const GQA_ATOL: f64 = 1e-6;
+
+// ---------------------------------------------------------------------------
 // CPU reference implementations (ported from proto)
 // ---------------------------------------------------------------------------
 
@@ -825,4 +838,402 @@ fn test_dequantize_q8_0_zero_scale() {
     let gpu_out = dispatch_dequantize_q8_0(&device, &mut pso_cache, &input, 1);
 
     assert_allclose(&gpu_out, &cpu_out, 1e-6, 1e-5, "dequantize_q8_0 zero scale");
+}
+
+// ===========================================================================
+// Parameterized flash attention sweep
+// ===========================================================================
+
+/// Helper: run flash attention GPU vs CPU at given (N, D, heads) configuration.
+fn run_flash_attention_check(seq_len: usize, head_dim: usize, num_heads: usize) {
+    let q = gen_data(seq_len * head_dim, 0.0);
+    let k = gen_data(seq_len * head_dim, 1.0);
+    let v = gen_data(seq_len * head_dim, 2.0);
+
+    let cpu_out = cpu_attention_f64(&q, &k, &v, seq_len, head_dim);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_flash_attention(
+        &device,
+        &mut pso_cache,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        head_dim,
+        num_heads,
+    );
+
+    assert_allclose(
+        &gpu_out,
+        &cpu_out,
+        FLASH_ATOL as f32,
+        1e-2,
+        &format!("flash_attn_sweep N={seq_len} D={head_dim} H={num_heads}"),
+    );
+}
+
+#[test]
+fn test_flash_attention_sweep_n64_d64() {
+    run_flash_attention_check(64, 64, 1);
+}
+
+#[test]
+fn test_flash_attention_sweep_n128_d64() {
+    run_flash_attention_check(128, 64, 1);
+}
+
+#[test]
+fn test_flash_attention_sweep_n256_d64() {
+    run_flash_attention_check(256, 64, 1);
+}
+
+#[test]
+fn test_flash_attention_sweep_n512_d64() {
+    run_flash_attention_check(512, 64, 1);
+}
+
+// ===========================================================================
+// Parameterized linear attention sweep
+// ===========================================================================
+
+/// Helper: run linear attention GPU vs CPU at given (N, D, chunk_size) configuration.
+fn run_linear_attention_check(seq_len: usize, head_dim: usize, chunk_size: usize) {
+    let q = gen_data(seq_len * head_dim, 3.0);
+    let k = gen_data(seq_len * head_dim, 4.0);
+    let v = gen_data(seq_len * head_dim, 5.0);
+
+    let cpu_out = cpu_linear_attention_f64(&q, &k, &v, seq_len, head_dim, chunk_size);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_linear_attention(
+        &device,
+        &mut pso_cache,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        head_dim,
+        chunk_size,
+    );
+
+    assert_allclose(
+        &gpu_out,
+        &cpu_out,
+        LINEAR_ATOL as f32,
+        1e-2,
+        &format!("linear_attn_sweep N={seq_len} D={head_dim} C={chunk_size}"),
+    );
+}
+
+#[test]
+fn test_linear_attention_sweep_n64_d64() {
+    run_linear_attention_check(64, 64, 32);
+}
+
+#[test]
+fn test_linear_attention_sweep_n128_d64() {
+    run_linear_attention_check(128, 64, 32);
+}
+
+#[test]
+fn test_linear_attention_sweep_n256_d64() {
+    run_linear_attention_check(256, 64, 32);
+}
+
+// ===========================================================================
+// Edge case tests
+// ===========================================================================
+
+/// Uniform Q=K=V=1.0: all attention weights should be equal (1/N),
+/// so each output row should be close to V (which is all 1.0).
+#[test]
+fn test_flash_attention_uniform_input() {
+    let seq_len = 64;
+    let head_dim = 64;
+    let num_heads = 1;
+
+    let q = vec![1.0f32; seq_len * head_dim];
+    let k = vec![1.0f32; seq_len * head_dim];
+    let v = vec![1.0f32; seq_len * head_dim];
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_flash_attention(
+        &device,
+        &mut pso_cache,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        head_dim,
+        num_heads,
+    );
+
+    // With uniform input, all attention weights are 1/N for each query.
+    // The weighted sum of V (all 1.0) is 1.0 for every position.
+    let expected = vec![1.0f32; seq_len * head_dim];
+    assert_allclose(
+        &gpu_out,
+        &expected,
+        FLASH_ATOL as f32,
+        1e-2,
+        "flash_attention uniform Q=K=V=1.0",
+    );
+}
+
+/// One-hot query: a single non-zero element in Q at position 0.
+/// Verify correct attention behavior (scores dominated by matching K positions).
+#[test]
+fn test_flash_attention_one_hot_query() {
+    let seq_len = 64;
+    let head_dim = 64;
+    let num_heads = 1;
+
+    // Q: only first token, first dimension is 10.0 (rest zero)
+    let mut q = vec![0.0f32; seq_len * head_dim];
+    q[0] = 10.0; // token 0, dim 0
+
+    // K: first token has 10.0 at dim 0 (matching Q), rest have 0.0 at dim 0
+    let mut k = vec![0.0f32; seq_len * head_dim];
+    k[0] = 10.0; // token 0, dim 0 -- matches Q[0]
+
+    // V: each token has a distinct first-dim value for easy verification
+    let mut v = vec![0.0f32; seq_len * head_dim];
+    for i in 0..seq_len {
+        v[i * head_dim] = i as f32;
+    }
+
+    let cpu_out = cpu_attention_f64(&q, &k, &v, seq_len, head_dim);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_flash_attention(
+        &device,
+        &mut pso_cache,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        head_dim,
+        num_heads,
+    );
+
+    assert_allclose(
+        &gpu_out,
+        &cpu_out,
+        FLASH_ATOL as f32,
+        1e-2,
+        "flash_attention one_hot_query",
+    );
+}
+
+/// Linear attention with K = identity (one-hot rows):
+/// First chunk of 32 tokens accumulates partial identity in H,
+/// second chunk sees the full state. GPU vs CPU reference comparison.
+#[test]
+fn test_linear_attention_identity_key() {
+    let head_dim = 64;
+    let seq_len = 64;
+    let chunk_size = 32;
+
+    // K: identity-like -- each of the first head_dim tokens gets a 1.0 at its dimension
+    let mut k = vec![0.0f32; seq_len * head_dim];
+    for i in 0..head_dim.min(seq_len) {
+        k[i * head_dim + i] = 1.0;
+    }
+
+    // Q: identity-like (same as K)
+    let mut q = vec![0.0f32; seq_len * head_dim];
+    for i in 0..head_dim.min(seq_len) {
+        q[i * head_dim + i] = 1.0;
+    }
+
+    // V: each token i has value (i+1) in its own dimension
+    let mut v = vec![0.0f32; seq_len * head_dim];
+    for i in 0..seq_len {
+        v[i * head_dim + (i % head_dim)] = (i + 1) as f32;
+    }
+
+    let cpu_out = cpu_linear_attention_f64(&q, &k, &v, seq_len, head_dim, chunk_size);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_linear_attention(
+        &device,
+        &mut pso_cache,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        head_dim,
+        chunk_size,
+    );
+
+    assert_allclose(
+        &gpu_out,
+        &cpu_out,
+        LINEAR_ATOL as f32,
+        1e-2,
+        "linear_attention identity_key",
+    );
+}
+
+/// RMSNorm of all-zero input should produce all-zero (or near-zero) output.
+/// rms = sqrt(mean(0^2) + eps) = sqrt(eps), output = (0 / sqrt(eps)) * weight = 0.
+#[test]
+fn test_rmsnorm_zero_input() {
+    let num_tokens = 2;
+    let hidden_dim = 64;
+    let eps = 1e-5f32;
+
+    let input = vec![0.0f32; num_tokens * hidden_dim];
+    let weight = vec![1.0f32; hidden_dim];
+
+    let cpu_out = cpu_rmsnorm(&input, &weight, num_tokens, hidden_dim, eps);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_rmsnorm(
+        &device,
+        &mut pso_cache,
+        &input,
+        &weight,
+        num_tokens,
+        hidden_dim,
+        eps,
+    );
+
+    // All outputs should be zero (0 / sqrt(eps)) * w = 0
+    let expected = vec![0.0f32; num_tokens * hidden_dim];
+    assert_allclose(
+        &gpu_out,
+        &expected,
+        ROPE_ATOL as f32, // tighter tolerance for this trivial case
+        1e-5,
+        "rmsnorm zero_input",
+    );
+    assert_allclose(
+        &gpu_out,
+        &cpu_out,
+        ROPE_ATOL as f32,
+        1e-5,
+        "rmsnorm zero_input gpu_vs_cpu",
+    );
+}
+
+/// Matmul A * I = A: multiplying by identity should return A unchanged.
+#[test]
+fn test_matmul_identity_sweep() {
+    let n = 8;
+
+    // Build identity matrix
+    let mut identity = vec![0.0f32; n * n];
+    for i in 0..n {
+        identity[i * n + i] = 1.0;
+    }
+
+    // A = arbitrary matrix
+    let a = gen_data(n * n, 7.0);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_matmul(&device, &mut pso_cache, &a, &identity, n, n, n);
+
+    assert_allclose(
+        &gpu_out,
+        &a,
+        1e-5,
+        1e-4,
+        "matmul A*I=A sweep",
+    );
+}
+
+// ===========================================================================
+// Finiteness and dimensional correctness checks
+// ===========================================================================
+
+/// Verify all flash attention outputs are finite (no NaN/Inf).
+#[test]
+fn test_flash_attention_output_finiteness() {
+    let seq_len = 128;
+    let head_dim = 64;
+    let num_heads = 1;
+
+    let q = gen_data(seq_len * head_dim, 10.0);
+    let k = gen_data(seq_len * head_dim, 20.0);
+    let v = gen_data(seq_len * head_dim, 30.0);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_flash_attention(
+        &device,
+        &mut pso_cache,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        head_dim,
+        num_heads,
+    );
+
+    assert_eq!(gpu_out.len(), seq_len * head_dim, "output dimension mismatch");
+    for (i, &val) in gpu_out.iter().enumerate() {
+        assert!(
+            val.is_finite(),
+            "flash_attention output[{i}] is not finite: {val}"
+        );
+    }
+}
+
+/// Verify all linear attention outputs are finite (no NaN/Inf).
+#[test]
+fn test_linear_attention_output_finiteness() {
+    let seq_len = 128;
+    let head_dim = 64;
+    let chunk_size = 64;
+
+    let q = gen_data(seq_len * head_dim, 10.0);
+    let k = gen_data(seq_len * head_dim, 20.0);
+    let v = gen_data(seq_len * head_dim, 30.0);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_linear_attention(
+        &device,
+        &mut pso_cache,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        head_dim,
+        chunk_size,
+    );
+
+    assert_eq!(gpu_out.len(), seq_len * head_dim, "output dimension mismatch");
+    for (i, &val) in gpu_out.iter().enumerate() {
+        assert!(
+            val.is_finite(),
+            "linear_attention output[{i}] is not finite: {val}"
+        );
+    }
+}
+
+/// Verify tolerance constants match QA spec requirements.
+#[test]
+fn test_tolerance_constants_consistency() {
+    // Flash attention: 5e-3 absolute tolerance
+    assert!((FLASH_ATOL - 5e-3).abs() < 1e-10, "FLASH_ATOL must be 5e-3");
+    // Linear attention: 1e-3 absolute tolerance
+    assert!((LINEAR_ATOL - 1e-3).abs() < 1e-10, "LINEAR_ATOL must be 1e-3");
+    // RoPE: 1e-4 absolute tolerance
+    assert!((ROPE_ATOL - 1e-4).abs() < 1e-10, "ROPE_ATOL must be 1e-4");
+    // GQA: 1e-6 absolute tolerance
+    assert!((GQA_ATOL - 1e-6).abs() < 1e-10, "GQA_ATOL must be 1e-6");
+    // Verify ordering: tightest to loosest
+    assert!(GQA_ATOL < ROPE_ATOL, "GQA must be tighter than RoPE");
+    assert!(ROPE_ATOL < LINEAR_ATOL, "RoPE must be tighter than Linear");
+    assert!(LINEAR_ATOL < FLASH_ATOL, "Linear must be tighter than Flash");
 }

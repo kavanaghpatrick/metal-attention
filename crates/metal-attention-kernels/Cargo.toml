@@ -16,3 +16,4 @@ dispatch = "0.2.0"
 
 [dev-dependencies]
 half.workspace = true
+proptest.workspace = true
