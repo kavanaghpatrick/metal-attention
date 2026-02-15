@@ -232,4 +232,74 @@ mod tests {
             max_diff
         );
     }
+
+    #[test]
+    fn test_rope_apply_multi_position() {
+        // Verify rotation angles at positions 0, 1, 10, 100
+        let gpu = GpuDevice::new();
+        let mut pso_cache = PsoCache::new(gpu.library.clone());
+
+        let num_heads = 4;
+        let head_dim = 64; // realistic SmolLM head_dim
+
+        let qk: Vec<f32> = (0..num_heads * head_dim)
+            .map(|i| (i as f32 - 128.0) * 0.01)
+            .collect();
+
+        for position in [0usize, 1, 10, 100] {
+            let gpu_result = dispatch_rope_apply(
+                &gpu,
+                &mut pso_cache,
+                &qk,
+                num_heads,
+                head_dim,
+                position,
+                THETA,
+            );
+
+            let mut cpu_result = qk.clone();
+            cpu_rope_apply(&mut cpu_result, num_heads, head_dim, position, THETA);
+
+            assert_eq!(gpu_result.len(), cpu_result.len());
+            let mut max_diff = 0.0f32;
+            for i in 0..cpu_result.len() {
+                let diff = (gpu_result[i] - cpu_result[i]).abs();
+                max_diff = max_diff.max(diff);
+                assert!(
+                    diff < 1e-4,
+                    "position={}, index {}: GPU={}, CPU={}, diff={}",
+                    position, i, gpu_result[i], cpu_result[i], diff
+                );
+            }
+
+            // At position 0, output should be identity (cos=1, sin=0)
+            if position == 0 {
+                for i in 0..qk.len() {
+                    let diff = (gpu_result[i] - qk[i]).abs();
+                    assert!(
+                        diff < 1e-5,
+                        "position=0 should be identity, index {}: input={}, output={}, diff={}",
+                        i, qk[i], gpu_result[i], diff
+                    );
+                }
+            } else {
+                // At non-zero positions, output should differ from input
+                let total_diff: f32 = gpu_result
+                    .iter()
+                    .zip(qk.iter())
+                    .map(|(g, q)| (g - q).abs())
+                    .sum();
+                assert!(
+                    total_diff > 0.01,
+                    "position={}: rotation should change values, but total diff={}",
+                    position, total_diff
+                );
+            }
+
+            eprintln!(
+                "test_rope_apply_multi_position: position={}, max_diff={:.6}",
+                position, max_diff
+            );
+        }
+    }
 }

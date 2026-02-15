@@ -149,7 +149,7 @@ pub fn dispatch_rmsnorm_optimized(
     // Allocate Metal buffers
     let input_buf = alloc_buffer_with_data(&device.device, input);
     let weight_buf = alloc_buffer_with_data(&device.device, weight);
-    let output_buf = alloc_buffer(&device.device, hidden_dim * std::mem::size_of::<f32>());
+    let output_buf = alloc_buffer(&device.device, std::mem::size_of_val(input));
 
     // Compile PSO
     let pso_key = PsoKey::simple("rmsnorm_optimized");
@@ -293,5 +293,82 @@ mod tests {
             "test_rmsnorm_optimized_known_vector: rms={:.6}, out[0]={:.6}, out[1]={:.6}",
             rms, result[0], result[1]
         );
+    }
+
+    #[test]
+    fn test_rmsnorm_optimized_576() {
+        // SmolLM hidden dimension (576) -- realistic size
+        let gpu = GpuDevice::new();
+        let mut pso_cache = PsoCache::new(gpu.library.clone());
+
+        let hidden_dim = 576;
+        let eps = 1e-5f32;
+
+        // Deterministic input and weight vectors
+        let input: Vec<f32> = (0..hidden_dim)
+            .map(|i| 0.1 * ((i % 20) as f32 - 10.0))
+            .collect();
+        let weight: Vec<f32> = (0..hidden_dim)
+            .map(|i| 0.5 + 0.01 * (i % 100) as f32)
+            .collect();
+
+        let expected = cpu_rmsnorm(&input, &weight, eps);
+        let result = dispatch_rmsnorm_optimized(&gpu, &mut pso_cache, &input, &weight, eps);
+
+        assert_eq!(result.len(), hidden_dim);
+        let mut max_diff = 0.0f32;
+        for i in 0..hidden_dim {
+            let diff = (result[i] - expected[i]).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 1e-5,
+                "index {}: GPU={}, CPU={}, diff={}",
+                i, result[i], expected[i], diff
+            );
+        }
+        eprintln!(
+            "test_rmsnorm_optimized_576: max_diff={:.6}, all {} elements within tolerance",
+            max_diff, hidden_dim
+        );
+    }
+
+    #[test]
+    fn test_rmsnorm_optimized_identity_weight() {
+        // With weight = 1.0 everywhere, output = input / rms
+        let gpu = GpuDevice::new();
+        let mut pso_cache = PsoCache::new(gpu.library.clone());
+
+        let hidden_dim = 64; // small but valid (>= 32 for simdgroup)
+        let eps = 1e-5f32;
+
+        // Constant input: all 2.0
+        // rms = sqrt(mean(4.0) + eps) = sqrt(4.0 + eps) ~ 2.0
+        // output = 2.0 / 2.0 * 1.0 = 1.0 for all elements
+        let input = vec![2.0f32; hidden_dim];
+        let weight = vec![1.0f32; hidden_dim];
+
+        let expected = cpu_rmsnorm(&input, &weight, eps);
+        let result = dispatch_rmsnorm_optimized(&gpu, &mut pso_cache, &input, &weight, eps);
+
+        assert_eq!(result.len(), hidden_dim);
+        for i in 0..hidden_dim {
+            let diff = (result[i] - expected[i]).abs();
+            assert!(
+                diff < 1e-5,
+                "index {}: GPU={}, CPU={}, diff={}",
+                i, result[i], expected[i], diff
+            );
+        }
+
+        // Analytically: rms = sqrt(4.0 + 1e-5) ~ 2.0, output ~ 1.0
+        let expected_val = 2.0 / (4.0f32 + eps).sqrt();
+        for i in 0..hidden_dim {
+            let diff = (result[i] - expected_val).abs();
+            assert!(
+                diff < 1e-5,
+                "index {}: GPU={}, analytical={}, diff={}",
+                i, result[i], expected_val, diff
+            );
+        }
     }
 }

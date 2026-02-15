@@ -386,4 +386,117 @@ mod tests {
             result.len()
         );
     }
+
+    #[test]
+    fn test_decode_attention_single_head() {
+        // Trivial case: 1 head, 1 kv_head, head_dim=4, kv_len=1
+        // With a single KV position, softmax output = 1.0, so output = V[0]
+        let gpu = GpuDevice::new();
+        let mut pso_cache = PsoCache::new(gpu.library.clone());
+
+        let num_heads = 1;
+        let num_kv_heads = 1;
+        let head_dim = 4;
+        let kv_len = 1;
+
+        let q = vec![1.0, 0.0, 0.0, 0.0];
+        let k_cache = vec![0.5, 0.5, 0.0, 0.0]; // single KV position
+        let v_cache = vec![0.1, 0.2, 0.3, 0.4]; // expected output (softmax trivially = 1.0)
+
+        let expected = cpu_decode_attention(
+            &q, &k_cache, &v_cache, num_heads, num_kv_heads, head_dim, kv_len,
+        );
+
+        let result = dispatch_decode_attention(
+            &gpu,
+            &mut pso_cache,
+            &q,
+            &k_cache,
+            &v_cache,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            kv_len,
+        );
+
+        assert_eq!(result.len(), num_heads * head_dim);
+        for i in 0..result.len() {
+            let diff = (result[i] - expected[i]).abs();
+            assert!(
+                diff < 1e-3,
+                "Index {}: GPU={}, CPU={}, diff={}",
+                i, result[i], expected[i], diff
+            );
+        }
+
+        // With single KV position, output should equal V[0] exactly
+        for i in 0..head_dim {
+            let diff = (result[i] - v_cache[i]).abs();
+            assert!(
+                diff < 1e-3,
+                "Single KV: output[{}]={}, expected V[{}]={}, diff={}",
+                i, result[i], i, v_cache[i], diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_attention_long_context() {
+        // kv_len=512, verify no threadgroup memory overflow (scores[2048] limit)
+        let gpu = GpuDevice::new();
+        let mut pso_cache = PsoCache::new(gpu.library.clone());
+
+        let num_heads = 9;
+        let num_kv_heads = 3;
+        let head_dim = 64;
+        let kv_len = 512;
+
+        let kv_dim = num_kv_heads * head_dim; // 192
+
+        // Deterministic pseudo-random data
+        let q: Vec<f32> = (0..num_heads * head_dim)
+            .map(|i| 0.01 * ((i * 7 + 3) % 100) as f32 - 0.5)
+            .collect();
+
+        let k_cache: Vec<f32> = (0..kv_len * kv_dim)
+            .map(|i| 0.01 * ((i * 13 + 7) % 100) as f32 - 0.5)
+            .collect();
+
+        let v_cache: Vec<f32> = (0..kv_len * kv_dim)
+            .map(|i| 0.01 * ((i * 17 + 11) % 100) as f32 - 0.5)
+            .collect();
+
+        let expected = cpu_decode_attention(
+            &q, &k_cache, &v_cache, num_heads, num_kv_heads, head_dim, kv_len,
+        );
+
+        let result = dispatch_decode_attention(
+            &gpu,
+            &mut pso_cache,
+            &q,
+            &k_cache,
+            &v_cache,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            kv_len,
+        );
+
+        assert_eq!(result.len(), num_heads * head_dim);
+        let mut max_diff = 0.0f32;
+        for i in 0..result.len() {
+            let diff = (result[i] - expected[i]).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 1e-3,
+                "Index {}: GPU={}, CPU={}, diff={}",
+                i, result[i], expected[i], diff
+            );
+        }
+
+        eprintln!(
+            "test_decode_attention_long_context: kv_len={}, max_diff={:.6}, {} outputs verified",
+            kv_len, max_diff, result.len()
+        );
+    }
 }

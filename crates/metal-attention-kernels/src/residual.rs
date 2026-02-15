@@ -39,7 +39,7 @@ pub fn dispatch_residual_add(
     // Allocate Metal buffers
     let a_buf = alloc_buffer_with_data(&device.device, a);
     let b_buf = alloc_buffer_with_data(&device.device, b);
-    let output_buf = alloc_buffer(&device.device, dim * std::mem::size_of::<f32>());
+    let output_buf = alloc_buffer(&device.device, std::mem::size_of_val(a));
 
     // Compile PSO
     let pso_key = PsoKey::simple("residual_add");
@@ -120,6 +120,29 @@ mod tests {
                 result[i], expected[i],
                 "index {}: GPU={}, expected={}",
                 i, result[i], expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_residual_add_576() {
+        // SmolLM hidden dimension (576) -- realistic size
+        let gpu = GpuDevice::new();
+        let mut pso_cache = PsoCache::new(gpu.library.clone());
+
+        let dim = 576;
+        let a: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.01).collect();
+        let b: Vec<f32> = (0..dim).map(|i| (dim as f32 - i as f32) * 0.01).collect();
+
+        let result = dispatch_residual_add(&gpu, &mut pso_cache, &a, &b);
+
+        assert_eq!(result.len(), dim);
+        for i in 0..dim {
+            let expected = a[i] + b[i];
+            assert_eq!(
+                result[i], expected,
+                "index {}: GPU={}, expected={}",
+                i, result[i], expected
             );
         }
     }
