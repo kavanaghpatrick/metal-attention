@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod dequant;
+pub mod gpu_kv_cache;
 pub mod gpu_weight_store;
 pub mod inference;
 pub mod model;
