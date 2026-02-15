@@ -76,10 +76,9 @@ impl JambaLayer {
                     attn_state: attn_state.clone(),
                 };
 
-                let output = if attn_state.kv_cache.len() == 0 {
+                let output = if attn_state.kv_cache.is_empty() {
                     // First token: prefill path
-                    let out = llama.process_prefill(input, &mut llama_state, 1);
-                    out
+                    llama.process_prefill(input, &mut llama_state, 1)
                 } else {
                     // Subsequent tokens: decode path
                     llama.process_token(input, &mut llama_state)
@@ -280,6 +279,7 @@ fn add(a: &[f32], b: &[f32]) -> Vec<f32> {
 /// Build a full Jamba model's layers using 7:1 Mamba:Attention schedule.
 ///
 /// Returns a Vec of JambaLayer with the appropriate mix of Mamba and Attention layers.
+#[allow(clippy::too_many_arguments)]
 pub fn build_jamba_layers(
     hidden_size: usize,
     head_dim: usize,

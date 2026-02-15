@@ -74,7 +74,7 @@ pub fn dispatch_prefix_sum(
     }
 
     // Dispatch: one thread per D*D element
-    let num_threadgroups = (dd + threads_per_tg - 1) / threads_per_tg;
+    let num_threadgroups = dd.div_ceil(threads_per_tg);
     let threadgroups = MTLSize {
         width: num_threadgroups,
         height: 1,

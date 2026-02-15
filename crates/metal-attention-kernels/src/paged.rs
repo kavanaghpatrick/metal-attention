@@ -57,7 +57,7 @@ pub fn dispatch_paged_attention(
     assert_eq!(q.len(), seq_len * head_dim, "Q length mismatch");
 
     let block_r: usize = 16; // TILE_Q in shader
-    let num_query_blocks = (seq_len + block_r - 1) / block_r;
+    let num_query_blocks = seq_len.div_ceil(block_r);
     let num_logical_pages = block_table.len();
 
     // Build AttentionParams for the shader
@@ -246,7 +246,7 @@ pub fn cpu_paged_attention(
         let mut scores = vec![-f32::INFINITY; context_len];
         let mut max_score = -f32::INFINITY;
 
-        for kv_pos in 0..context_len {
+        for (kv_pos, score) in scores.iter_mut().enumerate().take(context_len) {
             // Find which page and slot
             let logical_page = kv_pos / page_size;
             let slot = kv_pos % page_size;
@@ -261,8 +261,8 @@ pub fn cpu_paged_attention(
             for d in 0..head_dim {
                 dot += q[q_off + d] * kv_cache[k_base + d];
             }
-            scores[kv_pos] = dot * scale;
-            max_score = max_score.max(scores[kv_pos]);
+            *score = dot * scale;
+            max_score = max_score.max(*score);
         }
 
         // Softmax
@@ -278,7 +278,7 @@ pub fn cpu_paged_attention(
         }
 
         // Weighted sum of V
-        for kv_pos in 0..context_len {
+        for (kv_pos, &score) in scores.iter().enumerate().take(context_len) {
             let logical_page = kv_pos / page_size;
             let slot = kv_pos % page_size;
             let phys_page = block_table[logical_page] as usize;
@@ -288,7 +288,7 @@ pub fn cpu_paged_attention(
                 phys_page * 2 * page_size * head_dim + page_size * head_dim + slot * head_dim;
 
             for d in 0..head_dim {
-                output[q_off + d] += scores[kv_pos] * kv_cache[v_base + d];
+                output[q_off + d] += score * kv_cache[v_base + d];
             }
         }
     }
