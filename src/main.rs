@@ -13,8 +13,6 @@ use metal_attention::model::HybridModel;
 use metal_attention_gguf::parser::{GgufError, GgufFile};
 use metal_attention_gguf::quantize::GgufType;
 use metal_attention_gguf::tokenizer::GgufTokenizer;
-use metal_attention_models::registry::{self, ModelConfig};
-
 // GPU device and pipeline state cache for weight dequantization
 use metal_attention_kernels::device::GpuDevice;
 use metal_attention_kernels::pipeline::PsoCache;
@@ -185,15 +183,18 @@ fn run_info(model_path: PathBuf, json_output: bool) -> Result<(), String> {
     let arch = gguf.architecture;
     let arch_str = format!("{:?}", arch);
 
+    let arch_prefix = arch_str.to_lowercase();
     let hidden_size = gguf
         .metadata
-        .get_u32("general.hidden_size")
+        .get_u32(&format!("{arch_prefix}.embedding_length"))
+        .or_else(|| gguf.metadata.get_u32("general.hidden_size"))
         .or_else(|| gguf.metadata.get_u32("rwkv.embedding_size"))
         .unwrap_or(0) as usize;
 
     let num_heads = gguf
         .metadata
-        .get_u32("general.num_attention_heads")
+        .get_u32(&format!("{arch_prefix}.attention.head_count"))
+        .or_else(|| gguf.metadata.get_u32("general.num_attention_heads"))
         .or_else(|| gguf.metadata.get_u32("rwkv.num_heads"))
         .unwrap_or(0) as usize;
 
@@ -205,13 +206,15 @@ fn run_info(model_path: PathBuf, json_output: bool) -> Result<(), String> {
 
     let num_layers = gguf
         .metadata
-        .get_u32("general.num_layers")
+        .get_u32(&format!("{arch_prefix}.block_count"))
+        .or_else(|| gguf.metadata.get_u32("general.num_layers"))
         .or_else(|| gguf.metadata.get_u32("rwkv.block_count"))
         .unwrap_or(0) as usize;
 
     let num_kv_heads = gguf
         .metadata
-        .get_u32("general.num_kv_heads")
+        .get_u32(&format!("{arch_prefix}.attention.head_count_kv"))
+        .or_else(|| gguf.metadata.get_u32("general.num_kv_heads"))
         .unwrap_or(num_heads as u32) as usize;
 
     // Detect dominant quantization type from tensors
@@ -531,7 +534,7 @@ fn run_inference(
         ));
     }
 
-    // 2. Open and parse GGUF file
+    // 2. Parse GGUF for tokenizer (before loading weights)
     let gguf = GgufFile::open(&model_path).map_err(|e| match &e {
         GgufError::BadMagic(_) => format!(
             "Error: Invalid GGUF file: {}\nHint: The file does not appear to be a valid GGUF model",
@@ -540,61 +543,12 @@ fn run_inference(
         _ => format!("Error: Failed to parse GGUF file: {e}"),
     })?;
 
-    // 3. Detect architecture and check support
-    let arch = gguf.architecture;
-    if !registry::is_supported(arch) {
-        return Err(format!(
-            "Error: Unsupported model architecture: {:?}\nSupported: {:?}",
-            arch,
-            registry::supported_architectures()
-        ));
-    }
-
-    // 4. Extract model config from metadata
-    let hidden_size = gguf
-        .metadata
-        .get_u32("general.hidden_size")
-        .or_else(|| gguf.metadata.get_u32("rwkv.embedding_size"))
-        .unwrap_or(768) as usize;
-    let num_heads = gguf
-        .metadata
-        .get_u32("general.num_attention_heads")
-        .or_else(|| gguf.metadata.get_u32("rwkv.num_heads"))
-        .unwrap_or(12) as usize;
-    let head_dim = if num_heads > 0 {
-        hidden_size / num_heads
-    } else {
-        hidden_size
-    };
-    let num_layers = gguf
-        .metadata
-        .get_u32("general.num_layers")
-        .or_else(|| gguf.metadata.get_u32("rwkv.block_count"))
-        .unwrap_or(12) as usize;
-    let num_kv_heads = gguf
-        .metadata
-        .get_u32("general.num_kv_heads")
-        .unwrap_or(num_heads as u32) as usize;
-
-    let _model_config = ModelConfig {
-        architecture: arch,
-        hidden_size,
-        head_dim,
-        num_heads,
-        num_kv_heads,
-        num_layers,
-    };
-
-    eprintln!(
-        "Loading model: {:?} ({}L, {}H, {}D)",
-        arch, num_layers, num_heads, hidden_size
-    );
-
-    // 5. Build tokenizer from GGUF metadata
+    // 3. Build tokenizer from GGUF metadata
     let tokenizer = GgufTokenizer::from_metadata(&gguf.metadata)
         .map_err(|e| format!("Error: Failed to build tokenizer from GGUF metadata: {e}"))?;
+    drop(gguf); // Free mmap before loading weights (from_gguf opens its own)
 
-    // 6. Construct model from GGUF weights
+    // 4. Construct model from GGUF weights
     let device = GpuDevice::new();
     let mut pso_cache = PsoCache::new(device.library.clone());
     let hybrid_model = HybridModel::from_gguf(&model_path, Some(&device), Some(&mut pso_cache))

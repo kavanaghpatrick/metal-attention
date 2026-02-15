@@ -323,6 +323,7 @@ impl FlashAttentionLayer {
     /// Processes each head independently. Q has `num_heads` heads, K has `num_kv_heads` heads.
     /// `pos_offset` is the starting position (0 for prefill, cached_len for decode).
     /// `theta` is the RoPE frequency base (typically 10000.0).
+    #[allow(clippy::too_many_arguments)]
     fn apply_rope(
         q: &mut [f32],
         k: &mut [f32],
@@ -339,8 +340,7 @@ impl FlashAttentionLayer {
             for t in 0..seq_len {
                 let pos = pos_offset + t;
                 for pair in 0..(head_dim / 2) {
-                    let angle =
-                        pos as f32 / theta.powf(2.0 * pair as f32 / head_dim as f32);
+                    let angle = pos as f32 / theta.powf(2.0 * pair as f32 / head_dim as f32);
                     let cos_a = angle.cos();
                     let sin_a = angle.sin();
 
@@ -361,8 +361,7 @@ impl FlashAttentionLayer {
             for t in 0..seq_len {
                 let pos = pos_offset + t;
                 for pair in 0..(head_dim / 2) {
-                    let angle =
-                        pos as f32 / theta.powf(2.0 * pair as f32 / head_dim as f32);
+                    let angle = pos as f32 / theta.powf(2.0 * pair as f32 / head_dim as f32);
                     let cos_a = angle.cos();
                     let sin_a = angle.sin();
 
