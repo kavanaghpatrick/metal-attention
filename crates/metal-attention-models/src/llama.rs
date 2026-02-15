@@ -20,8 +20,63 @@
 //!   - `blk.{N}.ffn_norm.weight` -> FFN RMSNorm
 
 use crate::flash_attn::{FlashAttentionLayer, FlashAttentionState};
+use crate::registry::ModelConfig;
+use metal_attention_gguf::{GgufFile, GgufType};
+use metal_attention_kernels::dequant::{dispatch_dequantize_q4_0, dispatch_dequantize_q8_0};
+use metal_attention_kernels::device::GpuDevice;
+use metal_attention_kernels::pipeline::PsoCache;
+use metal_attention_traits::attention::PositionEncoding;
 use metal_attention_traits::sequence::SequenceBlock;
 use metal_attention_traits::types::{BlockConfig, DType, TensorView};
+
+/// Dequantize a named tensor from a GGUF file to f32 values.
+///
+/// Local helper that dispatches based on quantization type.
+fn dequant_tensor(
+    gguf_file: &GgufFile,
+    tensor_name: &str,
+    device: Option<&GpuDevice>,
+    pso_cache: Option<&mut PsoCache>,
+) -> Result<Vec<f32>, String> {
+    let tensor_info = gguf_file
+        .find_tensor(tensor_name)
+        .ok_or_else(|| format!("Tensor not found: {tensor_name}"))?;
+
+    let bytes = gguf_file.tensor_data(tensor_info);
+    let n_elements = tensor_info.n_elements() as usize;
+
+    match tensor_info.gguf_type {
+        GgufType::F32 => {
+            let floats: &[f32] = bytemuck::cast_slice(bytes);
+            Ok(floats.to_vec())
+        }
+        GgufType::F16 => {
+            let mut result = Vec::with_capacity(n_elements);
+            for i in 0..n_elements {
+                let lo = bytes[i * 2];
+                let hi = bytes[i * 2 + 1];
+                let f16_val = half::f16::from_le_bytes([lo, hi]);
+                result.push(f16_val.to_f32());
+            }
+            Ok(result)
+        }
+        GgufType::Q4_0 => {
+            let device = device.ok_or("GPU device required for Q4_0 dequantization")?;
+            let pso_cache = pso_cache.ok_or("PSO cache required for Q4_0 dequantization")?;
+            let block_size = tensor_info.gguf_type.block_size();
+            let n_blocks = n_elements / block_size;
+            Ok(dispatch_dequantize_q4_0(device, pso_cache, bytes, n_blocks))
+        }
+        GgufType::Q8_0 => {
+            let device = device.ok_or("GPU device required for Q8_0 dequantization")?;
+            let pso_cache = pso_cache.ok_or("PSO cache required for Q8_0 dequantization")?;
+            let block_size = tensor_info.gguf_type.block_size();
+            let n_blocks = n_elements / block_size;
+            Ok(dispatch_dequantize_q8_0(device, pso_cache, bytes, n_blocks))
+        }
+        other => Err(format!("Unsupported quantization type: {other:?}")),
+    }
+}
 
 /// Persistent state for one LlamaLayer.
 ///
@@ -102,6 +157,92 @@ impl LlamaLayer {
             hidden_size,
             intermediate_size,
         }
+    }
+
+    /// Load a LlamaLayer from GGUF tensors.
+    ///
+    /// Loads 9 tensors for this layer: attn_norm, Q/K/V/O projections,
+    /// ffn_norm, and SwiGLU gate/up/down weights. Uses GPU dequantization
+    /// for quantized weight types.
+    ///
+    /// # Arguments
+    /// - `gguf_file`: The parsed GGUF file.
+    /// - `layer_idx`: Layer index (0-based) for tensor name lookup.
+    /// - `config`: Model configuration with dimensions.
+    /// - `device`: GPU device for quantized tensor dispatch.
+    /// - `pso_cache`: Pipeline state cache for GPU kernels.
+    pub fn from_gguf(
+        gguf_file: &GgufFile,
+        layer_idx: usize,
+        config: &ModelConfig,
+        intermediate_size: usize,
+        device: Option<&GpuDevice>,
+        pso_cache: Option<&mut PsoCache>,
+    ) -> Result<Self, String> {
+        let mut pso = pso_cache;
+
+        let n = layer_idx;
+
+        // Norm weights (usually F32, no GPU needed)
+        let attn_norm_weight =
+            dequant_tensor(gguf_file, &format!("blk.{n}.attn_norm.weight"), device, None)?;
+        let ffn_norm_weight =
+            dequant_tensor(gguf_file, &format!("blk.{n}.ffn_norm.weight"), device, None)?;
+
+        // Attention weights (may be quantized)
+        let w_q =
+            dequant_tensor(gguf_file, &format!("blk.{n}.attn_q.weight"), device, pso.as_deref_mut())?;
+        let w_k =
+            dequant_tensor(gguf_file, &format!("blk.{n}.attn_k.weight"), device, pso.as_deref_mut())?;
+        let w_v =
+            dequant_tensor(gguf_file, &format!("blk.{n}.attn_v.weight"), device, pso.as_deref_mut())?;
+        let w_o = dequant_tensor(
+            gguf_file,
+            &format!("blk.{n}.attn_output.weight"),
+            device,
+            pso.as_deref_mut(),
+        )?;
+
+        // FFN weights (may be quantized)
+        let w_gate = dequant_tensor(
+            gguf_file,
+            &format!("blk.{n}.ffn_gate.weight"),
+            device,
+            pso.as_deref_mut(),
+        )?;
+        let w_up =
+            dequant_tensor(gguf_file, &format!("blk.{n}.ffn_up.weight"), device, pso.as_deref_mut())?;
+        let w_down = dequant_tensor(
+            gguf_file,
+            &format!("blk.{n}.ffn_down.weight"),
+            device,
+            pso.as_deref_mut(),
+        )?;
+
+        // Build FlashAttentionLayer with loaded weights
+        let attention = FlashAttentionLayer {
+            hidden_size: config.hidden_size,
+            head_dim: config.head_dim,
+            num_heads: config.num_heads,
+            num_kv_heads: config.num_kv_heads,
+            max_seq_len: 2048,
+            w_q,
+            w_k,
+            w_v,
+            w_o,
+            pos_encoding: PositionEncoding::None,
+        };
+
+        Ok(Self {
+            attention,
+            attn_norm_weight,
+            ffn_norm_weight,
+            w_gate,
+            w_up,
+            w_down,
+            hidden_size: config.hidden_size,
+            intermediate_size,
+        })
     }
 
     /// Apply RMSNorm: y = x * weight / rms(x).
