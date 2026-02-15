@@ -25,7 +25,7 @@ use objc2_metal::{
 };
 
 use metal_attention_gguf::GgufFile;
-use metal_attention_kernels::buffer::{alloc_buffer, read_buffer_slice};
+use metal_attention_kernels::buffer::{alloc_buffer, alloc_buffer_private, read_buffer_slice};
 use metal_attention_kernels::device::GpuDevice;
 use metal_attention_kernels::dispatch::{set_buffer, set_bytes};
 use metal_attention_kernels::pipeline::{PsoCache, PsoKey};
@@ -64,6 +64,11 @@ pub struct GpuForwardPass {
     scratch_ffn: Retained<ProtocolObject<dyn MTLBuffer>>,
     scratch_residual: Retained<ProtocolObject<dyn MTLBuffer>>,
     logits_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+
+    // Argmax buffers (GPU-side argmax to avoid logits readback).
+    argmax_partial_vals: Retained<ProtocolObject<dyn MTLBuffer>>,
+    argmax_partial_idxs: Retained<ProtocolObject<dyn MTLBuffer>>,
+    argmax_result: Retained<ProtocolObject<dyn MTLBuffer>>,
 
     // Model dimensions.
     hidden_size: usize,
@@ -192,6 +197,15 @@ impl GpuForwardPass {
         let scratch_residual = alloc_buffer(&device.device, hidden_bytes);
         let logits_buf = alloc_buffer(&device.device, logits_bytes);
 
+        // Argmax buffers: 48 threadgroups for vocab=49152 (ceil(49152 / (256*4)))
+        let num_argmax_groups = (vocab_size + 256 * 4 - 1) / (256 * 4);
+        let argmax_partial_vals =
+            alloc_buffer_private(&device.device, num_argmax_groups * std::mem::size_of::<f32>());
+        let argmax_partial_idxs =
+            alloc_buffer_private(&device.device, num_argmax_groups * std::mem::size_of::<u32>());
+        // Result buffer is Shared so CPU can read back the token id
+        let argmax_result = alloc_buffer(&device.device, std::mem::size_of::<u32>());
+
         // Build PSO cache and prewarm all kernels
         let mut pso_cache = PsoCache::new(device.library.clone());
         let mut pso_keys = vec![
@@ -203,6 +217,8 @@ impl GpuForwardPass {
             PsoKey::simple("ffn_silu"),
             PsoKey::simple("kv_cache_copy"),
             PsoKey::simple("buffer_copy"),
+            PsoKey::simple("argmax_reduce"),
+            PsoKey::simple("argmax_final"),
         ];
         if weight_store.lm_head_is_f32() {
             pso_keys.push(PsoKey::simple("matvec_f32"));
@@ -227,6 +243,9 @@ impl GpuForwardPass {
             scratch_ffn,
             scratch_residual,
             logits_buf,
+            argmax_partial_vals,
+            argmax_partial_idxs,
+            argmax_result,
             hidden_size,
             num_heads,
             num_kv_heads,
@@ -1113,6 +1132,68 @@ impl GpuForwardPass {
             depth: 1,
         };
         encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode GPU-side argmax: two-stage parallel reduction on logits buffer.
+    ///
+    /// Stage 1 (`argmax_reduce`): Each threadgroup reduces a chunk of logits
+    /// to a single (max_val, max_idx) pair. Dispatches `num_groups` threadgroups
+    /// of 256 threads each.
+    ///
+    /// Stage 2 (`argmax_final`): Single threadgroup of 256 threads reduces the
+    /// partial results to the global argmax. Result written to `argmax_result`
+    /// buffer (Shared, CPU-readable).
+    fn encode_argmax(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        logits_buf: &ProtocolObject<dyn MTLBuffer>,
+    ) {
+        let num_groups = (self.vocab_size + 256 * 4 - 1) / (256 * 4);
+        let num_groups_u32 = num_groups as u32;
+        let vocab_size_u32 = self.vocab_size as u32;
+
+        // Stage 1: argmax_reduce
+        let pso_reduce = self
+            .pso_cache
+            .get(&PsoKey::simple("argmax_reduce"))
+            .expect("argmax_reduce PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso_reduce);
+        set_buffer(encoder, logits_buf, 0, 0);
+        set_bytes(encoder, &vocab_size_u32, 1);
+        set_buffer(encoder, &self.argmax_partial_vals, 0, 2);
+        set_buffer(encoder, &self.argmax_partial_idxs, 0, 3);
+
+        let grid = MTLSize {
+            width: num_groups,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+
+        // Stage 2: argmax_final
+        let pso_final = self
+            .pso_cache
+            .get(&PsoKey::simple("argmax_final"))
+            .expect("argmax_final PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso_final);
+        set_buffer(encoder, &self.argmax_partial_vals, 0, 0);
+        set_buffer(encoder, &self.argmax_partial_idxs, 0, 1);
+        set_bytes(encoder, &num_groups_u32, 2);
+        set_buffer(encoder, &self.argmax_result, 0, 3);
+
+        let grid_final = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_final, tg);
     }
 
     /// Get the current decode position.

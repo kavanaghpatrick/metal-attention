@@ -21,6 +21,21 @@ pub fn alloc_buffer(
         .expect("Failed to allocate Metal buffer")
 }
 
+/// Allocate a Metal buffer of `size` bytes with StorageModePrivate.
+///
+/// Private buffers are only accessible by the GPU, which allows the driver
+/// to place them in dedicated GPU memory for faster access. Cannot be read
+/// from CPU — use for scratch/intermediate buffers that never leave the GPU.
+pub fn alloc_buffer_private(
+    device: &ProtocolObject<dyn MTLDevice>,
+    size: usize,
+) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+    let options = MTLResourceOptions::StorageModePrivate;
+    device
+        .newBufferWithLength_options(size, options)
+        .expect("Failed to allocate Private Metal buffer")
+}
+
 /// Allocate a Metal buffer initialized with the given data slice.
 pub fn alloc_buffer_with_data<T: Copy>(
     device: &ProtocolObject<dyn MTLDevice>,
