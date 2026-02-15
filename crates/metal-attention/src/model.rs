@@ -3,7 +3,11 @@
 //! Constructs a full model from GGUF-loaded weights (or random weights for testing).
 //! Supports schedule-driven dispatch through RWKV-7 blocks.
 
-use metal_attention_gguf::ModelArchitecture;
+use std::path::Path;
+
+use metal_attention_gguf::{GgufFile, ModelArchitecture};
+use metal_attention_kernels::device::GpuDevice;
+use metal_attention_kernels::pipeline::PsoCache;
 use metal_attention_models::griffin::{GriffinLayer, GriffinLayerState};
 use metal_attention_models::jamba::{JambaLayer, JambaLayerState};
 use metal_attention_models::llama::{LlamaLayer, LlamaState};
@@ -13,6 +17,7 @@ use metal_attention_models::rwkv7::{Rwkv7Block, Rwkv7State};
 use metal_attention_traits::sequence::SequenceBlock;
 use metal_attention_traits::types::BlockConfig;
 
+use crate::dequant::dequantize_tensor;
 use crate::sampling::SimpleRng;
 
 /// A model layer variant for enum-based dispatch.
@@ -144,6 +149,124 @@ impl HybridModel {
             config,
             block_config,
         }
+    }
+
+    /// Construct a model from a GGUF file with real weights.
+    ///
+    /// Opens the GGUF file, extracts model metadata, loads shared weights
+    /// (embeddings, output norm, lm_head), and constructs per-layer weights
+    /// using the appropriate architecture loader.
+    ///
+    /// Currently only supports Llama architecture.
+    pub fn from_gguf(
+        path: &Path,
+        device: Option<&GpuDevice>,
+        pso_cache: Option<&mut PsoCache>,
+    ) -> Result<Self, String> {
+        // 1. Open and parse GGUF
+        let gguf = GgufFile::open(path).map_err(|e| format!("Failed to open GGUF: {e}"))?;
+
+        // 2. Check architecture
+        let arch = gguf.architecture;
+        if arch != ModelArchitecture::Llama {
+            return Err(format!(
+                "Unsupported architecture for from_gguf: {arch:?}. Only Llama is supported."
+            ));
+        }
+
+        // 3. Extract model config from metadata
+        let hidden_size = gguf
+            .metadata
+            .get_u32("llama.embedding_length")
+            .or_else(|| gguf.metadata.get_u32("general.hidden_size"))
+            .unwrap_or(768) as usize;
+        let num_heads = gguf
+            .metadata
+            .get_u32("llama.attention.head_count")
+            .or_else(|| gguf.metadata.get_u32("general.num_attention_heads"))
+            .unwrap_or(12) as usize;
+        let head_dim = if num_heads > 0 {
+            hidden_size / num_heads
+        } else {
+            hidden_size
+        };
+        let num_kv_heads = gguf
+            .metadata
+            .get_u32("llama.attention.head_count_kv")
+            .or_else(|| gguf.metadata.get_u32("general.num_kv_heads"))
+            .unwrap_or(num_heads as u32) as usize;
+        let num_layers = gguf
+            .metadata
+            .get_u32("llama.block_count")
+            .or_else(|| gguf.metadata.get_u32("general.num_layers"))
+            .unwrap_or(12) as usize;
+        let intermediate_size = gguf
+            .metadata
+            .get_u32("llama.feed_forward_length")
+            .unwrap_or((hidden_size * 4) as u32) as usize;
+
+        eprintln!(
+            "GGUF model: {:?} | {}L {}H {}D (kv_heads={}, ffn={})",
+            arch, num_layers, num_heads, hidden_size, num_kv_heads, intermediate_size
+        );
+
+        let config = ModelConfig {
+            architecture: arch,
+            hidden_size,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+            num_layers,
+        };
+
+        // 4. Load shared weights
+        let mut pso = pso_cache;
+
+        let embed_weight =
+            dequantize_tensor(&gguf, "token_embd.weight", device, pso.as_deref_mut())?;
+        let final_norm_weight =
+            dequantize_tensor(&gguf, "output_norm.weight", device, None)?;
+
+        // lm_head: try output.weight, fall back to tied embeddings
+        let lm_head_weight =
+            match dequantize_tensor(&gguf, "output.weight", device, pso.as_deref_mut()) {
+                Ok(w) => w,
+                Err(_) => {
+                    eprintln!("Warning: output.weight not found, using tied token_embd.weight");
+                    embed_weight.clone()
+                }
+            };
+
+        // 5. Load layers
+        let mut layers = Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
+            let llama_layer = LlamaLayer::from_gguf(
+                &gguf,
+                i,
+                &config,
+                intermediate_size,
+                device,
+                pso.as_deref_mut(),
+            )?;
+            layers.push(ModelLayer::Llama(llama_layer));
+        }
+
+        let block_config = BlockConfig {
+            hidden_size,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+            layer_index: 0,
+        };
+
+        Ok(Self {
+            embed_weight,
+            final_norm_weight,
+            lm_head_weight,
+            layers,
+            config,
+            block_config,
+        })
     }
 
     /// Initialize fresh model state for all layers.
