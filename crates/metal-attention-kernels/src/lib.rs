@@ -19,6 +19,7 @@ pub mod norm;
 pub mod pipeline;
 pub mod rope;
 pub mod rwkv;
+pub mod ssm;
 pub mod types;
 
 // Re-export primary types for convenience
@@ -38,4 +39,5 @@ pub use norm::dispatch_rmsnorm;
 pub use pipeline::{ConstantType, ConstantValue, PsoCache, PsoKey};
 pub use rope::{cpu_rope, dispatch_rope};
 pub use rwkv::{cpu_rwkv_wkv, dispatch_rwkv_wkv};
+pub use ssm::{cpu_ssm_scan, dispatch_ssm_scan};
 pub use types::{AttentionParams, LayerParams, SSMParams};

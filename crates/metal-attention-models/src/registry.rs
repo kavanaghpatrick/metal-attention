@@ -5,7 +5,9 @@
 
 use metal_attention_gguf::ModelArchitecture;
 
+use crate::jamba::{build_jamba_layers, JambaLayer};
 use crate::llama::LlamaLayer;
+use crate::mamba::MambaBlock;
 use crate::rwkv7::Rwkv7Block;
 
 /// Model configuration extracted from GGUF metadata.
@@ -54,14 +56,52 @@ pub fn create_llama_layer(config: &ModelConfig, layer_index: usize) -> Option<Ll
     ))
 }
 
+/// Create a Mamba block from a model configuration.
+///
+/// Returns None if the architecture is not Jamba (Mamba blocks are used inside Jamba).
+pub fn create_mamba_block(config: &ModelConfig, layer_index: usize) -> Option<MambaBlock> {
+    if config.architecture != ModelArchitecture::Jamba {
+        return None;
+    }
+
+    Some(MambaBlock::random(
+        config.hidden_size,
+        16, // default d_state
+        (layer_index as u64) * 31 + 7,
+    ))
+}
+
+/// Create Jamba layers from a model configuration.
+///
+/// Returns None if the architecture is not Jamba.
+/// Returns a Vec of JambaLayer with 7:1 Mamba:Attention schedule.
+pub fn create_jamba_layers(config: &ModelConfig) -> Option<Vec<JambaLayer>> {
+    if config.architecture != ModelArchitecture::Jamba {
+        return None;
+    }
+
+    let (layers, _schedule) = build_jamba_layers(
+        config.hidden_size,
+        config.head_dim,
+        config.num_heads,
+        config.num_kv_heads,
+        config.num_layers,
+        16,  // d_state
+        16,  // num_experts
+        42,  // seed
+    );
+
+    Some(layers)
+}
+
 /// Check whether a given architecture is supported.
 pub fn is_supported(arch: ModelArchitecture) -> bool {
-    matches!(arch, ModelArchitecture::Rwkv | ModelArchitecture::Llama)
+    matches!(arch, ModelArchitecture::Rwkv | ModelArchitecture::Llama | ModelArchitecture::Jamba)
 }
 
 /// List all supported architectures.
 pub fn supported_architectures() -> Vec<ModelArchitecture> {
-    vec![ModelArchitecture::Rwkv, ModelArchitecture::Llama]
+    vec![ModelArchitecture::Rwkv, ModelArchitecture::Llama, ModelArchitecture::Jamba]
 }
 
 #[cfg(test)]
@@ -141,7 +181,7 @@ mod tests {
     fn test_is_supported() {
         assert!(is_supported(ModelArchitecture::Rwkv));
         assert!(is_supported(ModelArchitecture::Llama));
-        assert!(!is_supported(ModelArchitecture::Jamba));
+        assert!(is_supported(ModelArchitecture::Jamba));
         assert!(!is_supported(ModelArchitecture::Griffin));
         assert!(!is_supported(ModelArchitecture::Zamba));
         assert!(!is_supported(ModelArchitecture::Unknown));
@@ -150,8 +190,9 @@ mod tests {
     #[test]
     fn test_supported_architectures() {
         let archs = supported_architectures();
-        assert_eq!(archs.len(), 2);
+        assert_eq!(archs.len(), 3);
         assert!(archs.contains(&ModelArchitecture::Rwkv));
         assert!(archs.contains(&ModelArchitecture::Llama));
+        assert!(archs.contains(&ModelArchitecture::Jamba));
     }
 }
