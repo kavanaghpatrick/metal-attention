@@ -174,27 +174,48 @@ impl GpuForwardPass {
         let kv_dim = num_kv_heads * head_dim;
         let kv_caches = GpuKVCacheSet::new(&device.device, num_layers, 2048, kv_dim);
 
+        // Check GPU_DEBUG: when set, keep all buffers Shared for CPU readback.
+        // When not set, use StorageModePrivate for GPU-only scratch buffers.
+        let debug = std::env::var("GPU_DEBUG").is_ok();
+
         // Allocate ping-pong hidden state buffers
+        // hidden_a MUST stay Shared: embed_lookup() uses contents() for CPU memcpy
         let hidden_bytes = hidden_size * std::mem::size_of::<f32>();
         let hidden_a = alloc_buffer(&device.device, hidden_bytes);
-        let hidden_b = alloc_buffer(&device.device, hidden_bytes);
+        // hidden_b: only GPU reads/writes (rmsnorm output, matvec input)
+        let hidden_b = if debug {
+            alloc_buffer(&device.device, hidden_bytes)
+        } else {
+            alloc_buffer_private(&device.device, hidden_bytes)
+        };
 
         // Allocate scratch buffers (reused across all layers and tokens)
+        // In non-debug mode, use Private for GPU-only buffers (no CPU readback)
         let q_bytes = num_heads * head_dim * std::mem::size_of::<f32>();
         let kv_bytes = kv_dim * std::mem::size_of::<f32>();
         let ffn_bytes = intermediate_size * std::mem::size_of::<f32>();
         let logits_bytes = vocab_size * std::mem::size_of::<f32>();
 
-        let scratch_q = alloc_buffer(&device.device, q_bytes);
-        let scratch_k = alloc_buffer(&device.device, kv_bytes);
-        let scratch_v = alloc_buffer(&device.device, kv_bytes);
-        let scratch_attn_out = alloc_buffer(&device.device, q_bytes);
-        let scratch_o = alloc_buffer(&device.device, hidden_bytes);
-        let scratch_gate = alloc_buffer(&device.device, ffn_bytes);
-        let scratch_up = alloc_buffer(&device.device, ffn_bytes);
-        let scratch_silu = alloc_buffer(&device.device, ffn_bytes);
-        let scratch_ffn = alloc_buffer(&device.device, hidden_bytes);
-        let scratch_residual = alloc_buffer(&device.device, hidden_bytes);
+        // Helper closure: alloc_buffer (Shared) when debug, alloc_buffer_private otherwise
+        let alloc_scratch = |size: usize| -> Retained<ProtocolObject<dyn MTLBuffer>> {
+            if debug {
+                alloc_buffer(&device.device, size)
+            } else {
+                alloc_buffer_private(&device.device, size)
+            }
+        };
+
+        let scratch_q = alloc_scratch(q_bytes);
+        let scratch_k = alloc_scratch(kv_bytes);
+        let scratch_v = alloc_scratch(kv_bytes);
+        let scratch_attn_out = alloc_scratch(q_bytes);
+        let scratch_o = alloc_scratch(hidden_bytes);
+        let scratch_gate = alloc_scratch(ffn_bytes);
+        let scratch_up = alloc_scratch(ffn_bytes);
+        let scratch_silu = alloc_scratch(ffn_bytes);
+        let scratch_ffn = alloc_scratch(hidden_bytes);
+        let scratch_residual = alloc_scratch(hidden_bytes);
+        // logits_buf stays Shared: forward_token() reads it back via read_buffer_slice()
         let logits_buf = alloc_buffer(&device.device, logits_bytes);
 
         // Argmax buffers: 48 threadgroups for vocab=49152 (ceil(49152 / (256*4)))
