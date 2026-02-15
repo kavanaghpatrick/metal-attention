@@ -74,3 +74,125 @@ pub fn dequantize_tensor(
         other => Err(format!("Unsupported quantization type: {other:?}")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metal_attention_gguf::{GgufBuilder, GgufType};
+
+    /// Test: F32 tensors pass through via bytemuck cast without modification.
+    #[test]
+    fn test_dequantize_f32_passthrough() {
+        // Create known f32 values and encode as bytes
+        let values: Vec<f32> = vec![1.0, -2.5, 3.14, 0.0, f32::MAX, f32::MIN_POSITIVE];
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let data = GgufBuilder::new()
+            .add_string("general.architecture", "llama")
+            .add_tensor("test.weight", &[6], GgufType::F32, bytes)
+            .build();
+
+        let gguf = GgufFile::from_bytes(data).expect("parse failed");
+        let result = dequantize_tensor(&gguf, "test.weight", None, None).expect("dequant failed");
+
+        assert_eq!(result.len(), 6);
+        for (i, (&expected, &actual)) in values.iter().zip(result.iter()).enumerate() {
+            assert_eq!(
+                expected, actual,
+                "F32 passthrough mismatch at index {i}: expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    /// Test: Q4_0 tensors are dequantized on GPU and produce finite values.
+    #[test]
+    fn test_dequantize_q4_0_gpu() {
+        // Q4_0 block: 2 bytes f16 scale + 16 bytes packed nibbles = 18 bytes per 32 elements
+        // Create one block: scale = 1.0 (f16), nibbles all set to 8 (zero-point)
+        let scale_f16 = half::f16::from_f32(1.0);
+        let mut block = Vec::with_capacity(18);
+        block.extend_from_slice(&scale_f16.to_le_bytes());
+        // 16 bytes of packed nibbles: each byte holds 2 4-bit values
+        // Value 8 maps to (8 - 8) * scale = 0.0 after dequant
+        block.extend_from_slice(&[0x88u8; 16]);
+
+        let data = GgufBuilder::new()
+            .add_string("general.architecture", "llama")
+            .add_tensor("q4_test.weight", &[32], GgufType::Q4_0, block)
+            .build();
+
+        let gguf = GgufFile::from_bytes(data).expect("parse failed");
+        let device = GpuDevice::new();
+        let mut pso_cache = PsoCache::new(device.library.clone());
+
+        let result = dequantize_tensor(
+            &gguf,
+            "q4_test.weight",
+            Some(&device),
+            Some(&mut pso_cache),
+        )
+        .expect("dequant failed");
+
+        assert_eq!(result.len(), 32, "Q4_0 block should produce 32 elements");
+        for (i, &val) in result.iter().enumerate() {
+            assert!(
+                val.is_finite(),
+                "Q4_0 dequant element {i} is not finite: {val}"
+            );
+        }
+    }
+
+    /// Test: Q4_0 dequantization requires GPU device.
+    #[test]
+    fn test_dequantize_q4_0_requires_device() {
+        let scale_f16 = half::f16::from_f32(1.0);
+        let mut block = Vec::with_capacity(18);
+        block.extend_from_slice(&scale_f16.to_le_bytes());
+        block.extend_from_slice(&[0x88u8; 16]);
+
+        let data = GgufBuilder::new()
+            .add_string("general.architecture", "llama")
+            .add_tensor("q4_test.weight", &[32], GgufType::Q4_0, block)
+            .build();
+
+        let gguf = GgufFile::from_bytes(data).expect("parse failed");
+        let result = dequantize_tensor(&gguf, "q4_test.weight", None, None);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("GPU device required for Q4_0"));
+    }
+
+    /// Test: unsupported quantization type returns error.
+    #[test]
+    fn test_dequantize_unsupported_type() {
+        // Q4_K_M is not supported by dequantize_tensor
+        let data = GgufBuilder::new()
+            .add_string("general.architecture", "llama")
+            .add_tensor_zeros("qkm_test.weight", &[256], GgufType::Q4_K_M)
+            .build();
+
+        let gguf = GgufFile::from_bytes(data).expect("parse failed");
+        let result = dequantize_tensor(&gguf, "qkm_test.weight", None, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Unsupported quantization type"),
+            "Expected unsupported type error, got: {err}"
+        );
+    }
+
+    /// Test: requesting a nonexistent tensor returns error.
+    #[test]
+    fn test_dequantize_missing_tensor() {
+        let data = GgufBuilder::new()
+            .add_string("general.architecture", "llama")
+            .add_tensor_zeros("exists.weight", &[16], GgufType::F32)
+            .build();
+
+        let gguf = GgufFile::from_bytes(data).expect("parse failed");
+        let result = dequantize_tensor(&gguf, "nonexistent.weight", None, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Tensor not found"));
+    }
+}
