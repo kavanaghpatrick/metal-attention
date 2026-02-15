@@ -29,6 +29,7 @@ fn detect_from_tensor_names(tensors: &[GgufTensorInfo]) -> ModelArchitecture {
     let mut has_time_mix = false;
     let mut has_channel_mix = false;
     let mut has_rglru = false;
+    let mut has_lora = false;
 
     for t in tensors {
         let name = &t.name;
@@ -47,6 +48,9 @@ fn detect_from_tensor_names(tensors: &[GgufTensorInfo]) -> ModelArchitecture {
         if name.contains("rglru_") || name.contains("recurrent_gate") {
             has_rglru = true;
         }
+        if name.contains("lora_") || name.contains(".shared_attn.") {
+            has_lora = true;
+        }
     }
 
     // RWKV: has time_mix and channel_mix, no standard attention
@@ -54,7 +58,12 @@ fn detect_from_tensor_names(tensors: &[GgufTensorInfo]) -> ModelArchitecture {
         return ModelArchitecture::Rwkv;
     }
 
-    // Jamba: has both attention and SSM layers
+    // Zamba: has SSM + attention + LoRA/shared attention markers
+    if has_attn && has_ssm && has_lora {
+        return ModelArchitecture::Zamba;
+    }
+
+    // Jamba: has both attention and SSM layers (but no LoRA)
     if has_attn && has_ssm {
         return ModelArchitecture::Jamba;
     }
@@ -153,6 +162,36 @@ mod tests {
             make_tensor("blk.0.rglru_a.weight"),
         ];
         assert_eq!(detect_architecture(&md, &tensors), ModelArchitecture::Griffin);
+    }
+
+    #[test]
+    fn test_detect_griffin_from_metadata() {
+        let md = make_metadata(Some("griffin"));
+        assert_eq!(detect_architecture(&md, &[]), ModelArchitecture::Griffin);
+
+        let md = make_metadata(Some("recurrentgemma"));
+        assert_eq!(detect_architecture(&md, &[]), ModelArchitecture::Griffin);
+    }
+
+    #[test]
+    fn test_detect_zamba_from_metadata() {
+        let md = make_metadata(Some("zamba"));
+        assert_eq!(detect_architecture(&md, &[]), ModelArchitecture::Zamba);
+
+        let md = make_metadata(Some("zamba2"));
+        assert_eq!(detect_architecture(&md, &[]), ModelArchitecture::Zamba);
+    }
+
+    #[test]
+    fn test_detect_zamba_from_tensors() {
+        let md = make_metadata(None);
+        let tensors = vec![
+            make_tensor("blk.0.attn_q.weight"),
+            make_tensor("blk.0.ssm_in.weight"),
+            make_tensor("blk.0.ssm_out.weight"),
+            make_tensor("blk.0.lora_a.weight"),
+        ];
+        assert_eq!(detect_architecture(&md, &tensors), ModelArchitecture::Zamba);
     }
 
     #[test]

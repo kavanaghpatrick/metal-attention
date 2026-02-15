@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process;
@@ -10,6 +11,7 @@ use metal_attention::model::HybridModel;
 use metal_attention::generate_streaming;
 
 use metal_attention_gguf::parser::{GgufError, GgufFile};
+use metal_attention_gguf::quantize::GgufType;
 use metal_attention_gguf::tokenizer::GgufTokenizer;
 use metal_attention_models::registry::{self, ModelConfig};
 
@@ -57,17 +59,45 @@ enum Commands {
         #[arg(long, default_value = "1.1")]
         repeat_penalty: f32,
     },
-    /// Benchmark model performance (placeholder)
+    /// Benchmark model performance
     Bench {
-        /// Path to GGUF model file
+        /// Path to GGUF model file (ignored if --synthetic)
         #[arg(short = 'm', long)]
-        model: PathBuf,
+        model: Option<PathBuf>,
+
+        /// Comma-separated sequence lengths to benchmark
+        #[arg(long, default_value = "128,256,512")]
+        seq_lengths: String,
+
+        /// Number of decode tokens to generate per run
+        #[arg(long, default_value = "64")]
+        gen_length: usize,
+
+        /// Number of iterations per sequence length
+        #[arg(long, default_value = "3")]
+        iterations: usize,
+
+        /// Use synthetic random data (no real model needed)
+        #[arg(long)]
+        synthetic: bool,
+
+        /// Output results as JSONL
+        #[arg(long)]
+        json: bool,
+
+        /// Random seed
+        #[arg(short = 's', long, default_value = "42")]
+        seed: u64,
     },
-    /// Show model info (placeholder)
+    /// Show model info from GGUF metadata
     Info {
         /// Path to GGUF model file
         #[arg(short = 'm', long)]
         model: PathBuf,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -99,14 +129,374 @@ fn main() {
                 process::exit(1);
             }
         }
-        Commands::Bench { model: _ } => {
-            eprintln!("Not implemented yet");
+        Commands::Bench {
+            model,
+            seq_lengths,
+            gen_length,
+            iterations,
+            synthetic,
+            json,
+            seed,
+        } => {
+            if let Err(e) = run_bench(model, &seq_lengths, gen_length, iterations, synthetic, json, seed) {
+                eprintln!("{e}");
+                process::exit(1);
+            }
         }
-        Commands::Info { model: _ } => {
-            eprintln!("Not implemented yet");
+        Commands::Info { model, json } => {
+            if let Err(e) = run_info(model, json) {
+                eprintln!("{e}");
+                process::exit(1);
+            }
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// info subcommand
+// ---------------------------------------------------------------------------
+
+fn run_info(model_path: PathBuf, json_output: bool) -> Result<(), String> {
+    if !model_path.exists() {
+        return Err(format!(
+            "Error: Model file not found: {}",
+            model_path.display()
+        ));
+    }
+
+    let gguf = GgufFile::open(&model_path).map_err(|e| match &e {
+        GgufError::BadMagic(_) => format!("Error: Invalid GGUF file: {e}"),
+        _ => format!("Error: Failed to parse GGUF file: {e}"),
+    })?;
+
+    // Extract metadata fields
+    let arch = gguf.architecture;
+    let arch_str = format!("{:?}", arch);
+
+    let hidden_size = gguf
+        .metadata
+        .get_u32("general.hidden_size")
+        .or_else(|| gguf.metadata.get_u32("rwkv.embedding_size"))
+        .unwrap_or(0) as usize;
+
+    let num_heads = gguf
+        .metadata
+        .get_u32("general.num_attention_heads")
+        .or_else(|| gguf.metadata.get_u32("rwkv.num_heads"))
+        .unwrap_or(0) as usize;
+
+    let head_dim = if num_heads > 0 && hidden_size > 0 {
+        hidden_size / num_heads
+    } else {
+        0
+    };
+
+    let num_layers = gguf
+        .metadata
+        .get_u32("general.num_layers")
+        .or_else(|| gguf.metadata.get_u32("rwkv.block_count"))
+        .unwrap_or(0) as usize;
+
+    let num_kv_heads = gguf
+        .metadata
+        .get_u32("general.num_kv_heads")
+        .unwrap_or(num_heads as u32) as usize;
+
+    // Detect dominant quantization type from tensors
+    let quant_type = detect_dominant_quant(&gguf);
+    let quant_str = format!("{:?}", quant_type);
+
+    // Vocab size from tokenizer tokens array or metadata
+    let vocab_size = gguf
+        .metadata
+        .get_array_string("tokenizer.ggml.tokens")
+        .map(|t| t.len())
+        .unwrap_or(0);
+
+    // Tokenizer type
+    let tokenizer_type = gguf
+        .metadata
+        .get_string("tokenizer.ggml.model")
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Model name
+    let model_name = gguf
+        .metadata
+        .get_string("general.name")
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Estimated memory: sum of all tensor byte sizes
+    let total_bytes: usize = gguf.tensors.iter().map(|t| t.byte_size()).sum();
+    let memory_mb = total_bytes as f64 / (1024.0 * 1024.0);
+
+    // File size
+    let file_size = std::fs::metadata(&model_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    if json_output {
+        let json = format!(
+            concat!(
+                "{{",
+                "\"name\":\"{}\",",
+                "\"architecture\":\"{}\",",
+                "\"num_layers\":{},",
+                "\"hidden_size\":{},",
+                "\"head_dim\":{},",
+                "\"num_heads\":{},",
+                "\"num_kv_heads\":{},",
+                "\"quantization\":\"{}\",",
+                "\"vocab_size\":{},",
+                "\"tokenizer_type\":\"{}\",",
+                "\"num_tensors\":{},",
+                "\"estimated_memory_mb\":{:.1},",
+                "\"file_size_bytes\":{}",
+                "}}"
+            ),
+            escape_json(&model_name),
+            escape_json(&arch_str),
+            num_layers,
+            hidden_size,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+            escape_json(&quant_str),
+            vocab_size,
+            escape_json(&tokenizer_type),
+            gguf.tensors.len(),
+            memory_mb,
+            file_size,
+        );
+        println!("{json}");
+    } else {
+        println!("Model Info: {}", model_path.display());
+        println!("  Name:           {model_name}");
+        println!("  Architecture:   {arch_str}");
+        println!("  Layers:         {num_layers}");
+        println!("  Hidden size:    {hidden_size}");
+        println!("  Head dim:       {head_dim}");
+        println!("  Num heads:      {num_heads}");
+        println!("  Num KV heads:   {num_kv_heads}");
+        println!("  Quantization:   {quant_str}");
+        println!("  Vocab size:     {vocab_size}");
+        println!("  Tokenizer:      {tokenizer_type}");
+        println!("  Tensors:        {}", gguf.tensors.len());
+        println!("  Est. memory:    {memory_mb:.1} MB");
+        println!("  File size:      {} bytes", file_size);
+    }
+
+    Ok(())
+}
+
+/// Detect the most common quantization type among weight tensors.
+fn detect_dominant_quant(gguf: &GgufFile) -> GgufType {
+    let mut counts: HashMap<GgufType, usize> = HashMap::new();
+    for t in &gguf.tensors {
+        *counts.entry(t.gguf_type).or_insert(0) += 1;
+    }
+    // Return the type with the most tensors (excluding F32 if others exist,
+    // since F32 is often used for norms/biases)
+    let non_f32: Vec<_> = counts
+        .iter()
+        .filter(|(k, _)| **k != GgufType::F32)
+        .collect();
+    if non_f32.is_empty() {
+        GgufType::F32
+    } else {
+        *non_f32
+            .iter()
+            .max_by_key(|(_, count)| *count)
+            .unwrap()
+            .0
+    }
+}
+
+/// Minimal JSON string escaping.
+fn escape_json(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+// ---------------------------------------------------------------------------
+// bench subcommand
+// ---------------------------------------------------------------------------
+
+fn run_bench(
+    model_path: Option<PathBuf>,
+    seq_lengths_str: &str,
+    gen_length: usize,
+    iterations: usize,
+    synthetic: bool,
+    json_output: bool,
+    seed: u64,
+) -> Result<(), String> {
+    // Parse sequence lengths
+    let seq_lengths: Vec<usize> = seq_lengths_str
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<usize>()
+                .map_err(|_| format!("Invalid sequence length: '{}'", s.trim()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if seq_lengths.is_empty() {
+        return Err("No sequence lengths specified".to_string());
+    }
+
+    // Determine model config
+    let (hidden_size, head_dim, num_heads, num_layers, vocab_size) = if synthetic {
+        // Synthetic defaults: small model
+        (768, 64, 12, 12, 32000)
+    } else {
+        let path = model_path
+            .as_ref()
+            .ok_or("Error: --model required unless --synthetic is set")?;
+        if !path.exists() {
+            return Err(format!("Error: Model file not found: {}", path.display()));
+        }
+        let gguf = GgufFile::open(path).map_err(|e| format!("Error: {e}"))?;
+        let hs = gguf
+            .metadata
+            .get_u32("general.hidden_size")
+            .or_else(|| gguf.metadata.get_u32("rwkv.embedding_size"))
+            .unwrap_or(768) as usize;
+        let nh = gguf
+            .metadata
+            .get_u32("general.num_attention_heads")
+            .or_else(|| gguf.metadata.get_u32("rwkv.num_heads"))
+            .unwrap_or(12) as usize;
+        let hd = if nh > 0 { hs / nh } else { hs };
+        let nl = gguf
+            .metadata
+            .get_u32("general.num_layers")
+            .or_else(|| gguf.metadata.get_u32("rwkv.block_count"))
+            .unwrap_or(12) as usize;
+        let vs = gguf
+            .metadata
+            .get_array_string("tokenizer.ggml.tokens")
+            .map(|t| t.len())
+            .unwrap_or(32000);
+        (hs, hd, nh, nl, vs)
+    };
+
+    let model = HybridModel::random(vocab_size, hidden_size, head_dim, num_heads, num_layers, seed);
+
+    if !json_output {
+        eprintln!(
+            "Benchmark config: {}H, {}D, {}L, vocab={}, gen_length={}, iterations={}",
+            num_heads, hidden_size, num_layers, vocab_size, gen_length, iterations,
+        );
+        if synthetic {
+            eprintln!("Mode: synthetic (random weights + random tokens)");
+        }
+        eprintln!();
+    }
+
+    let config = InferenceConfig {
+        model_path: model_path.clone().unwrap_or_default(),
+        max_tokens: gen_length,
+        temperature: 0.0, // greedy for reproducible bench
+        top_p: 1.0,
+        top_k: 0,
+        repetition_penalty: 1.0,
+        seed: Some(seed),
+    };
+
+    for &seq_len in &seq_lengths {
+        // Generate synthetic prompt tokens
+        let prompt_tokens: Vec<u32> = (0..seq_len)
+            .map(|i| ((i * 7 + 13) % vocab_size) as u32)
+            .collect();
+
+        let mut prefill_times = Vec::with_capacity(iterations);
+        let mut decode_times = Vec::with_capacity(iterations);
+        let mut decode_tokens_counts = Vec::with_capacity(iterations);
+
+        for _ in 0..iterations {
+            // Prefill: measure time for first forward pass through all prompt tokens
+            let prefill_start = Instant::now();
+            let mut token_count = 0usize;
+            let mut first_token_time = None;
+
+            generate_streaming(&model, &prompt_tokens, &config, |_token_id| {
+                if first_token_time.is_none() {
+                    first_token_time = Some(prefill_start.elapsed());
+                }
+                token_count += 1;
+                token_count < gen_length
+            });
+
+            let total_time = prefill_start.elapsed();
+            let prefill_dur = first_token_time.unwrap_or(total_time);
+            let decode_dur = total_time.saturating_sub(prefill_dur);
+
+            prefill_times.push(prefill_dur.as_secs_f64());
+            decode_times.push(decode_dur.as_secs_f64());
+            decode_tokens_counts.push(if token_count > 0 { token_count - 1 } else { 0 });
+        }
+
+        // Compute averages
+        let avg_prefill = prefill_times.iter().sum::<f64>() / iterations as f64;
+        let avg_decode = decode_times.iter().sum::<f64>() / iterations as f64;
+        let avg_decode_tokens = decode_tokens_counts.iter().sum::<usize>() as f64 / iterations as f64;
+        let prefill_tok_s = if avg_prefill > 0.0 {
+            seq_len as f64 / avg_prefill
+        } else {
+            0.0
+        };
+        let decode_tok_s = if avg_decode > 0.0 {
+            avg_decode_tokens / avg_decode
+        } else {
+            0.0
+        };
+        let total_time_avg = avg_prefill + avg_decode;
+
+        if json_output {
+            println!(
+                concat!(
+                    "{{",
+                    "\"seq_len\":{},",
+                    "\"gen_length\":{},",
+                    "\"iterations\":{},",
+                    "\"prefill_tok_s\":{:.1},",
+                    "\"decode_tok_s\":{:.1},",
+                    "\"avg_prefill_s\":{:.4},",
+                    "\"avg_decode_s\":{:.4},",
+                    "\"total_time_s\":{:.4},",
+                    "\"synthetic\":{}",
+                    "}}"
+                ),
+                seq_len,
+                gen_length,
+                iterations,
+                prefill_tok_s,
+                decode_tok_s,
+                avg_prefill,
+                avg_decode,
+                total_time_avg,
+                synthetic,
+            );
+        } else {
+            println!("--- seq_len={seq_len} ---");
+            println!("  Prefill: {prefill_tok_s:.1} tok/s ({avg_prefill:.4}s avg)");
+            println!("  Decode:  {decode_tok_s:.1} tok/s ({avg_decode:.4}s avg)");
+            println!("  Total:   {total_time_avg:.4}s avg over {iterations} iterations");
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// run subcommand
+// ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
 fn run_inference(
@@ -172,7 +562,7 @@ fn run_inference(
         .get_u32("general.num_kv_heads")
         .unwrap_or(num_heads as u32) as usize;
 
-    let model_config = ModelConfig {
+    let _model_config = ModelConfig {
         architecture: arch,
         hidden_size,
         head_dim,
@@ -195,10 +585,10 @@ fn run_inference(
     let vocab_size = tokenizer.vocab_size();
     let hybrid_model = HybridModel::random(
         vocab_size,
-        model_config.hidden_size,
-        model_config.head_dim,
-        model_config.num_heads,
-        model_config.num_layers,
+        hidden_size,
+        head_dim,
+        num_heads,
+        num_layers,
         seed.unwrap_or(42),
     );
 

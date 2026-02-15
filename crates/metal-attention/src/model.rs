@@ -3,6 +3,7 @@
 //! Constructs a full model from GGUF-loaded weights (or random weights for testing).
 //! Supports schedule-driven dispatch through RWKV-7 blocks.
 
+use metal_attention_models::griffin::{GriffinLayer, GriffinLayerState};
 use metal_attention_models::jamba::{JambaLayer, JambaLayerState};
 use metal_attention_models::llama::{LlamaLayer, LlamaState};
 use metal_attention_models::mamba::{MambaBlock, MambaState};
@@ -27,6 +28,8 @@ pub enum ModelLayer {
     Mamba(MambaBlock),
     /// Jamba hybrid layer (Mamba or Attention, determined by schedule).
     Jamba(JambaLayer),
+    /// Griffin hybrid layer (RG-LRU or Attention, 2:1 schedule).
+    Griffin(GriffinLayer),
 }
 
 /// Per-layer state, mirroring the ModelLayer enum.
@@ -35,6 +38,7 @@ pub enum LayerState {
     Llama(LlamaState),
     Mamba(MambaState),
     Jamba(JambaLayerState),
+    Griffin(GriffinLayerState),
 }
 
 impl Clone for LayerState {
@@ -44,6 +48,7 @@ impl Clone for LayerState {
             LayerState::Llama(s) => LayerState::Llama(s.clone()),
             LayerState::Mamba(s) => LayerState::Mamba(s.clone()),
             LayerState::Jamba(s) => LayerState::Jamba(s.clone()),
+            LayerState::Griffin(s) => LayerState::Griffin(s.clone()),
         }
     }
 }
@@ -158,6 +163,9 @@ impl HybridModel {
                 ModelLayer::Jamba(jamba_layer) => {
                     LayerState::Jamba(jamba_layer.init_state(&self.block_config))
                 }
+                ModelLayer::Griffin(griffin_layer) => {
+                    LayerState::Griffin(griffin_layer.init_state(&self.block_config))
+                }
             })
             .collect();
         ModelState { layer_states }
@@ -233,6 +241,12 @@ impl HybridModel {
                         panic!("Layer state mismatch: expected Jamba for layer {}", i);
                     };
                     hidden = jamba_layer.process_token(&hidden, layer_state);
+                }
+                ModelLayer::Griffin(griffin_layer) => {
+                    let LayerState::Griffin(ref mut layer_state) = state.layer_states[i] else {
+                        panic!("Layer state mismatch: expected Griffin for layer {}", i);
+                    };
+                    hidden = griffin_layer.process_token(&hidden, layer_state);
                 }
             }
         }

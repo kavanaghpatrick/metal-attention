@@ -67,3 +67,14 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "attention"
+harness = false
+
+[[bench]]
+name = "inference"
+harness = false
