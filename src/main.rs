@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use metal_attention::config::InferenceConfig;
 use metal_attention::generate_streaming;
 use metal_attention::model::HybridModel;
+use metal_attention::GpuForwardPass;
 
 use metal_attention_gguf::parser::{GgufError, GgufFile};
 use metal_attention_gguf::quantize::GgufType;
@@ -60,6 +61,10 @@ enum Commands {
         /// Repetition penalty (1.0 = disabled)
         #[arg(long, default_value = "1.1")]
         repeat_penalty: f32,
+
+        /// Use GPU forward pass (Metal compute kernels)
+        #[arg(long)]
+        gpu: bool,
     },
     /// Benchmark model performance
     Bench {
@@ -90,6 +95,10 @@ enum Commands {
         /// Random seed
         #[arg(short = 's', long, default_value = "42")]
         seed: u64,
+
+        /// Use GPU forward pass (Metal compute kernels)
+        #[arg(long)]
+        gpu: bool,
     },
     /// Show model info from GGUF metadata
     Info {
@@ -116,8 +125,14 @@ fn main() {
             top_p,
             top_k,
             repeat_penalty,
+            gpu,
         } => {
-            if let Err(e) = run_inference(
+            if gpu {
+                if let Err(e) = run_inference_gpu(model, prompt, max_tokens) {
+                    eprintln!("{e}");
+                    process::exit(1);
+                }
+            } else if let Err(e) = run_inference(
                 model,
                 prompt,
                 max_tokens,
@@ -139,8 +154,20 @@ fn main() {
             synthetic,
             json,
             seed,
+            gpu,
         } => {
-            if let Err(e) = run_bench(
+            if gpu {
+                if let Err(e) = run_bench_gpu(
+                    model,
+                    &seq_lengths,
+                    gen_length,
+                    iterations,
+                    json,
+                ) {
+                    eprintln!("{e}");
+                    process::exit(1);
+                }
+            } else if let Err(e) = run_bench(
                 model,
                 &seq_lengths,
                 gen_length,
@@ -622,4 +649,225 @@ fn run_inference(
     );
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GPU run subcommand
+// ---------------------------------------------------------------------------
+
+fn run_inference_gpu(
+    model_path: PathBuf,
+    prompt: String,
+    max_tokens: usize,
+) -> Result<(), String> {
+    if !model_path.exists() {
+        return Err(format!(
+            "Error: Model file not found: {}",
+            model_path.display()
+        ));
+    }
+
+    // Parse GGUF for tokenizer
+    let gguf = GgufFile::open(&model_path).map_err(|e| format!("Error: {e}"))?;
+    let tokenizer = GgufTokenizer::from_metadata(&gguf.metadata)
+        .map_err(|e| format!("Error: Failed to build tokenizer: {e}"))?;
+    let eos_id = tokenizer.eos_token_id();
+    drop(gguf);
+
+    // Construct GPU forward pass
+    eprintln!("Loading GPU forward pass...");
+    let mut gpu = GpuForwardPass::from_gguf(&model_path)?;
+
+    // Tokenize prompt
+    let prompt_tokens = tokenizer.encode(&prompt);
+    if prompt_tokens.is_empty() {
+        return Err("Error: Prompt produced no tokens".to_string());
+    }
+
+    eprintln!(
+        "Prompt: {} tokens | Generating up to {} tokens (GPU, greedy)",
+        prompt_tokens.len(),
+        max_tokens
+    );
+
+    let start = Instant::now();
+    let mut stdout = std::io::stdout();
+
+    // Prefill: run forward_token for each prompt token (discard logits except last)
+    let prefill_start = Instant::now();
+    let mut logits = Vec::new();
+    for &tok in &prompt_tokens {
+        logits = gpu.forward_token(tok);
+    }
+    let prefill_elapsed = prefill_start.elapsed();
+
+    // Decode loop: greedy argmax
+    let mut token_count: usize = 0;
+    let decode_start = Instant::now();
+
+    for _ in 0..max_tokens {
+        // Greedy sample: argmax of logits
+        let next_token = argmax(&logits);
+
+        // Stop on EOS
+        if next_token == eos_id {
+            break;
+        }
+
+        token_count += 1;
+        let text = tokenizer.decode(&[next_token]);
+        print!("{text}");
+        let _ = stdout.flush();
+
+        // Forward next token
+        logits = gpu.forward_token(next_token);
+    }
+    let decode_elapsed = decode_start.elapsed();
+
+    println!();
+
+    let total_elapsed = start.elapsed();
+    let decode_tok_s = if decode_elapsed.as_secs_f64() > 0.0 {
+        token_count as f64 / decode_elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+
+    eprintln!(
+        "\n--- GPU Generation complete ---\n\
+         Tokens generated: {}\n\
+         Prefill time: {:.3}s ({} tokens, {:.1} tok/s)\n\
+         Decode time:  {:.3}s ({} tokens, {:.1} tok/s)\n\
+         Total time:   {:.2}s",
+        token_count,
+        prefill_elapsed.as_secs_f64(),
+        prompt_tokens.len(),
+        prompt_tokens.len() as f64 / prefill_elapsed.as_secs_f64().max(1e-9),
+        decode_elapsed.as_secs_f64(),
+        token_count,
+        decode_tok_s,
+        total_elapsed.as_secs_f64(),
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GPU bench subcommand
+// ---------------------------------------------------------------------------
+
+fn run_bench_gpu(
+    model_path: Option<PathBuf>,
+    seq_lengths_str: &str,
+    gen_length: usize,
+    iterations: usize,
+    json_output: bool,
+) -> Result<(), String> {
+    let path = model_path
+        .as_ref()
+        .ok_or("Error: --model required for GPU bench")?;
+    if !path.exists() {
+        return Err(format!("Error: Model file not found: {}", path.display()));
+    }
+
+    let seq_lengths: Vec<usize> = seq_lengths_str
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<usize>()
+                .map_err(|_| format!("Invalid sequence length: '{}'", s.trim()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if seq_lengths.is_empty() {
+        return Err("No sequence lengths specified".to_string());
+    }
+
+    if !json_output {
+        eprintln!(
+            "GPU Benchmark: gen_length={}, iterations={}, seq_lengths={:?}",
+            gen_length, iterations, seq_lengths
+        );
+    }
+
+    for &seq_len in &seq_lengths {
+        let mut decode_times = Vec::with_capacity(iterations);
+
+        for iter in 0..iterations {
+            // Fresh GPU forward pass each iteration (clean KV cache)
+            let mut gpu = GpuForwardPass::from_gguf(path)?;
+
+            // Prefill with synthetic tokens
+            let prompt_tokens: Vec<u32> = (0..seq_len)
+                .map(|i| ((i * 7 + 13) % 49152) as u32)
+                .collect();
+
+            for &tok in &prompt_tokens {
+                let _ = gpu.forward_token(tok);
+            }
+
+            // Warmup: 3 decode steps (only on first iteration)
+            if iter == 0 {
+                for w in 0..3u32 {
+                    let logits = gpu.forward_token(w + 1);
+                    let _ = argmax(&logits);
+                }
+            }
+
+            // Timed decode loop
+            let mut logits = gpu.forward_token(1u32); // seed token
+            let decode_start = Instant::now();
+            for _ in 0..gen_length {
+                let next = argmax(&logits);
+                logits = gpu.forward_token(next);
+            }
+            let decode_elapsed = decode_start.elapsed();
+            decode_times.push(decode_elapsed.as_secs_f64());
+        }
+
+        let avg_decode = decode_times.iter().sum::<f64>() / iterations as f64;
+        let decode_tok_s = if avg_decode > 0.0 {
+            gen_length as f64 / avg_decode
+        } else {
+            0.0
+        };
+
+        if json_output {
+            println!(
+                concat!(
+                    "{{",
+                    "\"seq_len\":{},",
+                    "\"gen_length\":{},",
+                    "\"iterations\":{},",
+                    "\"decode_tok_s\":{:.1},",
+                    "\"avg_decode_s\":{:.4},",
+                    "\"gpu\":true",
+                    "}}"
+                ),
+                seq_len, gen_length, iterations, decode_tok_s, avg_decode,
+            );
+        } else {
+            println!("--- GPU bench seq_len={seq_len} ---");
+            println!("  Decode: {decode_tok_s:.1} tok/s ({avg_decode:.4}s avg over {iterations} iterations)");
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Utility: greedy argmax
+// ---------------------------------------------------------------------------
+
+fn argmax(logits: &[f32]) -> u32 {
+    let mut best_idx = 0u32;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best_idx = i as u32;
+        }
+    }
+    best_idx
 }
