@@ -9,7 +9,7 @@ use crate::types::{BlockConfig, TensorView};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PositionEncoding {
     None,
-    RoPE { theta_base: f32 },
+    RoPE { theta: f32 },
     ALiBi,
 }
 
