@@ -14,6 +14,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice};
 
+use metal_attention_gguf::quantize::GgufType;
 use metal_attention_gguf::GgufFile;
 use metal_attention_kernels::buffer::{alloc_buffer_with_data, create_weight_buffer};
 use metal_attention_models::registry::ModelConfig;
@@ -52,8 +53,10 @@ pub struct GpuWeightStore {
     norms: Vec<NormBuffers>,
     /// Token embedding buffer (F32).
     embed: Retained<ProtocolObject<dyn MTLBuffer>>,
-    /// LM head projection buffer (Q4_0).
+    /// LM head projection buffer (Q4_0 or F32 for tied embeddings).
     lm_head: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Whether the lm_head buffer contains F32 data (true for tied embeddings).
+    lm_head_is_f32: bool,
     /// Final RMSNorm weight buffer (F32).
     final_norm: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Keep the GGUF mmap alive while zero-copy buffers reference it.
@@ -89,14 +92,43 @@ fn make_weight_buffer(
             "Warning: zero-copy buffer creation failed for {tensor_name}, falling back to copy"
         );
     } else {
-        eprintln!(
-            "Warning: tensor {tensor_name} not page-aligned (offset 0x{:x}, page_size {}), using copy",
-            ptr % page_size,
-            page_size
-        );
+        // Silently fall back to copy for non-aligned tensors (common for GGUF files).
+        // Set GPU_DEBUG=1 to see per-tensor alignment warnings.
+        if std::env::var("GPU_DEBUG").is_ok() {
+            eprintln!(
+                "  tensor {tensor_name} not page-aligned (offset 0x{:x}), using copy",
+                ptr % page_size,
+            );
+        }
     }
 
     alloc_buffer_with_data(device, data)
+}
+
+/// Dequantize Q8_0 data to F32.
+///
+/// Q8_0 block: 2 bytes fp16 scale (half d) + 32 bytes signed int8 values.
+/// Total: 34 bytes per 32 elements.
+/// Dequant: value = qs[i] * d
+fn dequantize_q8_0_to_f32(data: &[u8], n_elements: usize) -> Vec<f32> {
+    let n_blocks = n_elements / 32;
+    let mut out = vec![0.0f32; n_elements];
+
+    for b in 0..n_blocks {
+        let block_offset = b * 34; // 34 bytes per Q8_0 block
+
+        // Read fp16 scale (little-endian)
+        let d_bits = u16::from_le_bytes([data[block_offset], data[block_offset + 1]]);
+        let d = half::f16::from_bits(d_bits).to_f32();
+
+        // Read 32 signed int8 values
+        for i in 0..32 {
+            let qs = data[block_offset + 2 + i] as i8;
+            out[b * 32 + i] = qs as f32 * d;
+        }
+    }
+
+    out
 }
 
 impl GpuWeightStore {
@@ -207,21 +239,44 @@ impl GpuWeightStore {
             });
         }
 
-        // Embedding (F32, always copy)
+        // Embedding: dequantize to F32 at load time for CPU-side embed_lookup.
+        // This also provides the lm_head buffer for tied embeddings.
         let embed_info = gguf
             .find_tensor("token_embd.weight")
             .ok_or_else(|| "Tensor not found: token_embd.weight".to_string())?;
         let embed_data = gguf.tensor_data(embed_info);
-        let embed = alloc_buffer_with_data(device, embed_data);
 
-        // LM head (may be Q4_0 or F32, use zero-copy when aligned)
-        // Try output.weight first, fall back to token_embd.weight (tied embeddings)
-        let lm_head = if let Some(lm_info) = gguf.find_tensor("output.weight") {
+        let embed_f32_bytes: Vec<u8> = match embed_info.gguf_type {
+            GgufType::F32 => {
+                eprintln!("token_embd.weight: F32 (no dequant needed)");
+                embed_data.to_vec()
+            }
+            GgufType::Q8_0 => {
+                let n_elements = embed_info.shape.iter().product::<u64>() as usize;
+                eprintln!("token_embd.weight: Q8_0, dequantizing {n_elements} elements to F32");
+                let f32_vec = dequantize_q8_0_to_f32(embed_data, n_elements);
+                // Safety: reinterpret Vec<f32> as bytes
+                let byte_len = f32_vec.len() * std::mem::size_of::<f32>();
+                let ptr = f32_vec.as_ptr() as *const u8;
+                unsafe { std::slice::from_raw_parts(ptr, byte_len) }.to_vec()
+            }
+            other => {
+                return Err(format!(
+                    "Unsupported embedding type: {:?}. Expected F32 or Q8_0.",
+                    other
+                ));
+            }
+        };
+        let embed = alloc_buffer_with_data(device, &embed_f32_bytes);
+
+        // LM head: try output.weight first, fall back to tied embedding (already F32)
+        let (lm_head, lm_head_is_f32) = if let Some(lm_info) = gguf.find_tensor("output.weight") {
             let lm_data = gguf.tensor_data(lm_info);
-            make_weight_buffer(device, lm_data, "output.weight", page_size)
+            eprintln!("output.weight: type={:?}", lm_info.gguf_type);
+            (make_weight_buffer(device, lm_data, "output.weight", page_size), false)
         } else {
-            eprintln!("Warning: output.weight not found, using tied token_embd.weight for lm_head");
-            alloc_buffer_with_data(device, embed_data)
+            eprintln!("output.weight not found, using tied F32 embedding for lm_head");
+            (alloc_buffer_with_data(device, &embed_f32_bytes), true)
         };
 
         // Final norm (F32, always copy)
@@ -237,6 +292,7 @@ impl GpuWeightStore {
             norms,
             embed,
             lm_head,
+            lm_head_is_f32,
             final_norm,
             _gguf: gguf,
         })
@@ -265,6 +321,11 @@ impl GpuWeightStore {
     /// Get the LM head projection buffer.
     pub fn lm_head(&self) -> &ProtocolObject<dyn MTLBuffer> {
         &self.lm_head
+    }
+
+    /// Whether the lm_head contains F32 data (tied embeddings) vs Q4_0.
+    pub fn lm_head_is_f32(&self) -> bool {
+        self.lm_head_is_f32
     }
 
     /// Get the final RMSNorm weight buffer.

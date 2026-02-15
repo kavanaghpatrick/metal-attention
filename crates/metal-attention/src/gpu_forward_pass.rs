@@ -185,14 +185,18 @@ impl GpuForwardPass {
 
         // Build PSO cache and prewarm all kernels
         let mut pso_cache = PsoCache::new(device.library.clone());
-        pso_cache.prewarm(&[
+        let mut pso_keys = vec![
             PsoKey::simple("matvec_q4_0"),
             PsoKey::simple("rmsnorm_optimized"),
             PsoKey::simple("residual_add"),
             PsoKey::simple("decode_attention"),
             PsoKey::simple("rope_apply"),
             PsoKey::simple("ffn_silu"),
-        ]);
+        ];
+        if weight_store.lm_head_is_f32() {
+            pso_keys.push(PsoKey::simple("matvec_f32"));
+        }
+        pso_cache.prewarm(&pso_keys);
 
         Ok(Self {
             device,
@@ -233,14 +237,30 @@ impl GpuForwardPass {
     /// KV cache append between attention projection and decode attention.
     /// Within each command buffer, all kernel dispatches are inline-encoded.
     pub fn forward_token(&mut self, token_id: u32) -> Vec<f32> {
+        let debug = std::env::var("GPU_DEBUG").is_ok();
+
         // 1. CPU embedding lookup -> write to hidden_a via contents() memcpy
         self.embed_lookup(token_id);
+
+        if debug {
+            let h = unsafe { read_buffer_slice(&self.hidden_a, self.hidden_size) };
+            let (has_nan, min, max) = buf_stats(&h);
+            eprintln!("  [embed] hidden_a: nan={has_nan} min={min:.6} max={max:.6}");
+        }
 
         // 2. Per-layer forward
         for layer_idx in 0..self.num_layers {
             // --- Attention block ---
             // Encode rmsnorm + Q/K/V projections + RoPE, commit+wait
             self.encode_attention_projections(layer_idx);
+
+            if debug && layer_idx < 2 {
+                let q = unsafe { read_buffer_slice(&self.scratch_q, self.num_heads * self.head_dim) };
+                let k = unsafe { read_buffer_slice(&self.scratch_k, self.num_kv_heads * self.head_dim) };
+                let (qn, qmin, qmax) = buf_stats(&q);
+                let (kn, kmin, kmax) = buf_stats(&k);
+                eprintln!("  [L{layer_idx} attn_proj] Q: nan={qn} min={qmin:.4} max={qmax:.4}  K: nan={kn} min={kmin:.4} max={kmax:.4}");
+            }
 
             // CPU-side KV cache append (requires GPU work completed)
             self.kv_caches
@@ -250,8 +270,20 @@ impl GpuForwardPass {
             // Decode attention + O projection + residual add
             self.encode_attention_output(layer_idx);
 
+            if debug && layer_idx < 2 {
+                let h = unsafe { read_buffer_slice(&self.hidden_a, self.hidden_size) };
+                let (hn, hmin, hmax) = buf_stats(&h);
+                eprintln!("  [L{layer_idx} attn_out] hidden_a: nan={hn} min={hmin:.4} max={hmax:.4}");
+            }
+
             // --- FFN block ---
             self.encode_ffn_block(layer_idx);
+
+            if debug && layer_idx < 2 {
+                let h = unsafe { read_buffer_slice(&self.hidden_a, self.hidden_size) };
+                let (hn, hmin, hmax) = buf_stats(&h);
+                eprintln!("  [L{layer_idx} ffn] hidden_a: nan={hn} min={hmin:.4} max={hmax:.4}");
+            }
         }
 
         // 3. Final norm + lm_head
@@ -259,6 +291,12 @@ impl GpuForwardPass {
 
         // 4. Read back logits and increment position
         let logits = unsafe { read_buffer_slice(&self.logits_buf, self.vocab_size) };
+
+        if debug {
+            let (ln, lmin, lmax) = buf_stats(&logits);
+            eprintln!("  [logits] nan={ln} min={lmin:.4} max={lmax:.4}");
+        }
+
         self.position += 1;
         logits
     }
@@ -484,14 +522,27 @@ impl GpuForwardPass {
         );
 
         // LM head matvec: hidden_b -> logits_buf [vocab_size]
-        self.encode_matvec_q4_0(
-            &encoder,
-            self.weight_store.lm_head(),
-            &self.hidden_b,
-            &self.logits_buf,
-            self.vocab_size,
-            self.hidden_size,
-        );
+        if self.weight_store.lm_head_is_f32() {
+            // Tied embeddings: F32 weights -> use F32 matvec kernel
+            self.encode_matvec_f32(
+                &encoder,
+                self.weight_store.lm_head(),
+                &self.hidden_b,
+                &self.logits_buf,
+                self.vocab_size,
+                self.hidden_size,
+            );
+        } else {
+            // Separate output.weight: Q4_0 -> use Q4_0 matvec kernel
+            self.encode_matvec_q4_0(
+                &encoder,
+                self.weight_store.lm_head(),
+                &self.hidden_b,
+                &self.logits_buf,
+                self.vocab_size,
+                self.hidden_size,
+            );
+        }
 
         encoder.endEncoding();
         cmd_buf.commit();
@@ -553,6 +604,46 @@ impl GpuForwardPass {
             .pso_cache
             .get(&PsoKey::simple("matvec_q4_0"))
             .expect("matvec_q4_0 PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, weight_buf, 0, 0);
+        set_buffer(encoder, input_buf, 0, 1);
+        set_buffer(encoder, output_buf, 0, 2);
+
+        let out_dim_u32 = out_dim as u32;
+        let in_dim_u32 = in_dim as u32;
+        set_bytes(encoder, &out_dim_u32, 3);
+        set_bytes(encoder, &in_dim_u32, 4);
+
+        let grid = MTLSize {
+            width: out_dim,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode F32 matvec: weight * input -> output.
+    /// Same dispatch pattern as Q4_0 but for dense F32 weights.
+    /// Dispatch: grid=(out_dim) threadgroups, threadgroup=(32).
+    fn encode_matvec_f32(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        weight_buf: &ProtocolObject<dyn MTLBuffer>,
+        input_buf: &ProtocolObject<dyn MTLBuffer>,
+        output_buf: &ProtocolObject<dyn MTLBuffer>,
+        out_dim: usize,
+        in_dim: usize,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("matvec_f32"))
+            .expect("matvec_f32 PSO not prewarmed");
 
         encoder.setComputePipelineState(pso);
         set_buffer(encoder, weight_buf, 0, 0);
@@ -758,6 +849,14 @@ impl GpuForwardPass {
     pub fn hidden_size(&self) -> usize {
         self.hidden_size
     }
+}
+
+/// Debug helper: compute NaN presence, min, max for a buffer.
+fn buf_stats(data: &[f32]) -> (bool, f32, f32) {
+    let has_nan = data.iter().any(|v| v.is_nan() || v.is_infinite());
+    let min = data.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    (has_nan, min, max)
 }
 
 /// CPU-side buffer copy between shared-mode Metal buffers.
