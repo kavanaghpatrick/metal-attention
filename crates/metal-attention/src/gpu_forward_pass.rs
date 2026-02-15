@@ -103,9 +103,7 @@ impl GpuForwardPass {
         }
 
         // Open GGUF and extract config
-        let gguf = Arc::new(
-            GgufFile::open(path).map_err(|e| format!("Failed to open GGUF: {e}"))?,
-        );
+        let gguf = Arc::new(GgufFile::open(path).map_err(|e| format!("Failed to open GGUF: {e}"))?);
 
         let hidden_size = gguf
             .metadata
@@ -124,10 +122,7 @@ impl GpuForwardPass {
             .metadata
             .get_u32("llama.attention.head_count_kv")
             .unwrap_or(num_heads as u32) as usize;
-        let num_layers = gguf
-            .metadata
-            .get_u32("llama.block_count")
-            .unwrap_or(30) as usize;
+        let num_layers = gguf.metadata.get_u32("llama.block_count").unwrap_or(30) as usize;
         let intermediate_size = gguf
             .metadata
             .get_u32("llama.feed_forward_length")
@@ -153,8 +148,14 @@ impl GpuForwardPass {
 
         eprintln!(
             "GpuForwardPass: {}L {}H {}D (kv_heads={}, ffn={}, vocab={}, rope_theta={}, eps={})",
-            num_layers, num_heads, hidden_size, num_kv_heads, intermediate_size, vocab_size,
-            rope_theta, rms_norm_eps
+            num_layers,
+            num_heads,
+            hidden_size,
+            num_kv_heads,
+            intermediate_size,
+            vocab_size,
+            rope_theta,
+            rms_norm_eps
         );
 
         // Build ModelConfig for GpuWeightStore
@@ -219,11 +220,15 @@ impl GpuForwardPass {
         let logits_buf = alloc_buffer(&device.device, logits_bytes);
 
         // Argmax buffers: 48 threadgroups for vocab=49152 (ceil(49152 / (256*4)))
-        let num_argmax_groups = (vocab_size + 256 * 4 - 1) / (256 * 4);
-        let argmax_partial_vals =
-            alloc_buffer_private(&device.device, num_argmax_groups * std::mem::size_of::<f32>());
-        let argmax_partial_idxs =
-            alloc_buffer_private(&device.device, num_argmax_groups * std::mem::size_of::<u32>());
+        let num_argmax_groups = vocab_size.div_ceil(256 * 4);
+        let argmax_partial_vals = alloc_buffer_private(
+            &device.device,
+            num_argmax_groups * std::mem::size_of::<f32>(),
+        );
+        let argmax_partial_idxs = alloc_buffer_private(
+            &device.device,
+            num_argmax_groups * std::mem::size_of::<u32>(),
+        );
         // Result buffer is Shared so CPU can read back the token id
         let argmax_result = alloc_buffer(&device.device, std::mem::size_of::<u32>());
 
@@ -535,8 +540,11 @@ impl GpuForwardPass {
             self.encode_attention_projections(layer_idx)?;
 
             if layer_idx < 2 {
-                let q = unsafe { read_buffer_slice(&self.scratch_q, self.num_heads * self.head_dim) };
-                let k = unsafe { read_buffer_slice(&self.scratch_k, self.num_kv_heads * self.head_dim) };
+                let q =
+                    unsafe { read_buffer_slice(&self.scratch_q, self.num_heads * self.head_dim) };
+                let k = unsafe {
+                    read_buffer_slice(&self.scratch_k, self.num_kv_heads * self.head_dim)
+                };
                 let (qn, qmin, qmax) = buf_stats(&q);
                 let (kn, kmin, kmax) = buf_stats(&k);
                 eprintln!("  [L{layer_idx} attn_proj] Q: nan={qn} min={qmin:.4} max={qmax:.4}  K: nan={kn} min={kmin:.4} max={kmax:.4}");
@@ -553,7 +561,9 @@ impl GpuForwardPass {
             if layer_idx < 2 {
                 let h = unsafe { read_buffer_slice(&self.hidden_a, self.hidden_size) };
                 let (hn, hmin, hmax) = buf_stats(&h);
-                eprintln!("  [L{layer_idx} attn_out] hidden_a: nan={hn} min={hmin:.4} max={hmax:.4}");
+                eprintln!(
+                    "  [L{layer_idx} attn_out] hidden_a: nan={hn} min={hmin:.4} max={hmax:.4}"
+                );
             }
 
             // --- FFN block ---
@@ -610,12 +620,7 @@ impl GpuForwardPass {
         let attn = self.weight_store.attn_proj(layer_idx);
 
         // RMSNorm: hidden_a -> hidden_b
-        self.encode_rmsnorm(
-            &encoder,
-            &self.hidden_a,
-            &norms.attn_norm,
-            &self.hidden_b,
-        );
+        self.encode_rmsnorm(&encoder, &self.hidden_a, &norms.attn_norm, &self.hidden_b);
 
         // Q projection: hidden_b -> scratch_q
         self.encode_matvec_q4_0(
@@ -727,12 +732,7 @@ impl GpuForwardPass {
         let ffn = self.weight_store.ffn(layer_idx);
 
         // RMSNorm: hidden_a -> hidden_b
-        self.encode_rmsnorm(
-            &encoder,
-            &self.hidden_a,
-            &norms.ffn_norm,
-            &self.hidden_b,
-        );
+        self.encode_rmsnorm(&encoder, &self.hidden_a, &norms.ffn_norm, &self.hidden_b);
 
         // Gate projection: hidden_b -> scratch_gate
         self.encode_matvec_q4_0(
@@ -961,6 +961,7 @@ impl GpuForwardPass {
     /// Buffer bindings: input(0), norm_weight(1), weight_q4_0(2), output(3),
     /// out_dim(4), in_dim(5), eps(6).
     /// Dispatch: grid=(out_dim, 1, 1) threadgroups, threadgroup=(32, 1, 1).
+    #[allow(clippy::too_many_arguments)]
     fn encode_fused_rmsnorm_matvec_q4_0(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -1008,6 +1009,7 @@ impl GpuForwardPass {
     /// Buffer bindings: input(0), norm_weight(1), weight_f32(2), output(3),
     /// out_dim(4), in_dim(5), eps(6).
     /// Dispatch: grid=(out_dim, 1, 1) threadgroups, threadgroup=(32, 1, 1).
+    #[allow(clippy::too_many_arguments, dead_code)]
     fn encode_fused_rmsnorm_matvec_f32(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -1169,10 +1171,7 @@ impl GpuForwardPass {
     /// Encode SwiGLU activation: silu(scratch_gate) * scratch_up -> scratch_silu.
     /// Uses LayerParams struct at buffer(4) for ffn_silu kernel.
     /// Dispatch: grid=(intermediate_size), threadgroup=(256).
-    fn encode_ffn_silu(
-        &self,
-        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    ) {
+    fn encode_ffn_silu(&self, encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>) {
         let pso = self
             .pso_cache
             .get(&PsoKey::simple("ffn_silu"))
@@ -1257,7 +1256,7 @@ impl GpuForwardPass {
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         logits_buf: &ProtocolObject<dyn MTLBuffer>,
     ) {
-        let num_groups = (self.vocab_size + 256 * 4 - 1) / (256 * 4);
+        let num_groups = self.vocab_size.div_ceil(256 * 4);
         let num_groups_u32 = num_groups as u32;
         let vocab_size_u32 = self.vocab_size as u32;
 

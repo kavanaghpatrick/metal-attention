@@ -177,15 +177,13 @@ pub fn dispatch_rmsnorm_optimized(
     let size_u32 = std::mem::size_of::<u32>();
     let size_f32 = std::mem::size_of::<f32>();
     unsafe {
-        let ptr_dim = std::ptr::NonNull::new(
-            &hidden_dim_u32 as *const u32 as *mut std::ffi::c_void,
-        )
-        .expect("dim pointer is null");
+        let ptr_dim =
+            std::ptr::NonNull::new(&hidden_dim_u32 as *const u32 as *mut std::ffi::c_void)
+                .expect("dim pointer is null");
         encoder.setBytes_length_atIndex(ptr_dim, size_u32, 3);
 
-        let ptr_eps =
-            std::ptr::NonNull::new(&eps as *const f32 as *mut std::ffi::c_void)
-                .expect("eps pointer is null");
+        let ptr_eps = std::ptr::NonNull::new(&eps as *const f32 as *mut std::ffi::c_void)
+            .expect("eps pointer is null");
         encoder.setBytes_length_atIndex(ptr_eps, size_f32, 4);
     }
 
@@ -323,7 +321,10 @@ mod tests {
             assert!(
                 diff < 1e-5,
                 "index {}: GPU={}, CPU={}, diff={}",
-                i, result[i], expected[i], diff
+                i,
+                result[i],
+                expected[i],
+                diff
             );
         }
         eprintln!(
@@ -356,7 +357,10 @@ mod tests {
             assert!(
                 diff < 1e-5,
                 "index {}: GPU={}, CPU={}, diff={}",
-                i, result[i], expected[i], diff
+                i,
+                result[i],
+                expected[i],
+                diff
             );
         }
 
@@ -367,7 +371,10 @@ mod tests {
             assert!(
                 diff < 1e-5,
                 "index {}: GPU={}, analytical={}, diff={}",
-                i, result[i], expected_val, diff
+                i,
+                result[i],
+                expected_val,
+                diff
             );
         }
     }

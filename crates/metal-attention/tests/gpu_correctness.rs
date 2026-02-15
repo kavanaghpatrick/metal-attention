@@ -19,8 +19,7 @@ use metal_attention_kernels::pipeline::PsoCache;
 /// is two directories up.
 fn model_path() -> PathBuf {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    Path::new(manifest_dir)
-        .join("../../models/SmolLM-135M.Q4_0.gguf")
+    Path::new(manifest_dir).join("../../models/SmolLM-135M.Q4_0.gguf")
 }
 
 /// Prefill tokens [1, 2, 3] on both GPU and CPU paths, then compare the

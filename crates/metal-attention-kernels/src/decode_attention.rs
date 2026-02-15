@@ -248,16 +248,20 @@ mod tests {
         // V cache: [3, 2*4] = [3, 8] -- distinct values per position
         let v_cache = vec![
             // pos 0
-            0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8,
-            // pos 1
-            1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8,
-            // pos 2
+            0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, // pos 1
+            1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, // pos 2
             2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8,
         ];
 
         // CPU reference
         let expected = cpu_decode_attention(
-            &q, &k_cache, &v_cache, num_heads, num_kv_heads, head_dim, kv_len,
+            &q,
+            &k_cache,
+            &v_cache,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            kv_len,
         );
 
         // GPU dispatch
@@ -281,7 +285,10 @@ mod tests {
             assert!(
                 diff < 1e-3,
                 "Index {}: GPU={}, CPU={}, diff={}",
-                i, result[i], expected[i], diff
+                i,
+                result[i],
+                expected[i],
+                diff
             );
         }
 
@@ -321,7 +328,13 @@ mod tests {
 
         // CPU reference
         let expected = cpu_decode_attention(
-            &q, &k_cache, &v_cache, num_heads, num_kv_heads, head_dim, kv_len,
+            &q,
+            &k_cache,
+            &v_cache,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            kv_len,
         );
 
         // GPU dispatch
@@ -346,7 +359,10 @@ mod tests {
             assert!(
                 diff < 1e-3,
                 "Index {}: GPU={}, CPU={}, diff={}",
-                i, result[i], expected[i], diff
+                i,
+                result[i],
+                expected[i],
+                diff
             );
         }
 
@@ -404,7 +420,13 @@ mod tests {
         let v_cache = vec![0.1, 0.2, 0.3, 0.4]; // expected output (softmax trivially = 1.0)
 
         let expected = cpu_decode_attention(
-            &q, &k_cache, &v_cache, num_heads, num_kv_heads, head_dim, kv_len,
+            &q,
+            &k_cache,
+            &v_cache,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            kv_len,
         );
 
         let result = dispatch_decode_attention(
@@ -425,7 +447,10 @@ mod tests {
             assert!(
                 diff < 1e-3,
                 "Index {}: GPU={}, CPU={}, diff={}",
-                i, result[i], expected[i], diff
+                i,
+                result[i],
+                expected[i],
+                diff
             );
         }
 
@@ -435,7 +460,11 @@ mod tests {
             assert!(
                 diff < 1e-3,
                 "Single KV: output[{}]={}, expected V[{}]={}, diff={}",
-                i, result[i], i, v_cache[i], diff
+                i,
+                result[i],
+                i,
+                v_cache[i],
+                diff
             );
         }
     }
@@ -467,7 +496,13 @@ mod tests {
             .collect();
 
         let expected = cpu_decode_attention(
-            &q, &k_cache, &v_cache, num_heads, num_kv_heads, head_dim, kv_len,
+            &q,
+            &k_cache,
+            &v_cache,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            kv_len,
         );
 
         let result = dispatch_decode_attention(
@@ -490,13 +525,18 @@ mod tests {
             assert!(
                 diff < 1e-3,
                 "Index {}: GPU={}, CPU={}, diff={}",
-                i, result[i], expected[i], diff
+                i,
+                result[i],
+                expected[i],
+                diff
             );
         }
 
         eprintln!(
             "test_decode_attention_long_context: kv_len={}, max_diff={:.6}, {} outputs verified",
-            kv_len, max_diff, result.len()
+            kv_len,
+            max_diff,
+            result.len()
         );
     }
 }

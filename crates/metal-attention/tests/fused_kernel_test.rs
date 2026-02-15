@@ -63,7 +63,7 @@ const TOLERANCE_Q4_0: f32 = 2e-4;
 fn run_separate_rmsnorm_matvec_f32(
     input: &[f32],
     norm_weight: &[f32],
-    weight: &[f32],  // [out_dim * in_dim] row-major
+    weight: &[f32], // [out_dim * in_dim] row-major
     in_dim: usize,
     out_dim: usize,
 ) -> Vec<f32> {
@@ -82,13 +82,8 @@ fn run_separate_rmsnorm_matvec_f32(
     let output_buf = alloc_buffer(&device.device, out_dim * std::mem::size_of::<f32>());
 
     // Command buffer
-    let cmd_buf = device
-        .command_queue
-        .commandBuffer()
-        .expect("cmd buf");
-    let encoder = cmd_buf
-        .computeCommandEncoder()
-        .expect("encoder");
+    let cmd_buf = device.command_queue.commandBuffer().expect("cmd buf");
+    let encoder = cmd_buf.computeCommandEncoder().expect("encoder");
 
     // Step 1: rmsnorm_optimized
     let pso_rmsnorm = pso_cache
@@ -102,8 +97,16 @@ fn run_separate_rmsnorm_matvec_f32(
     set_bytes(&encoder, &hidden_dim_u32, 3);
     set_bytes(&encoder, &EPS, 4);
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize { width: 1, height: 1, depth: 1 },
-        MTLSize { width: 32, height: 1, depth: 1 },
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
     );
 
     // Step 2: matvec_f32
@@ -119,8 +122,16 @@ fn run_separate_rmsnorm_matvec_f32(
     set_bytes(&encoder, &out_dim_u32, 3);
     set_bytes(&encoder, &in_dim_u32, 4);
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize { width: out_dim, height: 1, depth: 1 },
-        MTLSize { width: 32, height: 1, depth: 1 },
+        MTLSize {
+            width: out_dim,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
     );
 
     encoder.endEncoding();
@@ -134,7 +145,7 @@ fn run_separate_rmsnorm_matvec_f32(
 fn run_fused_rmsnorm_matvec_f32(
     input: &[f32],
     norm_weight: &[f32],
-    weight: &[f32],  // [out_dim * in_dim] row-major
+    weight: &[f32], // [out_dim * in_dim] row-major
     in_dim: usize,
     out_dim: usize,
 ) -> Vec<f32> {
@@ -147,13 +158,8 @@ fn run_fused_rmsnorm_matvec_f32(
     let weight_buf = alloc_buffer_with_data(&device.device, weight);
     let output_buf = alloc_buffer(&device.device, out_dim * std::mem::size_of::<f32>());
 
-    let cmd_buf = device
-        .command_queue
-        .commandBuffer()
-        .expect("cmd buf");
-    let encoder = cmd_buf
-        .computeCommandEncoder()
-        .expect("encoder");
+    let cmd_buf = device.command_queue.commandBuffer().expect("cmd buf");
+    let encoder = cmd_buf.computeCommandEncoder().expect("encoder");
 
     let pso = pso_cache
         .get(&PsoKey::simple("rmsnorm_matvec_f32"))
@@ -170,8 +176,16 @@ fn run_fused_rmsnorm_matvec_f32(
     set_bytes(&encoder, &EPS, 6);
 
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize { width: out_dim, height: 1, depth: 1 },
-        MTLSize { width: 32, height: 1, depth: 1 },
+        MTLSize {
+            width: out_dim,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
     );
 
     encoder.endEncoding();
@@ -190,7 +204,7 @@ fn run_fused_rmsnorm_matvec_f32(
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
 struct BlockQ4_0 {
-    d: u16,    // fp16 scale factor
+    d: u16,       // fp16 scale factor
     qs: [u8; 16], // 32 x 4-bit values packed as nibble pairs
 }
 
@@ -321,13 +335,8 @@ fn run_separate_rmsnorm_matvec_q4_0(
     let normed_buf = alloc_buffer(&device.device, in_dim * std::mem::size_of::<f32>());
     let output_buf = alloc_buffer(&device.device, out_dim * std::mem::size_of::<f32>());
 
-    let cmd_buf = device
-        .command_queue
-        .commandBuffer()
-        .expect("cmd buf");
-    let encoder = cmd_buf
-        .computeCommandEncoder()
-        .expect("encoder");
+    let cmd_buf = device.command_queue.commandBuffer().expect("cmd buf");
+    let encoder = cmd_buf.computeCommandEncoder().expect("encoder");
 
     // Step 1: rmsnorm_optimized
     let pso_rmsnorm = pso_cache
@@ -341,8 +350,16 @@ fn run_separate_rmsnorm_matvec_q4_0(
     set_bytes(&encoder, &hidden_dim_u32, 3);
     set_bytes(&encoder, &EPS, 4);
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize { width: 1, height: 1, depth: 1 },
-        MTLSize { width: 32, height: 1, depth: 1 },
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
     );
 
     // Step 2: matvec_q4_0
@@ -358,8 +375,16 @@ fn run_separate_rmsnorm_matvec_q4_0(
     set_bytes(&encoder, &out_dim_u32, 3);
     set_bytes(&encoder, &in_dim_u32, 4);
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize { width: out_dim, height: 1, depth: 1 },
-        MTLSize { width: 32, height: 1, depth: 1 },
+        MTLSize {
+            width: out_dim,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
     );
 
     encoder.endEncoding();
@@ -386,13 +411,8 @@ fn run_fused_rmsnorm_matvec_q4_0(
     let weight_buf = alloc_buffer_with_data(&device.device, q4_bytes);
     let output_buf = alloc_buffer(&device.device, out_dim * std::mem::size_of::<f32>());
 
-    let cmd_buf = device
-        .command_queue
-        .commandBuffer()
-        .expect("cmd buf");
-    let encoder = cmd_buf
-        .computeCommandEncoder()
-        .expect("encoder");
+    let cmd_buf = device.command_queue.commandBuffer().expect("cmd buf");
+    let encoder = cmd_buf.computeCommandEncoder().expect("encoder");
 
     let pso = pso_cache
         .get(&PsoKey::simple("rmsnorm_matvec_q4_0"))
@@ -409,8 +429,16 @@ fn run_fused_rmsnorm_matvec_q4_0(
     set_bytes(&encoder, &EPS, 6);
 
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize { width: out_dim, height: 1, depth: 1 },
-        MTLSize { width: 32, height: 1, depth: 1 },
+        MTLSize {
+            width: out_dim,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
     );
 
     encoder.endEncoding();
@@ -426,7 +454,13 @@ fn run_fused_rmsnorm_matvec_q4_0(
 
 /// Assert two f32 slices match within tolerance. Returns max absolute diff.
 fn assert_close(label: &str, a: &[f32], b: &[f32], tol: f32) -> f32 {
-    assert_eq!(a.len(), b.len(), "{label}: length mismatch {} vs {}", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "{label}: length mismatch {} vs {}",
+        a.len(),
+        b.len()
+    );
     let mut max_diff = 0.0f32;
     let mut max_diff_idx = 0;
     for (i, (&va, &vb)) in a.iter().zip(b.iter()).enumerate() {

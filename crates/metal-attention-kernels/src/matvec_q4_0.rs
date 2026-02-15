@@ -196,8 +196,8 @@ mod tests {
         // Row 0: scale=1.0, values = [-8,-7,...,-1, 0,1,...,7] (full range)
         let mut values_0 = [0i8; 32];
         for i in 0..16 {
-            values_0[i] = (i as i8) - 8;       // low nibbles: -8..7
-            values_0[i + 16] = (i as i8) - 8;  // high nibbles: -8..7
+            values_0[i] = (i as i8) - 8; // low nibbles: -8..7
+            values_0[i + 16] = (i as i8) - 8; // high nibbles: -8..7
         }
         let block_0 = encode_q4_0_block(1.0, &values_0);
 
@@ -216,7 +216,8 @@ mod tests {
         let expected = cpu_q4_0_dot(&weight_bytes, &input, out_dim, in_dim);
 
         // GPU dispatch
-        let result = dispatch_matvec_q4_0(&gpu, &mut pso_cache, &weight_bytes, &input, out_dim, in_dim);
+        let result =
+            dispatch_matvec_q4_0(&gpu, &mut pso_cache, &weight_bytes, &input, out_dim, in_dim);
 
         assert_eq!(result.len(), out_dim);
         for i in 0..out_dim {
@@ -258,7 +259,8 @@ mod tests {
         let n_blocks_per_row = in_dim / Q4_0_BLOCK_SIZE; // 18 blocks per row
 
         // Generate random Q4_0 data using a simple deterministic pattern
-        let mut weight_bytes = Vec::with_capacity(out_dim * n_blocks_per_row * Q4_0_BYTES_PER_BLOCK);
+        let mut weight_bytes =
+            Vec::with_capacity(out_dim * n_blocks_per_row * Q4_0_BYTES_PER_BLOCK);
         for row in 0..out_dim {
             for b in 0..n_blocks_per_row {
                 // Use a deterministic scale based on row and block index
@@ -275,15 +277,14 @@ mod tests {
         }
 
         // Generate deterministic input
-        let input: Vec<f32> = (0..in_dim)
-            .map(|i| 0.1 * ((i % 10) as f32 - 5.0))
-            .collect();
+        let input: Vec<f32> = (0..in_dim).map(|i| 0.1 * ((i % 10) as f32 - 5.0)).collect();
 
         // CPU reference
         let expected = cpu_q4_0_dot(&weight_bytes, &input, out_dim, in_dim);
 
         // GPU dispatch
-        let result = dispatch_matvec_q4_0(&gpu, &mut pso_cache, &weight_bytes, &input, out_dim, in_dim);
+        let result =
+            dispatch_matvec_q4_0(&gpu, &mut pso_cache, &weight_bytes, &input, out_dim, in_dim);
 
         assert_eq!(result.len(), out_dim);
         let mut max_diff = 0.0f32;
@@ -329,9 +330,7 @@ mod tests {
             }
         }
 
-        let input: Vec<f32> = (0..in_dim)
-            .map(|i| 0.1 * ((i % 10) as f32 - 5.0))
-            .collect();
+        let input: Vec<f32> = (0..in_dim).map(|i| 0.1 * ((i % 10) as f32 - 5.0)).collect();
 
         let expected = cpu_q4_0_dot(&weight_bytes, &input, out_dim, in_dim);
         let result =
@@ -345,7 +344,10 @@ mod tests {
             assert!(
                 diff < 1e-2,
                 "Row {}: GPU={}, CPU={}, diff={}",
-                i, result[i], expected[i], diff
+                i,
+                result[i],
+                expected[i],
+                diff
             );
         }
         eprintln!(
@@ -394,7 +396,10 @@ mod tests {
             assert!(
                 diff < 1e-3,
                 "Row {}: GPU={}, expected={}, diff={}",
-                i, result[i], expected_val, diff
+                i,
+                result[i],
+                expected_val,
+                diff
             );
         }
         eprintln!(
@@ -443,7 +448,10 @@ mod tests {
             assert!(
                 diff < 1e-2,
                 "Row {}: GPU={}, CPU={}, diff={}",
-                i, result[i], expected[i], diff
+                i,
+                result[i],
+                expected[i],
+                diff
             );
         }
         eprintln!(
@@ -483,7 +491,8 @@ mod tests {
             assert!(
                 result[i].abs() < 1e-6,
                 "Row {}: expected ~0.0 with zero scale, got {}",
-                i, result[i]
+                i,
+                result[i]
             );
         }
     }

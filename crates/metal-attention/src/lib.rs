@@ -15,8 +15,8 @@ pub mod sampling;
 
 // Re-exports for convenience
 pub use config::InferenceConfig;
-pub use gpu_forward_pass::GpuForwardPass;
 pub use dequant::dequantize_tensor;
+pub use gpu_forward_pass::GpuForwardPass;
 pub use inference::{decode_step, generate, generate_streaming, prefill};
 pub use model::{HybridModel, LayerState, ModelLayer, ModelState};
 pub use sampling::{

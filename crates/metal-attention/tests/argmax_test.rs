@@ -4,11 +4,15 @@
 //! synthetic input vectors and compare against CPU argmax. Does NOT require
 //! a model file — only needs the metallib with argmax shaders.
 
-use metal_attention_kernels::buffer::{alloc_buffer, alloc_buffer_private, alloc_buffer_with_data, read_buffer_slice};
+use metal_attention_kernels::buffer::{
+    alloc_buffer, alloc_buffer_private, alloc_buffer_with_data, read_buffer_slice,
+};
 use metal_attention_kernels::device::GpuDevice;
 use metal_attention_kernels::dispatch::{set_buffer, set_bytes};
 use metal_attention_kernels::pipeline::{PsoCache, PsoKey};
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+use objc2_metal::{
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+};
 
 /// Run GPU argmax on the given f32 slice; returns the index of the max element.
 fn gpu_argmax(data: &[f32]) -> u32 {
@@ -25,8 +29,10 @@ fn gpu_argmax(data: &[f32]) -> u32 {
     // Allocate buffers
     let logits_buf = alloc_buffer_with_data(&device.device, data);
     let num_groups = (vocab_size + 256 * 4 - 1) / (256 * 4);
-    let partial_vals = alloc_buffer_private(&device.device, num_groups * std::mem::size_of::<f32>());
-    let partial_idxs = alloc_buffer_private(&device.device, num_groups * std::mem::size_of::<u32>());
+    let partial_vals =
+        alloc_buffer_private(&device.device, num_groups * std::mem::size_of::<f32>());
+    let partial_idxs =
+        alloc_buffer_private(&device.device, num_groups * std::mem::size_of::<u32>());
     let result_buf = alloc_buffer(&device.device, std::mem::size_of::<u32>());
 
     // Create command buffer + compute encoder
@@ -51,8 +57,16 @@ fn gpu_argmax(data: &[f32]) -> u32 {
     set_buffer(&encoder, &partial_vals, 0, 2);
     set_buffer(&encoder, &partial_idxs, 0, 3);
 
-    let grid = MTLSize { width: num_groups, height: 1, depth: 1 };
-    let tg = MTLSize { width: 256, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: num_groups,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
 
     // Stage 2: argmax_final
@@ -65,7 +79,11 @@ fn gpu_argmax(data: &[f32]) -> u32 {
     set_bytes(&encoder, &num_groups_u32, 2);
     set_buffer(&encoder, &result_buf, 0, 3);
 
-    let grid_final = MTLSize { width: 1, height: 1, depth: 1 };
+    let grid_final = MTLSize {
+        width: 1,
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_final, tg);
 
     encoder.endEncoding();
@@ -99,7 +117,10 @@ fn argmax_known_vector() {
     // Simple vector where the max is at a known position
     let data = vec![0.1, 0.5, 0.3, 0.9, 0.2, 0.7, 0.4, 0.8, 0.6, 0.0];
     let result = gpu_argmax(&data);
-    assert_eq!(result, 3, "argmax of [0.1, 0.5, 0.3, 0.9, ...] should be index 3");
+    assert_eq!(
+        result, 3,
+        "argmax of [0.1, 0.5, 0.3, 0.9, ...] should be index 3"
+    );
 }
 
 #[test]
@@ -109,7 +130,10 @@ fn argmax_all_same_values() {
     // The kernel iterates forward, so index 0 gets the first `> -INF` comparison.
     let data = vec![1.0; 1024];
     let result = gpu_argmax(&data);
-    assert_eq!(result, 0, "all-same values should return index 0 (first wins with strict >)");
+    assert_eq!(
+        result, 0,
+        "all-same values should return index 0 (first wins with strict >)"
+    );
 }
 
 #[test]
@@ -118,11 +142,7 @@ fn argmax_max_at_last_index() {
     let mut data = vec![0.0f32; n];
     data[n - 1] = 999.0;
     let result = gpu_argmax(&data);
-    assert_eq!(
-        result,
-        (n - 1) as u32,
-        "max at last index should be found"
-    );
+    assert_eq!(result, (n - 1) as u32, "max at last index should be found");
 }
 
 #[test]
@@ -176,7 +196,8 @@ fn argmax_full_vocab_49152() {
     assert!(
         (gpu_result as usize) < vocab_size,
         "result token_id ({}) must be < vocab_size ({})",
-        gpu_result, vocab_size
+        gpu_result,
+        vocab_size
     );
 }
 
@@ -207,7 +228,8 @@ fn argmax_full_vocab_49152_random() {
     assert!(
         (gpu_result as usize) < vocab_size,
         "result token_id ({}) must be < vocab_size ({})",
-        gpu_result, vocab_size
+        gpu_result,
+        vocab_size
     );
 }
 
@@ -220,7 +242,8 @@ fn argmax_property_result_in_range() {
         assert!(
             (result as usize) < size,
             "result {} out of range for size {}",
-            result, size
+            result,
+            size
         );
         // Also verify matches CPU
         let cpu = cpu_argmax(&data);
@@ -251,5 +274,8 @@ fn argmax_negative_values() {
     // All negative: most negative values, max is the least negative
     let data = vec![-10.0, -5.0, -100.0, -1.0, -50.0];
     let result = gpu_argmax(&data);
-    assert_eq!(result, 3, "argmax of all-negative should find -1.0 at index 3");
+    assert_eq!(
+        result, 3,
+        "argmax of all-negative should find -1.0 at index 3"
+    );
 }

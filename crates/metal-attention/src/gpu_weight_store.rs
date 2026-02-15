@@ -325,7 +325,10 @@ impl GpuWeightStore {
         let (lm_head, lm_head_is_f32) = if let Some(lm_info) = gguf.find_tensor("output.weight") {
             let lm_data = gguf.tensor_data(lm_info);
             eprintln!("output.weight: type={:?}", lm_info.gguf_type);
-            (make_weight_buffer(device, lm_data, "output.weight", page_size), false)
+            (
+                make_weight_buffer(device, lm_data, "output.weight", page_size),
+                false,
+            )
         } else {
             eprintln!("output.weight not found, using tied F32 embedding for lm_head");
             (alloc_buffer_with_data(device, &embed_f32_bytes), true)

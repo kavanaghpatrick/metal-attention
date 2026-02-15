@@ -12,7 +12,9 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLSize};
+use objc2_metal::{
+    MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLSize,
+};
 
 use metal_attention_kernels::buffer::alloc_buffer;
 use metal_attention_kernels::dispatch::{set_buffer, set_bytes};
@@ -43,11 +45,7 @@ impl GpuKVCache {
     /// - `device`: Metal device for buffer allocation.
     /// - `max_len`: Maximum sequence length (e.g., 2048).
     /// - `kv_dim`: KV dimension (num_kv_heads * head_dim).
-    pub fn new(
-        device: &ProtocolObject<dyn MTLDevice>,
-        max_len: usize,
-        kv_dim: usize,
-    ) -> Self {
+    pub fn new(device: &ProtocolObject<dyn MTLDevice>, max_len: usize, kv_dim: usize) -> Self {
         let buf_size = max_len * kv_dim * std::mem::size_of::<f32>();
         let k_buf = alloc_buffer(device, buf_size);
         let v_buf = alloc_buffer(device, buf_size);

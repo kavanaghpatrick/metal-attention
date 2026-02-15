@@ -167,7 +167,15 @@ mod tests {
             .map(|i| (i as f32 + 1.0) * 0.1)
             .collect();
 
-        let result = dispatch_rope_apply(&gpu, &mut pso_cache, &qk, num_heads, head_dim, position, THETA);
+        let result = dispatch_rope_apply(
+            &gpu,
+            &mut pso_cache,
+            &qk,
+            num_heads,
+            head_dim,
+            position,
+            THETA,
+        );
 
         assert_eq!(result.len(), qk.len());
         for i in 0..qk.len() {
@@ -175,7 +183,10 @@ mod tests {
             assert!(
                 diff < 1e-5,
                 "Position 0 should be identity. Index {}: input={}, output={}, diff={}",
-                i, qk[i], result[i], diff
+                i,
+                qk[i],
+                result[i],
+                diff
             );
         }
     }
@@ -196,7 +207,15 @@ mod tests {
             .collect();
 
         // GPU result
-        let gpu_result = dispatch_rope_apply(&gpu, &mut pso_cache, &qk, num_heads, head_dim, position, THETA);
+        let gpu_result = dispatch_rope_apply(
+            &gpu,
+            &mut pso_cache,
+            &qk,
+            num_heads,
+            head_dim,
+            position,
+            THETA,
+        );
 
         // CPU reference
         let mut cpu_result = qk.clone();
@@ -210,7 +229,10 @@ mod tests {
             assert!(
                 diff < 1e-4,
                 "Mismatch at index {}: GPU={}, CPU={}, diff={}",
-                i, gpu_result[i], cpu_result[i], diff
+                i,
+                gpu_result[i],
+                cpu_result[i],
+                diff
             );
         }
 
@@ -268,7 +290,11 @@ mod tests {
                 assert!(
                     diff < 1e-4,
                     "position={}, index {}: GPU={}, CPU={}, diff={}",
-                    position, i, gpu_result[i], cpu_result[i], diff
+                    position,
+                    i,
+                    gpu_result[i],
+                    cpu_result[i],
+                    diff
                 );
             }
 
@@ -279,7 +305,10 @@ mod tests {
                     assert!(
                         diff < 1e-5,
                         "position=0 should be identity, index {}: input={}, output={}, diff={}",
-                        i, qk[i], gpu_result[i], diff
+                        i,
+                        qk[i],
+                        gpu_result[i],
+                        diff
                     );
                 }
             } else {
@@ -292,7 +321,8 @@ mod tests {
                 assert!(
                     total_diff > 0.01,
                     "position={}: rotation should change values, but total diff={}",
-                    position, total_diff
+                    position,
+                    total_diff
                 );
             }
 

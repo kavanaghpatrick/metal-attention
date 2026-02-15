@@ -1262,7 +1262,9 @@ fn test_linear_attention_output_finiteness() {
 
 #[test]
 fn test_kv_cache_copy_gpu_vs_cpu() {
-    use metal_attention_kernels::buffer::{alloc_buffer, alloc_buffer_with_data, read_buffer_slice};
+    use metal_attention_kernels::buffer::{
+        alloc_buffer, alloc_buffer_with_data, read_buffer_slice,
+    };
     use metal_attention_kernels::dispatch::{set_buffer, set_bytes};
 
     let kv_dim: u32 = 192;
@@ -1327,10 +1329,8 @@ fn test_kv_cache_copy_gpu_vs_cpu() {
     }
 
     // Read back and verify row 0
-    let k_cache: Vec<f32> =
-        unsafe { read_buffer_slice(&k_dst_buf, max_rows * kv_dim_usize) };
-    let v_cache: Vec<f32> =
-        unsafe { read_buffer_slice(&v_dst_buf, max_rows * kv_dim_usize) };
+    let k_cache: Vec<f32> = unsafe { read_buffer_slice(&k_dst_buf, max_rows * kv_dim_usize) };
+    let v_cache: Vec<f32> = unsafe { read_buffer_slice(&v_dst_buf, max_rows * kv_dim_usize) };
 
     // Row 0 should match scratch data exactly (bit-for-bit copy)
     assert_eq!(
@@ -1346,8 +1346,14 @@ fn test_kv_cache_copy_gpu_vs_cpu() {
 
     // Rows 1+ should still be zero
     for i in kv_dim_usize..max_rows * kv_dim_usize {
-        assert_eq!(k_cache[i], 0.0, "kv_cache_copy: K cache row >0 should be zero at idx {i}");
-        assert_eq!(v_cache[i], 0.0, "kv_cache_copy: V cache row >0 should be zero at idx {i}");
+        assert_eq!(
+            k_cache[i], 0.0,
+            "kv_cache_copy: K cache row >0 should be zero at idx {i}"
+        );
+        assert_eq!(
+            v_cache[i], 0.0,
+            "kv_cache_copy: V cache row >0 should be zero at idx {i}"
+        );
     }
 
     // Now dispatch at row_idx=1 with different data
@@ -1388,10 +1394,8 @@ fn test_kv_cache_copy_gpu_vs_cpu() {
     }
 
     // Read back again
-    let k_cache2: Vec<f32> =
-        unsafe { read_buffer_slice(&k_dst_buf, max_rows * kv_dim_usize) };
-    let v_cache2: Vec<f32> =
-        unsafe { read_buffer_slice(&v_dst_buf, max_rows * kv_dim_usize) };
+    let k_cache2: Vec<f32> = unsafe { read_buffer_slice(&k_dst_buf, max_rows * kv_dim_usize) };
+    let v_cache2: Vec<f32> = unsafe { read_buffer_slice(&v_dst_buf, max_rows * kv_dim_usize) };
 
     // Row 0 should be UNCHANGED (still matches scratch_k/scratch_v)
     assert_eq!(
@@ -1419,8 +1423,14 @@ fn test_kv_cache_copy_gpu_vs_cpu() {
 
     // Rows 2+ should still be zero
     for i in 2 * kv_dim_usize..max_rows * kv_dim_usize {
-        assert_eq!(k_cache2[i], 0.0, "kv_cache_copy: K row >=2 should be zero at idx {i}");
-        assert_eq!(v_cache2[i], 0.0, "kv_cache_copy: V row >=2 should be zero at idx {i}");
+        assert_eq!(
+            k_cache2[i], 0.0,
+            "kv_cache_copy: K row >=2 should be zero at idx {i}"
+        );
+        assert_eq!(
+            v_cache2[i], 0.0,
+            "kv_cache_copy: V row >=2 should be zero at idx {i}"
+        );
     }
 
     eprintln!("kv_cache_copy: PASS (2 rows verified bit-for-bit, kv_dim={kv_dim})");
@@ -1428,7 +1438,9 @@ fn test_kv_cache_copy_gpu_vs_cpu() {
 
 #[test]
 fn test_buffer_copy_gpu_vs_cpu() {
-    use metal_attention_kernels::buffer::{alloc_buffer, alloc_buffer_with_data, read_buffer_slice};
+    use metal_attention_kernels::buffer::{
+        alloc_buffer, alloc_buffer_with_data, read_buffer_slice,
+    };
     use metal_attention_kernels::dispatch::{set_buffer, set_bytes};
 
     let count: u32 = 576;
@@ -1495,7 +1507,9 @@ fn test_buffer_copy_gpu_vs_cpu() {
 
 #[test]
 fn test_buffer_copy_small() {
-    use metal_attention_kernels::buffer::{alloc_buffer, alloc_buffer_with_data, read_buffer_slice};
+    use metal_attention_kernels::buffer::{
+        alloc_buffer, alloc_buffer_with_data, read_buffer_slice,
+    };
     use metal_attention_kernels::dispatch::{set_buffer, set_bytes};
 
     let count: u32 = 1;
