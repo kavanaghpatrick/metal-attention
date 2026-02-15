@@ -142,7 +142,7 @@ pub fn cpu_rwkv_wkv(
     k: &[f32],
     v: &[f32],
     w: &[f32],
-    state: &mut Vec<f32>,
+    state: &mut [f32],
     seq_len: usize,
     head_dim: usize,
 ) -> Vec<f32> {

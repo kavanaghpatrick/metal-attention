@@ -166,12 +166,12 @@ impl HybridModel {
         let vocab_size = self.vocab_size();
         let hs = self.config.hidden_size;
         let mut logits = vec![0.0f32; vocab_size];
-        for i in 0..vocab_size {
+        for (i, logit) in logits.iter_mut().enumerate() {
             let mut acc = 0.0f32;
-            for j in 0..hs {
-                acc += self.lm_head_weight[i * hs + j] * hidden[j];
+            for (j, &h) in hidden.iter().enumerate().take(hs) {
+                acc += self.lm_head_weight[i * hs + j] * h;
             }
-            logits[i] = acc;
+            *logit = acc;
         }
         logits
     }

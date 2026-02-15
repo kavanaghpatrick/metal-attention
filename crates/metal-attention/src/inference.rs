@@ -29,7 +29,7 @@ pub fn decode_step(model: &HybridModel, token: u32, state: &mut ModelState) -> V
 
 /// Sample a token from logits using the configured sampling strategy.
 fn sample_token(
-    logits: &mut Vec<f32>,
+    logits: &mut [f32],
     previous_tokens: &[u32],
     config: &InferenceConfig,
     rng: &mut SimpleRng,
