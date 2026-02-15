@@ -40,7 +40,7 @@ pub use kv_cache::{DenseKVCache, PagedKVCache, PAGE_SIZE};
 pub use linear::dispatch_linear_attention;
 pub use matmul::dispatch_matmul;
 pub use matvec_q4_0::dispatch_matvec_q4_0;
-pub use norm::dispatch_rmsnorm;
+pub use norm::{dispatch_rmsnorm, dispatch_rmsnorm_optimized};
 pub use residual::dispatch_residual_add;
 pub use paged::{cpu_paged_attention, dispatch_paged_attention, interleave_kv_pages};
 pub use pipeline::{ConstantType, ConstantValue, PsoCache, PsoKey};

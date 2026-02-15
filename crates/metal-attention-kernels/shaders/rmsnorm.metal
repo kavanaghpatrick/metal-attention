@@ -34,3 +34,43 @@ kernel void rmsnorm(
 
     output[offset + dim] = (input[offset + dim] / rms) * weight[dim];
 }
+
+// ---------------------------------------------------------------------------
+// Optimized RMSNorm kernel with simdgroup cooperative reduction
+//
+// Computes: output[i] = (input[i] / rms) * weight[i]
+// where rms = sqrt(mean(input^2) + eps)
+//
+// Uses 32 threads (1 simdgroup) with simd_sum for cooperative reduction.
+// Each thread processes hidden_dim/32 elements in a strided loop.
+//
+// Dispatch: grid=(1,1,1), threadgroup=(32,1,1)
+// Buffer bindings: input(0), weight(1), output(2), hidden_dim(3), eps(4)
+// ---------------------------------------------------------------------------
+
+kernel void rmsnorm_optimized(
+    device const float* input      [[buffer(0)]],   // [hidden_dim]
+    device const float* weight     [[buffer(1)]],   // [hidden_dim]
+    device float*       output     [[buffer(2)]],   // [hidden_dim]
+    constant uint&      hidden_dim [[buffer(3)]],
+    constant float&     eps        [[buffer(4)]],
+    uint tid [[thread_index_in_simdgroup]]
+) {
+    // Phase 1: Each thread computes partial sum-of-squares over stride
+    float partial_ss = 0.0f;
+    for (uint i = tid; i < hidden_dim; i += 32) {
+        float val = input[i];
+        partial_ss += val * val;
+    }
+
+    // Phase 2: simd_sum for cooperative reduction across 32 threads
+    float total_ss = simd_sum(partial_ss);
+
+    // Phase 3: Compute RMS (broadcast to all threads via simd_sum result)
+    float rms = sqrt(total_ss / float(hidden_dim) + eps);
+
+    // Phase 4: Each thread normalizes its stride
+    for (uint i = tid; i < hidden_dim; i += 32) {
+        output[i] = (input[i] / rms) * weight[i];
+    }
+}
