@@ -1,0 +1,8 @@
+[package]
+name = "metal-attention-traits"
+version.workspace = true
+edition.workspace = true
+description = "Core traits for composable attention mechanisms — pure Rust, zero Metal deps"
+
+[dependencies]
+# Pure Rust crate — no external dependencies

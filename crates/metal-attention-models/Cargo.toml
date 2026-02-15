@@ -1,0 +1,12 @@
+[package]
+name = "metal-attention-models"
+version.workspace = true
+edition.workspace = true
+description = "Model implementations — RWKV-7, Llama, Jamba, Griffin, Zamba"
+
+[dependencies]
+metal-attention-traits.workspace = true
+metal-attention-kernels.workspace = true
+metal-attention-gguf.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
