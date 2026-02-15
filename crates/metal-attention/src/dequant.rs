@@ -125,13 +125,9 @@ mod tests {
         let device = GpuDevice::new();
         let mut pso_cache = PsoCache::new(device.library.clone());
 
-        let result = dequantize_tensor(
-            &gguf,
-            "q4_test.weight",
-            Some(&device),
-            Some(&mut pso_cache),
-        )
-        .expect("dequant failed");
+        let result =
+            dequantize_tensor(&gguf, "q4_test.weight", Some(&device), Some(&mut pso_cache))
+                .expect("dequant failed");
 
         assert_eq!(result.len(), 32, "Q4_0 block should produce 32 elements");
         for (i, &val) in result.iter().enumerate() {
@@ -158,9 +154,7 @@ mod tests {
         let gguf = GgufFile::from_bytes(data).expect("parse failed");
         let result = dequantize_tensor(&gguf, "q4_test.weight", None, None);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("GPU device required for Q4_0"));
+        assert!(result.unwrap_err().contains("GPU device required for Q4_0"));
     }
 
     /// Test: unsupported quantization type returns error.
