@@ -5,3 +5,5 @@
 *.o
 *.d
 .DS_Store
+/models/
+KB_VALIDATION.md

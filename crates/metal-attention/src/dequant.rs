@@ -84,7 +84,7 @@ mod tests {
     #[test]
     fn test_dequantize_f32_passthrough() {
         // Create known f32 values and encode as bytes
-        let values: Vec<f32> = vec![1.0, -2.5, 3.14, 0.0, f32::MAX, f32::MIN_POSITIVE];
+        let values: Vec<f32> = vec![1.0, -2.5, 3.125, 0.0, f32::MAX, f32::MIN_POSITIVE];
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
 
         let data = GgufBuilder::new()
