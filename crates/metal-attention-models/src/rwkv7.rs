@@ -162,32 +162,55 @@ impl Rwkv7Block {
         // Apply sigmoid to decay (ensures values in (0, 1))
         let w: Vec<f32> = w_raw.iter().map(|&x| Self::sigmoid(x)).collect();
 
-        // 3. WKV operator (per-head, but simplified: single head spanning full dim)
-        // For simplicity in this POC, treat as single-head with head_dim = hidden_size
-        // if head_dim == hidden_size, otherwise process each head separately.
-        let (wkv_output, new_state) = if self.use_gpu && hd == hs {
-            // GPU path: single head
-            let gpu = GpuDevice::new();
-            let mut pso_cache = PsoCache::new(gpu.library.clone());
-            dispatch_rwkv_wkv(
-                &gpu,
-                &mut pso_cache,
-                &r,
-                &k,
-                &v,
-                &w,
-                &state.wkv_state,
-                1,
-                hd,
-            )
+        // 3. WKV operator
+        // If head_dim == hidden_size, single-head fast path.
+        // Otherwise, process each head separately with per-head state slices.
+        let wkv_output = if hd == hs {
+            // Single-head fast path
+            let (output, new_state) = if self.use_gpu {
+                let gpu = GpuDevice::new();
+                let mut pso_cache = PsoCache::new(gpu.library.clone());
+                dispatch_rwkv_wkv(
+                    &gpu,
+                    &mut pso_cache,
+                    &r,
+                    &k,
+                    &v,
+                    &w,
+                    &state.wkv_state,
+                    1,
+                    hd,
+                )
+            } else {
+                let mut wkv_state = state.wkv_state.clone();
+                let output = cpu_rwkv_wkv(&r, &k, &v, &w, &mut wkv_state, 1, hd);
+                (output, wkv_state)
+            };
+            state.wkv_state = new_state;
+            output
         } else {
-            // CPU path or multi-head
-            let mut wkv_state = state.wkv_state.clone();
-            let output = cpu_rwkv_wkv(&r, &k, &v, &w, &mut wkv_state, 1, hd);
-            (output, wkv_state)
-        };
+            // Multi-head: process each head separately
+            let mut output = Vec::with_capacity(hs);
+            for h in 0..self.num_heads {
+                let head_start = h * hd;
+                let head_end = head_start + hd;
+                let r_head = &r[head_start..head_end];
+                let k_head = &k[head_start..head_end];
+                let v_head = &v[head_start..head_end];
+                let w_head = &w[head_start..head_end];
 
-        state.wkv_state = new_state;
+                let state_start = h * hd * hd;
+                let state_end = state_start + hd * hd;
+                let mut head_state = state.wkv_state[state_start..state_end].to_vec();
+
+                let head_output =
+                    cpu_rwkv_wkv(r_head, k_head, v_head, w_head, &mut head_state, 1, hd);
+
+                output.extend_from_slice(&head_output);
+                state.wkv_state[state_start..state_end].copy_from_slice(&head_state);
+            }
+            output
+        };
 
         // 4. Output projection
         Self::matvec(&self.w_o, &wkv_output, hs, hs)
@@ -199,7 +222,7 @@ impl SequenceBlock for Rwkv7Block {
 
     fn init_state(&self, _config: &BlockConfig) -> Self::State {
         Rwkv7State {
-            wkv_state: vec![0.0f32; self.head_dim * self.head_dim],
+            wkv_state: vec![0.0f32; self.num_heads * self.head_dim * self.head_dim],
             prev_token: vec![0.0f32; self.hidden_size],
         }
     }
@@ -228,8 +251,9 @@ impl SequenceBlock for Rwkv7Block {
     }
 
     fn state_size_bytes(&self, _config: &BlockConfig) -> usize {
-        // WKV state + prev_token
-        (self.head_dim * self.head_dim + self.hidden_size) * std::mem::size_of::<f32>()
+        // WKV state (num_heads * head_dim * head_dim) + prev_token (hidden_size)
+        (self.num_heads * self.head_dim * self.head_dim + self.hidden_size)
+            * std::mem::size_of::<f32>()
     }
 }
 
