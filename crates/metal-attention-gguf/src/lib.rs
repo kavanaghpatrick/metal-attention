@@ -2,3 +2,18 @@
 //!
 //! Parses GGUF binary format, extracts metadata and tensor information,
 //! and detects model architectures (llama, rwkv, jamba, griffin).
+
+pub mod architectures;
+pub mod detect;
+pub mod metadata;
+pub mod parser;
+pub mod quantize;
+pub mod tensor;
+
+// Re-exports for convenience
+pub use architectures::{ModelArchitecture, WeightRole, map_tensor_name};
+pub use detect::detect_architecture;
+pub use metadata::{GgufMetadata, GgufMetadataValue};
+pub use parser::{GgufBuilder, GgufError, GgufFile};
+pub use quantize::GgufType;
+pub use tensor::GgufTensorInfo;
