@@ -5,12 +5,14 @@
 //! schedule-driven hybrid layer dispatch.
 
 pub mod config;
+pub mod dequant;
 pub mod inference;
 pub mod model;
 pub mod sampling;
 
 // Re-exports for convenience
 pub use config::InferenceConfig;
+pub use dequant::dequantize_tensor;
 pub use inference::{decode_step, generate, generate_streaming, prefill};
 pub use model::{HybridModel, LayerState, ModelLayer, ModelState};
 pub use sampling::{
