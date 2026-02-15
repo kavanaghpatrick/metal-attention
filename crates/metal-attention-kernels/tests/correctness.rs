@@ -445,19 +445,21 @@ fn cpu_matmul(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
 
 /// CPU reference for Q4_0 dequantization.
 fn cpu_dequantize_q4_0(input: &[u8], num_blocks: usize) -> Vec<f32> {
-    let mut output = Vec::with_capacity(num_blocks * 32);
+    let mut output = vec![0.0f32; num_blocks * 32];
     for block in 0..num_blocks {
         let block_offset = block * 18;
+        let out_offset = block * 32;
         // Read scale as f16 (stored as 2 little-endian bytes)
         let scale_bits = u16::from_le_bytes([input[block_offset], input[block_offset + 1]]);
         let scale = half::f16::from_bits(scale_bits).to_f32();
         let quants = &input[block_offset + 2..block_offset + 18];
+        // GGUF Q4_0 layout: low nibbles first [0..15], high nibbles second [16..31]
         for i in 0..16 {
             let byte_val = quants[i];
             let lo = ((byte_val & 0x0F) as i32 - 8) as f32 * scale;
             let hi = (((byte_val >> 4) & 0x0F) as i32 - 8) as f32 * scale;
-            output.push(lo);
-            output.push(hi);
+            output[out_offset + i] = lo;
+            output[out_offset + i + 16] = hi;
         }
     }
     output

@@ -12,8 +12,8 @@ use crate::metadata::{GgufMetadata, GgufMetadataValue, GgufMetadataValueType};
 use crate::quantize::GgufType;
 use crate::tensor::GgufTensorInfo;
 
-/// GGUF magic bytes: "GGUF" as little-endian u32 = 0x46475547
-const GGUF_MAGIC: u32 = 0x4647_5547;
+/// GGUF magic bytes: "GGUF" as little-endian u32 = 0x46554747
+const GGUF_MAGIC: u32 = 0x4655_4747;
 /// Default alignment for GGUF data section.
 const DEFAULT_ALIGNMENT: usize = 32;
 
@@ -22,7 +22,7 @@ const DEFAULT_ALIGNMENT: usize = 32;
 pub enum GgufError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Invalid GGUF magic: expected 0x46475547, got 0x{0:08X}")]
+    #[error("Invalid GGUF magic: expected 0x46554747, got 0x{0:08X}")]
     BadMagic(u32),
     #[error("Unsupported GGUF version: {0} (expected 2 or 3)")]
     UnsupportedVersion(u32),

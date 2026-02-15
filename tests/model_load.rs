@@ -184,7 +184,7 @@ fn test_invalid_magic_returns_error() {
 fn test_unsupported_version_returns_error() {
     let mut data = vec![0u8; 32];
     // GGUF magic
-    const GGUF_MAGIC: u32 = 0x4647_5547;
+    const GGUF_MAGIC: u32 = 0x4655_4747;
     data[0..4].copy_from_slice(&GGUF_MAGIC.to_le_bytes());
     // Invalid version
     data[4..8].copy_from_slice(&99u32.to_le_bytes());

@@ -39,8 +39,8 @@ kernel void dequantize_q4_0(
         float lo = float(int(byte_val & 0x0F) - 8) * scale;
         // High nibble
         float hi = float(int((byte_val >> 4) & 0x0F) - 8) * scale;
-        output[out_offset + i * 2] = lo;
-        output[out_offset + i * 2 + 1] = hi;
+        output[out_offset + i] = lo;
+        output[out_offset + i + 16] = hi;
     }
 }
 
