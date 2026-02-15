@@ -172,17 +172,21 @@ impl GgufTokenizer {
 
     /// Map a single GPT-2 BPE character back to the original byte value.
     fn bpe_char_to_byte(ch: char) -> u8 {
-        // GPT-2 byte_encoder maps:
-        //   '!' ..= '~'  (33..=126)  → identity
-        //   '¡' ..= '¬'  (161..=172) → 127..=138
-        //   '®' ..= 'ÿ'  (174..=255) → 139..=220
-        //   'Ā' ..= 'Ġ'+ (256..=288) → remaining bytes 0..=32 (control + space)
+        // GPT-2 byte_encoder maps bytes to Unicode code points:
+        //   Bytes 33..=126   → identity (printable ASCII)
+        //   Bytes 161..=172  → identity (Latin-1: ¡ through ¬)
+        //   Bytes 174..=255  → identity (Latin-1: ® through ÿ)
+        //   Bytes 0..=32     → 256..=288 (Ā..Ġ, control chars + space)
+        //   Bytes 127..=160  → 289..=322 (DEL + high control)
+        //   Byte  173        → 323 (soft hyphen)
         let c = ch as u32;
         match c {
             33..=126 => c as u8,
-            161..=172 => (c - 161 + 127) as u8,
-            174..=255 => (c - 174 + 139) as u8,
+            161..=172 => c as u8,
+            174..=255 => c as u8,
             256..=288 => (c - 256) as u8,
+            289..=322 => (c - 289 + 127) as u8,
+            323 => 173,
             _ => b'?',
         }
     }
