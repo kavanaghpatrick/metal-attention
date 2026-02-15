@@ -200,6 +200,8 @@ impl GpuForwardPass {
             PsoKey::simple("decode_attention"),
             PsoKey::simple("rope_apply"),
             PsoKey::simple("ffn_silu"),
+            PsoKey::simple("kv_cache_copy"),
+            PsoKey::simple("buffer_copy"),
         ];
         if weight_store.lm_head_is_f32() {
             pso_keys.push(PsoKey::simple("matvec_f32"));
@@ -840,6 +842,40 @@ impl GpuForwardPass {
         let total = self.intermediate_size;
         let grid = MTLSize {
             width: total,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode GPU-side buffer copy: src -> dst for `count` f32 elements.
+    /// Dispatch: grid=(count, 1, 1), threadgroup=(256, 1, 1).
+    fn encode_buffer_copy(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        src: &ProtocolObject<dyn MTLBuffer>,
+        dst: &ProtocolObject<dyn MTLBuffer>,
+        count: usize,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("buffer_copy"))
+            .expect("buffer_copy PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, src, 0, 0);
+        set_buffer(encoder, dst, 0, 1);
+
+        let count_u32 = count as u32;
+        set_bytes(encoder, &count_u32, 2);
+
+        let grid = MTLSize {
+            width: count,
             height: 1,
             depth: 1,
         };
