@@ -34,6 +34,7 @@ use objc2_metal::{
 /// # Panics
 /// Panics if input slice lengths don't match seq_len * head_dim, or if the
 /// Metal command buffer fails to execute.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_flash_attention(
     device: &GpuDevice,
     pso_cache: &mut PsoCache,
@@ -95,7 +96,7 @@ pub fn dispatch_flash_attention(
     // Dispatch threadgroups:
     // Grid: (ceil(seq_len/BLOCK_R), num_heads, 1)
     // Threadgroup size: 32 threads (one simdgroup)
-    let num_row_blocks = (seq_len as u64 + block_r as u64 - 1) / block_r as u64;
+    let num_row_blocks = (seq_len as u64).div_ceil(block_r as u64);
     let threadgroups_per_grid = MTLSize {
         width: num_row_blocks as usize,
         height: num_heads,

@@ -38,6 +38,7 @@ use objc2_metal::{
 ///
 /// # Panics
 /// Panics if seq_len is not divisible by chunk_size, or if input lengths don't match.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_linear_attention(
     device: &GpuDevice,
     pso_cache: &mut PsoCache,
@@ -52,7 +53,7 @@ pub fn dispatch_linear_attention(
     assert_eq!(k.len(), seq_len * head_dim, "K length mismatch");
     assert_eq!(v.len(), seq_len * head_dim, "V length mismatch");
     assert!(
-        seq_len % chunk_size == 0,
+        seq_len.is_multiple_of(chunk_size),
         "seq_len must be divisible by chunk_size"
     );
 
