@@ -142,7 +142,7 @@ impl GgufTokenizer {
 
     /// Decode token IDs back into text.
     pub fn decode(&self, tokens: &[u32]) -> String {
-        tokens
+        let raw: String = tokens
             .iter()
             .map(|&id| {
                 if (id as usize) < self.id_to_token.len() {
@@ -152,7 +152,39 @@ impl GgufTokenizer {
                 }
             })
             .collect::<Vec<_>>()
-            .join("")
+            .join("");
+        // Decode GPT-2 BPE byte markers: Ġ = space, Ċ = newline, etc.
+        Self::decode_bpe_bytes(&raw)
+    }
+
+    /// Decode GPT-2 BPE byte-level encoding back to UTF-8 text.
+    ///
+    /// GPT-2 BPE maps each byte to a printable Unicode character to avoid
+    /// whitespace/control issues in the vocabulary. This reverses that mapping.
+    fn decode_bpe_bytes(s: &str) -> String {
+        let mut out = Vec::new();
+        for ch in s.chars() {
+            let b = Self::bpe_char_to_byte(ch);
+            out.push(b);
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Map a single GPT-2 BPE character back to the original byte value.
+    fn bpe_char_to_byte(ch: char) -> u8 {
+        // GPT-2 byte_encoder maps:
+        //   '!' ..= '~'  (33..=126)  → identity
+        //   '¡' ..= '¬'  (161..=172) → 127..=138
+        //   '®' ..= 'ÿ'  (174..=255) → 139..=220
+        //   'Ā' ..= 'Ġ'+ (256..=288) → remaining bytes 0..=32 (control + space)
+        let c = ch as u32;
+        match c {
+            33..=126 => c as u8,
+            161..=172 => (c - 161 + 127) as u8,
+            174..=255 => (c - 174 + 139) as u8,
+            256..=288 => (c - 256) as u8,
+            _ => b'?',
+        }
     }
 
     /// Get the beginning-of-sequence token ID.
