@@ -163,6 +163,14 @@ impl PsoCache {
         &self.cache[key]
     }
 
+    /// Get a cached PSO by key without compiling.
+    ///
+    /// Returns None if the PSO is not in the cache. Use `get_or_compile`
+    /// or `prewarm` first to ensure the PSO is available.
+    pub fn get(&self, key: &PsoKey) -> Option<&ProtocolObject<dyn MTLComputePipelineState>> {
+        self.cache.get(key).map(|r| &**r)
+    }
+
     /// Number of cached PSOs.
     pub fn len(&self) -> usize {
         self.cache.len()
