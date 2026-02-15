@@ -243,9 +243,10 @@ impl GpuForwardPass {
     ///
     /// Returns logits [vocab_size] as `Result<Vec<f32>, String>`.
     ///
-    /// For POC, uses one command buffer per encoding block to allow CPU-side
-    /// KV cache append between attention projection and decode attention.
-    /// Within each command buffer, all kernel dispatches are inline-encoded.
+    /// Uses a single command buffer with one compute encoder for all layers.
+    /// GPU-side kv_cache_copy and buffer_copy kernels eliminate CPU sync points.
+    /// When `GPU_DEBUG` is set, falls back to the multi-command-buffer debug path
+    /// that allows per-layer readback.
     pub fn forward_token(&mut self, token_id: u32) -> Result<Vec<f32>, String> {
         let debug = std::env::var("GPU_DEBUG").is_ok();
 
@@ -264,15 +265,243 @@ impl GpuForwardPass {
             let h = unsafe { read_buffer_slice(&self.hidden_a, self.hidden_size) };
             let (has_nan, min, max) = buf_stats(&h);
             eprintln!("  [embed] hidden_a: nan={has_nan} min={min:.6} max={max:.6}");
+            return self.forward_token_debug(token_id);
         }
 
-        // 2. Per-layer forward
+        // Pre-look up kv_cache_copy PSO before the layer loop to avoid
+        // borrow conflicts between pso_cache and kv_caches.
+        let kv_copy_pso = self
+            .pso_cache
+            .get(&PsoKey::simple("kv_cache_copy"))
+            .expect("kv_cache_copy PSO not prewarmed");
+
+        // 2. Create single command buffer + encoder for all layers
+        let cmd_buf = self
+            .device
+            .command_queue
+            .commandBuffer()
+            .expect("Failed to create command buffer");
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("Failed to create compute encoder");
+
+        // 3. Per-layer forward (all encoded into the single encoder)
+        for layer_idx in 0..self.num_layers {
+            // --- Attention projections: rmsnorm + Q/K/V matvec + RoPE ---
+            let norms = self.weight_store.norm(layer_idx);
+            let attn = self.weight_store.attn_proj(layer_idx);
+
+            // RMSNorm: hidden_a -> hidden_b
+            self.encode_rmsnorm(
+                &encoder,
+                &self.hidden_a,
+                &norms.attn_norm,
+                &self.hidden_b,
+            );
+
+            // Q projection: hidden_b -> scratch_q
+            self.encode_matvec_q4_0(
+                &encoder,
+                &attn.q,
+                &self.hidden_b,
+                &self.scratch_q,
+                self.num_heads * self.head_dim,
+                self.hidden_size,
+            );
+
+            // K projection: hidden_b -> scratch_k
+            self.encode_matvec_q4_0(
+                &encoder,
+                &attn.k,
+                &self.hidden_b,
+                &self.scratch_k,
+                self.num_kv_heads * self.head_dim,
+                self.hidden_size,
+            );
+
+            // V projection: hidden_b -> scratch_v
+            self.encode_matvec_q4_0(
+                &encoder,
+                &attn.v,
+                &self.hidden_b,
+                &self.scratch_v,
+                self.num_kv_heads * self.head_dim,
+                self.hidden_size,
+            );
+
+            // RoPE on Q and K
+            self.encode_rope(&encoder, &self.scratch_q, self.num_heads);
+            self.encode_rope(&encoder, &self.scratch_k, self.num_kv_heads);
+
+            // --- GPU-side KV cache append ---
+            // Dispatches kv_cache_copy kernel, increments cache len on CPU.
+            // Field-level borrow: &mut self.kv_caches is disjoint from
+            // &self.scratch_k / &self.scratch_v.
+            self.kv_caches.cache_mut(layer_idx).encode_kv_append(
+                &encoder,
+                kv_copy_pso,
+                &self.scratch_k,
+                &self.scratch_v,
+            );
+
+            // --- Decode attention + O projection + residual ---
+            let kv_cache = self.kv_caches.cache(layer_idx);
+            let kv_len = kv_cache.current_len() as u32;
+
+            self.encode_decode_attention(
+                &encoder,
+                &self.scratch_q,
+                kv_cache.k_buffer(),
+                kv_cache.v_buffer(),
+                &self.scratch_attn_out,
+                kv_len,
+            );
+
+            // Re-fetch attn weights for O projection
+            let attn = self.weight_store.attn_proj(layer_idx);
+
+            // O projection: scratch_attn_out -> scratch_o
+            self.encode_matvec_q4_0(
+                &encoder,
+                &attn.o,
+                &self.scratch_attn_out,
+                &self.scratch_o,
+                self.hidden_size,
+                self.num_heads * self.head_dim,
+            );
+
+            // Residual add: hidden_a + scratch_o -> scratch_residual
+            self.encode_residual_add(
+                &encoder,
+                &self.hidden_a,
+                &self.scratch_o,
+                &self.scratch_residual,
+            );
+
+            // GPU-side copy: scratch_residual -> hidden_a
+            self.encode_buffer_copy(
+                &encoder,
+                &self.scratch_residual,
+                &self.hidden_a,
+                self.hidden_size,
+            );
+
+            // --- FFN block: rmsnorm + gate/up + SwiGLU + down + residual ---
+            let norms = self.weight_store.norm(layer_idx);
+            let ffn = self.weight_store.ffn(layer_idx);
+
+            // RMSNorm: hidden_a -> hidden_b
+            self.encode_rmsnorm(
+                &encoder,
+                &self.hidden_a,
+                &norms.ffn_norm,
+                &self.hidden_b,
+            );
+
+            // Gate projection: hidden_b -> scratch_gate
+            self.encode_matvec_q4_0(
+                &encoder,
+                &ffn.gate,
+                &self.hidden_b,
+                &self.scratch_gate,
+                self.intermediate_size,
+                self.hidden_size,
+            );
+
+            // Up projection: hidden_b -> scratch_up
+            self.encode_matvec_q4_0(
+                &encoder,
+                &ffn.up,
+                &self.hidden_b,
+                &self.scratch_up,
+                self.intermediate_size,
+                self.hidden_size,
+            );
+
+            // SwiGLU: silu(gate) * up -> scratch_silu
+            self.encode_ffn_silu(&encoder);
+
+            // Down projection: scratch_silu -> scratch_ffn
+            self.encode_matvec_q4_0(
+                &encoder,
+                &ffn.down,
+                &self.scratch_silu,
+                &self.scratch_ffn,
+                self.hidden_size,
+                self.intermediate_size,
+            );
+
+            // Residual add: hidden_a + scratch_ffn -> scratch_residual
+            self.encode_residual_add(
+                &encoder,
+                &self.hidden_a,
+                &self.scratch_ffn,
+                &self.scratch_residual,
+            );
+
+            // GPU-side copy: scratch_residual -> hidden_a
+            self.encode_buffer_copy(
+                &encoder,
+                &self.scratch_residual,
+                &self.hidden_a,
+                self.hidden_size,
+            );
+        }
+
+        // 4. Final norm + lm_head
+        self.encode_rmsnorm(
+            &encoder,
+            &self.hidden_a,
+            self.weight_store.final_norm(),
+            &self.hidden_b,
+        );
+
+        if self.weight_store.lm_head_is_f32() {
+            self.encode_matvec_f32(
+                &encoder,
+                self.weight_store.lm_head(),
+                &self.hidden_b,
+                &self.logits_buf,
+                self.vocab_size,
+                self.hidden_size,
+            );
+        } else {
+            self.encode_matvec_q4_0(
+                &encoder,
+                self.weight_store.lm_head(),
+                &self.hidden_b,
+                &self.logits_buf,
+                self.vocab_size,
+                self.hidden_size,
+            );
+        }
+
+        // 5. Single submit: endEncoding + commit + wait
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        validate_command_buffer(&cmd_buf, "forward_token", 0)?;
+
+        // 6. Read logits and increment position
+        let logits = unsafe { read_buffer_slice(&self.logits_buf, self.vocab_size) };
+        self.position += 1;
+        Ok(logits)
+    }
+
+    /// Debug forward pass: multi-command-buffer path with per-layer readback.
+    ///
+    /// Uses the original encode_attention_projections / encode_attention_output /
+    /// encode_ffn_block methods with commit+wait after each, allowing CPU-side
+    /// buffer readback for NaN/range diagnostics. Called when `GPU_DEBUG` is set.
+    ///
+    /// Assumes embed_lookup has already been called and debug embed log printed.
+    fn forward_token_debug(&mut self, _token_id: u32) -> Result<Vec<f32>, String> {
+        // Per-layer forward with debug readbacks
         for layer_idx in 0..self.num_layers {
             // --- Attention block ---
-            // Encode rmsnorm + Q/K/V projections + RoPE, commit+wait
             self.encode_attention_projections(layer_idx)?;
 
-            if debug && layer_idx < 2 {
+            if layer_idx < 2 {
                 let q = unsafe { read_buffer_slice(&self.scratch_q, self.num_heads * self.head_dim) };
                 let k = unsafe { read_buffer_slice(&self.scratch_k, self.num_kv_heads * self.head_dim) };
                 let (qn, qmin, qmax) = buf_stats(&q);
@@ -288,7 +517,7 @@ impl GpuForwardPass {
             // Decode attention + O projection + residual add
             self.encode_attention_output(layer_idx)?;
 
-            if debug && layer_idx < 2 {
+            if layer_idx < 2 {
                 let h = unsafe { read_buffer_slice(&self.hidden_a, self.hidden_size) };
                 let (hn, hmin, hmax) = buf_stats(&h);
                 eprintln!("  [L{layer_idx} attn_out] hidden_a: nan={hn} min={hmin:.4} max={hmax:.4}");
@@ -297,23 +526,21 @@ impl GpuForwardPass {
             // --- FFN block ---
             self.encode_ffn_block(layer_idx)?;
 
-            if debug && layer_idx < 2 {
+            if layer_idx < 2 {
                 let h = unsafe { read_buffer_slice(&self.hidden_a, self.hidden_size) };
                 let (hn, hmin, hmax) = buf_stats(&h);
                 eprintln!("  [L{layer_idx} ffn] hidden_a: nan={hn} min={hmin:.4} max={hmax:.4}");
             }
         }
 
-        // 3. Final norm + lm_head
+        // Final norm + lm_head
         self.encode_final_logits()?;
 
-        // 4. Read back logits and increment position
+        // Read back logits and increment position
         let logits = unsafe { read_buffer_slice(&self.logits_buf, self.vocab_size) };
 
-        if debug {
-            let (ln, lmin, lmax) = buf_stats(&logits);
-            eprintln!("  [logits] nan={ln} min={lmin:.4} max={lmax:.4}");
-        }
+        let (ln, lmin, lmax) = buf_stats(&logits);
+        eprintln!("  [logits] nan={ln} min={lmin:.4} max={lmax:.4}");
 
         self.position += 1;
         Ok(logits)
