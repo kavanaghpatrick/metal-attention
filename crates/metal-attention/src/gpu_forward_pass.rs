@@ -235,9 +235,10 @@ impl GpuForwardPass {
         // Build PSO cache and prewarm all kernels
         let mut pso_cache = PsoCache::new(device.library.clone());
         let mut pso_keys = vec![
-            PsoKey::simple("matvec_q4_0"),
+            PsoKey::simple("matvec_q4_0_v5_coalesced"),
             PsoKey::simple("rmsnorm_optimized"),
             PsoKey::simple("residual_add"),
+            PsoKey::simple("residual_add_inplace"),
             PsoKey::simple("decode_attention"),
             PsoKey::simple("rope_apply"),
             PsoKey::simple("ffn_silu"),
@@ -248,7 +249,7 @@ impl GpuForwardPass {
             PsoKey::simple("rmsnorm_matvec_q4_0"),
         ];
         if weight_store.lm_head_is_f32() {
-            pso_keys.push(PsoKey::simple("matvec_f32"));
+            pso_keys.push(PsoKey::simple("matvec_f32_v2"));
             pso_keys.push(PsoKey::simple("rmsnorm_matvec_f32"));
         }
         pso_cache.prewarm(&pso_keys);
@@ -335,39 +336,38 @@ impl GpuForwardPass {
 
         // 3. Per-layer forward (all encoded into the single encoder)
         for layer_idx in 0..self.num_layers {
-            // --- Attention projections: fused rmsnorm+matvec Q/K/V + RoPE ---
+            // --- Attention projections: rmsnorm -> Q/K/V matvec + RoPE ---
             let norms = self.weight_store.norm(layer_idx);
             let attn = self.weight_store.attn_proj(layer_idx);
 
-            // Fused RMSNorm + Q projection: hidden_a -> scratch_q
-            // (recomputes RMS per output row, eliminates hidden_b intermediate)
-            self.encode_fused_rmsnorm_matvec_q4_0(
+            // RMSNorm: hidden_a -> hidden_b (compute once, reuse for Q/K/V)
+            self.encode_rmsnorm(&encoder, &self.hidden_a, &norms.attn_norm, &self.hidden_b);
+
+            // Q projection: hidden_b -> scratch_q
+            self.encode_matvec_q4_0(
                 &encoder,
-                &self.hidden_a,
-                &norms.attn_norm,
                 &attn.q,
+                &self.hidden_b,
                 &self.scratch_q,
                 self.num_heads * self.head_dim,
                 self.hidden_size,
             );
 
-            // Fused RMSNorm + K projection: hidden_a -> scratch_k
-            self.encode_fused_rmsnorm_matvec_q4_0(
+            // K projection: hidden_b -> scratch_k
+            self.encode_matvec_q4_0(
                 &encoder,
-                &self.hidden_a,
-                &norms.attn_norm,
                 &attn.k,
+                &self.hidden_b,
                 &self.scratch_k,
                 self.num_kv_heads * self.head_dim,
                 self.hidden_size,
             );
 
-            // Fused RMSNorm + V projection: hidden_a -> scratch_v
-            self.encode_fused_rmsnorm_matvec_q4_0(
+            // V projection: hidden_b -> scratch_v
+            self.encode_matvec_q4_0(
                 &encoder,
-                &self.hidden_a,
-                &norms.attn_norm,
                 &attn.v,
+                &self.hidden_b,
                 &self.scratch_v,
                 self.num_kv_heads * self.head_dim,
                 self.hidden_size,
@@ -414,43 +414,35 @@ impl GpuForwardPass {
                 self.num_heads * self.head_dim,
             );
 
-            // Residual add: hidden_a + scratch_o -> scratch_residual
-            self.encode_residual_add(
+            // In-place residual add: hidden_a += scratch_o
+            self.encode_residual_add_inplace(
                 &encoder,
                 &self.hidden_a,
                 &self.scratch_o,
-                &self.scratch_residual,
             );
 
-            // GPU-side copy: scratch_residual -> hidden_a
-            self.encode_buffer_copy(
-                &encoder,
-                &self.scratch_residual,
-                &self.hidden_a,
-                self.hidden_size,
-            );
-
-            // --- FFN block: fused rmsnorm+gate/up + SwiGLU + down + residual ---
+            // --- FFN block: rmsnorm -> gate/up matvec + SwiGLU + down + residual ---
             let norms = self.weight_store.norm(layer_idx);
             let ffn = self.weight_store.ffn(layer_idx);
 
-            // Fused RMSNorm + Gate projection: hidden_a -> scratch_gate
-            self.encode_fused_rmsnorm_matvec_q4_0(
+            // RMSNorm: hidden_a -> hidden_b (compute once, reuse for gate/up)
+            self.encode_rmsnorm(&encoder, &self.hidden_a, &norms.ffn_norm, &self.hidden_b);
+
+            // Gate projection: hidden_b -> scratch_gate
+            self.encode_matvec_q4_0(
                 &encoder,
-                &self.hidden_a,
-                &norms.ffn_norm,
                 &ffn.gate,
+                &self.hidden_b,
                 &self.scratch_gate,
                 self.intermediate_size,
                 self.hidden_size,
             );
 
-            // Fused RMSNorm + Up projection: hidden_a -> scratch_up
-            self.encode_fused_rmsnorm_matvec_q4_0(
+            // Up projection: hidden_b -> scratch_up
+            self.encode_matvec_q4_0(
                 &encoder,
-                &self.hidden_a,
-                &norms.ffn_norm,
                 &ffn.up,
+                &self.hidden_b,
                 &self.scratch_up,
                 self.intermediate_size,
                 self.hidden_size,
@@ -459,7 +451,7 @@ impl GpuForwardPass {
             // SwiGLU: silu(gate) * up -> scratch_silu
             self.encode_ffn_silu(&encoder);
 
-            // Down projection: scratch_silu -> scratch_ffn (NOT fused -- no rmsnorm precedes)
+            // Down projection: scratch_silu -> scratch_ffn
             self.encode_matvec_q4_0(
                 &encoder,
                 &ffn.down,
@@ -469,20 +461,11 @@ impl GpuForwardPass {
                 self.intermediate_size,
             );
 
-            // Residual add: hidden_a + scratch_ffn -> scratch_residual
-            self.encode_residual_add(
+            // In-place residual add: hidden_a += scratch_ffn
+            self.encode_residual_add_inplace(
                 &encoder,
                 &self.hidden_a,
                 &self.scratch_ffn,
-                &self.scratch_residual,
-            );
-
-            // GPU-side copy: scratch_residual -> hidden_a
-            self.encode_buffer_copy(
-                &encoder,
-                &self.scratch_residual,
-                &self.hidden_a,
-                self.hidden_size,
             );
         }
 
@@ -873,8 +856,9 @@ impl GpuForwardPass {
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 
-    /// Encode fused Q4_0 dequant + matvec: weight * input -> output.
-    /// Dispatch: grid=(out_dim) threadgroups, threadgroup=(32).
+    /// Encode v5 coalesced Q4_0 dequant + matvec: weight * input -> output.
+    /// Uses multi-row dispatch: 8 rows per threadgroup, 256 threads (8 simdgroups).
+    /// Dispatch: grid=(ceil(out_dim/8)) threadgroups, threadgroup=(256).
     fn encode_matvec_q4_0(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -886,8 +870,8 @@ impl GpuForwardPass {
     ) {
         let pso = self
             .pso_cache
-            .get(&PsoKey::simple("matvec_q4_0"))
-            .expect("matvec_q4_0 PSO not prewarmed");
+            .get(&PsoKey::simple("matvec_q4_0_v5_coalesced"))
+            .expect("matvec_q4_0_v5_coalesced PSO not prewarmed");
 
         encoder.setComputePipelineState(pso);
         set_buffer(encoder, weight_buf, 0, 0);
@@ -899,22 +883,23 @@ impl GpuForwardPass {
         set_bytes(encoder, &out_dim_u32, 3);
         set_bytes(encoder, &in_dim_u32, 4);
 
+        const ROWS_PER_TG: usize = 8;
         let grid = MTLSize {
-            width: out_dim,
+            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
             height: 1,
             depth: 1,
         };
         let tg = MTLSize {
-            width: 32,
+            width: 256,
             height: 1,
             depth: 1,
         };
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 
-    /// Encode F32 matvec: weight * input -> output.
-    /// Same dispatch pattern as Q4_0 but for dense F32 weights.
-    /// Dispatch: grid=(out_dim) threadgroups, threadgroup=(32).
+    /// Encode v2 multi-row F32 matvec: weight * input -> output.
+    /// Uses 8 rows per threadgroup, 256 threads (8 simdgroups), float4 vectorized reads.
+    /// Dispatch: grid=(ceil(out_dim/8)) threadgroups, threadgroup=(256).
     fn encode_matvec_f32(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -926,8 +911,8 @@ impl GpuForwardPass {
     ) {
         let pso = self
             .pso_cache
-            .get(&PsoKey::simple("matvec_f32"))
-            .expect("matvec_f32 PSO not prewarmed");
+            .get(&PsoKey::simple("matvec_f32_v2"))
+            .expect("matvec_f32_v2 PSO not prewarmed");
 
         encoder.setComputePipelineState(pso);
         set_buffer(encoder, weight_buf, 0, 0);
@@ -939,13 +924,14 @@ impl GpuForwardPass {
         set_bytes(encoder, &out_dim_u32, 3);
         set_bytes(encoder, &in_dim_u32, 4);
 
+        const ROWS_PER_TG: usize = 8;
         let grid = MTLSize {
-            width: out_dim,
+            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
             height: 1,
             depth: 1,
         };
         let tg = MTLSize {
-            width: 32,
+            width: 256,
             height: 1,
             depth: 1,
         };
@@ -1168,6 +1154,40 @@ impl GpuForwardPass {
         encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
     }
 
+    /// Encode in-place residual addition: a[i] += b[i].
+    /// Eliminates the separate output buffer + buffer_copy dispatch.
+    /// Dispatch: grid=(dim), threadgroup=(256).
+    fn encode_residual_add_inplace(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        a_buf: &ProtocolObject<dyn MTLBuffer>,
+        b_buf: &ProtocolObject<dyn MTLBuffer>,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("residual_add_inplace"))
+            .expect("residual_add_inplace PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, a_buf, 0, 0);
+        set_buffer(encoder, b_buf, 0, 1);
+
+        let dim_u32 = self.hidden_size as u32;
+        set_bytes(encoder, &dim_u32, 2);
+
+        let grid = MTLSize {
+            width: self.hidden_size,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
+    }
+
     /// Encode SwiGLU activation: silu(scratch_gate) * scratch_up -> scratch_silu.
     /// Uses LayerParams struct at buffer(4) for ffn_silu kernel.
     /// Dispatch: grid=(intermediate_size), threadgroup=(256).
@@ -1339,38 +1359,38 @@ impl GpuForwardPass {
 
         // 3. Per-layer forward (all encoded into the single encoder)
         for layer_idx in 0..self.num_layers {
-            // --- Attention: fused rmsnorm+matvec Q/K/V + RoPE ---
+            // --- Attention: rmsnorm -> Q/K/V matvec + RoPE ---
             let norms = self.weight_store.norm(layer_idx);
             let attn = self.weight_store.attn_proj(layer_idx);
 
-            // Fused RMSNorm + Q projection: hidden_a -> scratch_q
-            self.encode_fused_rmsnorm_matvec_q4_0(
+            // RMSNorm: hidden_a -> hidden_b (compute once, reuse for Q/K/V)
+            self.encode_rmsnorm(&encoder, &self.hidden_a, &norms.attn_norm, &self.hidden_b);
+
+            // Q projection: hidden_b -> scratch_q
+            self.encode_matvec_q4_0(
                 &encoder,
-                &self.hidden_a,
-                &norms.attn_norm,
                 &attn.q,
+                &self.hidden_b,
                 &self.scratch_q,
                 self.num_heads * self.head_dim,
                 self.hidden_size,
             );
 
-            // Fused RMSNorm + K projection: hidden_a -> scratch_k
-            self.encode_fused_rmsnorm_matvec_q4_0(
+            // K projection: hidden_b -> scratch_k
+            self.encode_matvec_q4_0(
                 &encoder,
-                &self.hidden_a,
-                &norms.attn_norm,
                 &attn.k,
+                &self.hidden_b,
                 &self.scratch_k,
                 self.num_kv_heads * self.head_dim,
                 self.hidden_size,
             );
 
-            // Fused RMSNorm + V projection: hidden_a -> scratch_v
-            self.encode_fused_rmsnorm_matvec_q4_0(
+            // V projection: hidden_b -> scratch_v
+            self.encode_matvec_q4_0(
                 &encoder,
-                &self.hidden_a,
-                &norms.attn_norm,
                 &attn.v,
+                &self.hidden_b,
                 &self.scratch_v,
                 self.num_kv_heads * self.head_dim,
                 self.hidden_size,
@@ -1398,7 +1418,7 @@ impl GpuForwardPass {
                 kv_len,
             );
 
-            // O projection: NOT fused (reads from scratch_attn_out, no rmsnorm precedes)
+            // O projection: scratch_attn_out -> scratch_o
             let attn = self.weight_store.attn_proj(layer_idx);
 
             self.encode_matvec_q4_0(
@@ -1410,41 +1430,35 @@ impl GpuForwardPass {
                 self.num_heads * self.head_dim,
             );
 
-            self.encode_residual_add(
+            // In-place residual add: hidden_a += scratch_o
+            self.encode_residual_add_inplace(
                 &encoder,
                 &self.hidden_a,
                 &self.scratch_o,
-                &self.scratch_residual,
             );
 
-            self.encode_buffer_copy(
-                &encoder,
-                &self.scratch_residual,
-                &self.hidden_a,
-                self.hidden_size,
-            );
-
-            // --- FFN: fused rmsnorm+gate/up + SwiGLU + down + residual ---
+            // --- FFN: rmsnorm -> gate/up matvec + SwiGLU + down + residual ---
             let norms = self.weight_store.norm(layer_idx);
             let ffn = self.weight_store.ffn(layer_idx);
 
-            // Fused RMSNorm + Gate projection: hidden_a -> scratch_gate
-            self.encode_fused_rmsnorm_matvec_q4_0(
+            // RMSNorm: hidden_a -> hidden_b (compute once, reuse for gate/up)
+            self.encode_rmsnorm(&encoder, &self.hidden_a, &norms.ffn_norm, &self.hidden_b);
+
+            // Gate projection: hidden_b -> scratch_gate
+            self.encode_matvec_q4_0(
                 &encoder,
-                &self.hidden_a,
-                &norms.ffn_norm,
                 &ffn.gate,
+                &self.hidden_b,
                 &self.scratch_gate,
                 self.intermediate_size,
                 self.hidden_size,
             );
 
-            // Fused RMSNorm + Up projection: hidden_a -> scratch_up
-            self.encode_fused_rmsnorm_matvec_q4_0(
+            // Up projection: hidden_b -> scratch_up
+            self.encode_matvec_q4_0(
                 &encoder,
-                &self.hidden_a,
-                &norms.ffn_norm,
                 &ffn.up,
+                &self.hidden_b,
                 &self.scratch_up,
                 self.intermediate_size,
                 self.hidden_size,
@@ -1452,7 +1466,7 @@ impl GpuForwardPass {
 
             self.encode_ffn_silu(&encoder);
 
-            // Down projection: NOT fused (reads from scratch_silu, no rmsnorm precedes)
+            // Down projection: scratch_silu -> scratch_ffn
             self.encode_matvec_q4_0(
                 &encoder,
                 &ffn.down,
@@ -1462,18 +1476,11 @@ impl GpuForwardPass {
                 self.intermediate_size,
             );
 
-            self.encode_residual_add(
+            // In-place residual add: hidden_a += scratch_ffn
+            self.encode_residual_add_inplace(
                 &encoder,
                 &self.hidden_a,
                 &self.scratch_ffn,
-                &self.scratch_residual,
-            );
-
-            self.encode_buffer_copy(
-                &encoder,
-                &self.scratch_residual,
-                &self.hidden_a,
-                self.hidden_size,
             );
         }
 

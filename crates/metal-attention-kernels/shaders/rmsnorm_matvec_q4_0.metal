@@ -76,19 +76,27 @@ kernel void rmsnorm_matvec_q4_0(
         const float scale = float(block.d);
         const uint base = b * 32;
 
-        // Process 16 bytes -> 32 dequantized values
-        for (uint i = 0; i < 16; i++) {
-            uchar byte_val = block.qs[i];
+        // Vectorized float4 dot products (4 bytes / 8 values per iteration)
+        for (uint i = 0; i < 16; i += 4) {
+            float4 norm_lo = float4(input[base + i]     * inv_rms * norm_weight[base + i],
+                                    input[base + i + 1] * inv_rms * norm_weight[base + i + 1],
+                                    input[base + i + 2] * inv_rms * norm_weight[base + i + 2],
+                                    input[base + i + 3] * inv_rms * norm_weight[base + i + 3]);
+            float4 norm_hi = float4(input[base + i + 16] * inv_rms * norm_weight[base + i + 16],
+                                    input[base + i + 17] * inv_rms * norm_weight[base + i + 17],
+                                    input[base + i + 18] * inv_rms * norm_weight[base + i + 18],
+                                    input[base + i + 19] * inv_rms * norm_weight[base + i + 19]);
 
-            // Low nibble -> elements [0..15]
-            float dq_lo = float(int(byte_val & 0x0F) - 8) * scale;
-            float norm_lo = input[base + i] * inv_rms * norm_weight[base + i];
-            sum += dq_lo * norm_lo;
+            float4 lo_vals = float4(int(block.qs[i]   & 0x0F) - 8,
+                                    int(block.qs[i+1] & 0x0F) - 8,
+                                    int(block.qs[i+2] & 0x0F) - 8,
+                                    int(block.qs[i+3] & 0x0F) - 8) * scale;
+            float4 hi_vals = float4(int(block.qs[i]   >> 4) - 8,
+                                    int(block.qs[i+1] >> 4) - 8,
+                                    int(block.qs[i+2] >> 4) - 8,
+                                    int(block.qs[i+3] >> 4) - 8) * scale;
 
-            // High nibble -> elements [16..31]
-            float dq_hi = float(int((byte_val >> 4) & 0x0F) - 8) * scale;
-            float norm_hi = input[base + i + 16] * inv_rms * norm_weight[base + i + 16];
-            sum += dq_hi * norm_hi;
+            sum += dot(lo_vals, norm_lo) + dot(hi_vals, norm_hi);
         }
     }
 
