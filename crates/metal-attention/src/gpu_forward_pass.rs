@@ -21,7 +21,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLDevice, MTLGPUFamily, MTLSize,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLGPUFamily, MTLSize,
 };
 
 use metal_attention_gguf::GgufFile;
@@ -33,6 +33,21 @@ use metal_attention_kernels::types::LayerParams;
 
 use crate::gpu_kv_cache::GpuKVCacheSet;
 use crate::gpu_weight_store::GpuWeightStore;
+
+/// Cached batch buffers for `forward_prompt()` to avoid per-call allocation.
+struct BatchBuffers {
+    hidden_a: Retained<ProtocolObject<dyn MTLBuffer>>,
+    hidden_b: Retained<ProtocolObject<dyn MTLBuffer>>,
+    q: Retained<ProtocolObject<dyn MTLBuffer>>,
+    k: Retained<ProtocolObject<dyn MTLBuffer>>,
+    v: Retained<ProtocolObject<dyn MTLBuffer>>,
+    attn_out: Retained<ProtocolObject<dyn MTLBuffer>>,
+    gate: Retained<ProtocolObject<dyn MTLBuffer>>,
+    up: Retained<ProtocolObject<dyn MTLBuffer>>,
+    silu: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Maximum batch size these buffers can accommodate.
+    max_batch_size: usize,
+}
 
 /// Full-GPU forward pass pipeline for autoregressive decode.
 ///
@@ -92,6 +107,9 @@ pub struct GpuForwardPass {
 
     /// Current decode position (incremented after each forward_token call).
     position: usize,
+
+    /// Cached batch buffers for forward_prompt (reused across calls).
+    batch_bufs: Option<BatchBuffers>,
 }
 
 impl GpuForwardPass {
@@ -313,6 +331,7 @@ impl GpuForwardPass {
             rope_theta,
             rms_norm_eps,
             position: 0,
+            batch_bufs: None,
         })
     }
 
@@ -547,27 +566,36 @@ impl GpuForwardPass {
         let ffn_dim = self.intermediate_size;
         let f32_sz = std::mem::size_of::<f32>();
 
-        // Allocate batch buffers
-        // batch_hidden_a is Shared (CPU writes embeddings into it)
-        let batch_hidden_a = alloc_buffer(&self.device.device, batch_size * h * f32_sz);
-        let batch_hidden_b = alloc_buffer_private(&self.device.device, batch_size * h * f32_sz);
-        let batch_q = alloc_buffer_private(&self.device.device, batch_size * q_dim * f32_sz);
-        let batch_k = alloc_buffer_private(&self.device.device, batch_size * kv_dim * f32_sz);
-        let batch_v = alloc_buffer_private(&self.device.device, batch_size * kv_dim * f32_sz);
-        let batch_attn_out =
-            alloc_buffer_private(&self.device.device, batch_size * q_dim * f32_sz);
-        let batch_gate = alloc_buffer_private(&self.device.device, batch_size * ffn_dim * f32_sz);
-        let batch_up = alloc_buffer_private(&self.device.device, batch_size * ffn_dim * f32_sz);
-        let batch_silu = alloc_buffer_private(&self.device.device, batch_size * ffn_dim * f32_sz);
+        // Allocate or reuse batch buffers
+        let need_alloc = match &self.batch_bufs {
+            Some(bufs) => bufs.max_batch_size < batch_size,
+            None => true,
+        };
+        if need_alloc {
+            // hidden_a is Shared (CPU writes embeddings into it), rest are Private
+            self.batch_bufs = Some(BatchBuffers {
+                hidden_a: alloc_buffer(&self.device.device, batch_size * h * f32_sz),
+                hidden_b: alloc_buffer_private(&self.device.device, batch_size * h * f32_sz),
+                q: alloc_buffer_private(&self.device.device, batch_size * q_dim * f32_sz),
+                k: alloc_buffer_private(&self.device.device, batch_size * kv_dim * f32_sz),
+                v: alloc_buffer_private(&self.device.device, batch_size * kv_dim * f32_sz),
+                attn_out: alloc_buffer_private(&self.device.device, batch_size * q_dim * f32_sz),
+                gate: alloc_buffer_private(&self.device.device, batch_size * ffn_dim * f32_sz),
+                up: alloc_buffer_private(&self.device.device, batch_size * ffn_dim * f32_sz),
+                silu: alloc_buffer_private(&self.device.device, batch_size * ffn_dim * f32_sz),
+                max_batch_size: batch_size,
+            });
+        }
+        let bb = self.batch_bufs.as_ref().unwrap();
 
-        // CPU embedding lookup into batch_hidden_a
+        // CPU embedding lookup into bb.hidden_a
         let embed_buf = self.weight_store.embed();
         for (tok, &tid) in token_ids.iter().enumerate() {
             let embed_offset = (tid as usize) * h * f32_sz;
             let dst_offset = tok * h * f32_sz;
             unsafe {
                 let src = (embed_buf.contents().as_ptr() as *const u8).add(embed_offset);
-                let dst = (batch_hidden_a.contents().as_ptr() as *mut u8).add(dst_offset);
+                let dst = (bb.hidden_a.contents().as_ptr() as *mut u8).add(dst_offset);
                 std::ptr::copy_nonoverlapping(src, dst, h * f32_sz);
             }
         }
@@ -631,24 +659,23 @@ impl GpuForwardPass {
             let norms = self.weight_store.norm(layer_idx);
             let attn = self.weight_store.attn_proj(layer_idx);
 
-            // ---- Per-token attn RMSNorm: batch_hidden_a[tok] -> batch_hidden_b[tok] ----
-            for tok in 0..batch_size {
-                let offset = tok * h * f32_sz;
-                encoder.setComputePipelineState(rmsnorm_pso);
-                set_buffer(&encoder, &batch_hidden_a, offset, 0);
-                set_buffer(&encoder, &norms.attn_norm, 0, 1);
-                set_buffer(&encoder, &batch_hidden_b, offset, 2);
-                set_bytes(&encoder, &hidden_dim_u32, 3);
-                set_bytes(&encoder, &self.rms_norm_eps, 4);
-                encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_1, tg_32);
-            }
+            // ---- Per-token attn RMSNorm: bb.hidden_a[tok] -> bb.hidden_b[tok] ----
+            self.encode_rmsnorm_batched(
+                &encoder,
+                &bb.hidden_a,
+                &norms.attn_norm,
+                &bb.hidden_b,
+                h,
+                batch_size,
+                rmsnorm_pso,
+            );
 
             // ---- Batched QKV matvec (weight cache reuse) ----
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
                 &attn.q,
-                &batch_hidden_b,
-                &batch_q,
+                &bb.hidden_b,
+                &bb.q,
                 q_dim,
                 h,
                 batch_size,
@@ -656,8 +683,8 @@ impl GpuForwardPass {
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
                 &attn.k,
-                &batch_hidden_b,
-                &batch_k,
+                &bb.hidden_b,
+                &bb.k,
                 kv_dim,
                 h,
                 batch_size,
@@ -665,8 +692,8 @@ impl GpuForwardPass {
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
                 &attn.v,
-                &batch_hidden_b,
-                &batch_v,
+                &bb.hidden_b,
+                &bb.v,
                 kv_dim,
                 h,
                 batch_size,
@@ -680,7 +707,7 @@ impl GpuForwardPass {
 
                 // RoPE on Q
                 encoder.setComputePipelineState(rope_pso);
-                set_buffer(&encoder, &batch_q, tok * q_dim * f32_sz, 0);
+                set_buffer(&encoder, &bb.q, tok * q_dim * f32_sz, 0);
                 set_bytes(&encoder, &num_heads_u32, 1);
                 set_bytes(&encoder, &head_dim_u32, 2);
                 set_bytes(&encoder, &pos, 3);
@@ -696,7 +723,7 @@ impl GpuForwardPass {
 
                 // RoPE on K
                 encoder.setComputePipelineState(rope_pso);
-                set_buffer(&encoder, &batch_k, tok * kv_dim * f32_sz, 0);
+                set_buffer(&encoder, &bb.k, tok * kv_dim * f32_sz, 0);
                 set_bytes(&encoder, &num_kv_heads_u32, 1);
                 set_bytes(&encoder, &head_dim_u32, 2);
                 set_bytes(&encoder, &pos, 3);
@@ -721,8 +748,8 @@ impl GpuForwardPass {
                 self.kv_caches.cache_mut(layer_idx).encode_kv_append_offset(
                     &encoder,
                     kv_copy_pso,
-                    &batch_k,
-                    &batch_v,
+                    &bb.k,
+                    &bb.v,
                     kv_offset,
                 );
 
@@ -731,10 +758,10 @@ impl GpuForwardPass {
 
                 // Decode attention: Q[tok] + KV cache -> attn_out[tok]
                 encoder.setComputePipelineState(attn_pso);
-                set_buffer(&encoder, &batch_q, q_offset, 0);
+                set_buffer(&encoder, &bb.q, q_offset, 0);
                 set_buffer(&encoder, kv_cache.k_buffer(), 0, 1);
                 set_buffer(&encoder, kv_cache.v_buffer(), 0, 2);
-                set_buffer(&encoder, &batch_attn_out, attn_offset, 3);
+                set_buffer(&encoder, &bb.attn_out, attn_offset, 3);
                 set_bytes(&encoder, &num_heads_u32, 4);
                 set_bytes(&encoder, &num_kv_heads_u32, 5);
                 set_bytes(&encoder, &head_dim_u32, 6);
@@ -755,33 +782,32 @@ impl GpuForwardPass {
             self.encode_multi_token_matvec_q4_0_accumulate(
                 &encoder,
                 &attn.o,
-                &batch_attn_out,
-                &batch_hidden_a,
+                &bb.attn_out,
+                &bb.hidden_a,
                 h,
                 q_dim,
                 batch_size,
             );
 
-            // ---- Per-token FFN RMSNorm: batch_hidden_a[tok] -> batch_hidden_b[tok] ----
+            // ---- Per-token FFN RMSNorm: bb.hidden_a[tok] -> bb.hidden_b[tok] ----
             let norms = self.weight_store.norm(layer_idx);
             let ffn = self.weight_store.ffn(layer_idx);
-            for tok in 0..batch_size {
-                let offset = tok * h * f32_sz;
-                encoder.setComputePipelineState(rmsnorm_pso);
-                set_buffer(&encoder, &batch_hidden_a, offset, 0);
-                set_buffer(&encoder, &norms.ffn_norm, 0, 1);
-                set_buffer(&encoder, &batch_hidden_b, offset, 2);
-                set_bytes(&encoder, &hidden_dim_u32, 3);
-                set_bytes(&encoder, &self.rms_norm_eps, 4);
-                encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_1, tg_32);
-            }
+            self.encode_rmsnorm_batched(
+                &encoder,
+                &bb.hidden_a,
+                &norms.ffn_norm,
+                &bb.hidden_b,
+                h,
+                batch_size,
+                rmsnorm_pso,
+            );
 
             // ---- Batched gate/up matvec ----
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
                 &ffn.gate,
-                &batch_hidden_b,
-                &batch_gate,
+                &bb.hidden_b,
+                &bb.gate,
                 ffn_dim,
                 h,
                 batch_size,
@@ -789,43 +815,30 @@ impl GpuForwardPass {
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
                 &ffn.up,
-                &batch_hidden_b,
-                &batch_up,
+                &bb.hidden_b,
+                &bb.up,
                 ffn_dim,
                 h,
                 batch_size,
             );
 
             // ---- Per-token SiLU: silu(gate[tok]) * up[tok] -> silu[tok] ----
-            let params = LayerParams {
-                intermediate_dim: ffn_dim as u32,
-                seq_len: 1,
-                ..Default::default()
-            };
-            for tok in 0..batch_size {
-                let ffn_offset = tok * ffn_dim * f32_sz;
-                encoder.setComputePipelineState(silu_pso);
-                set_buffer(&encoder, &self.hidden_b, 0, 0); // dummy, unused by kernel
-                set_buffer(&encoder, &batch_gate, ffn_offset, 1);
-                set_buffer(&encoder, &batch_up, ffn_offset, 2);
-                set_buffer(&encoder, &batch_silu, ffn_offset, 3);
-                set_bytes(&encoder, &params, 4);
-                encoder.dispatchThreads_threadsPerThreadgroup(
-                    MTLSize {
-                        width: ffn_dim,
-                        height: 1,
-                        depth: 1,
-                    },
-                    tg_256,
-                );
-            }
+            self.encode_silu_batched(
+                &encoder,
+                &bb.gate,
+                &bb.up,
+                &bb.silu,
+                ffn_dim,
+                batch_size,
+                silu_pso,
+            );
 
             // ---- Batched down-projection + residual accumulate ----
             self.encode_multi_token_matvec_q4_0_accumulate(
                 &encoder,
                 &ffn.down,
-                &batch_silu,
-                &batch_hidden_a,
+                &bb.silu,
+                &bb.hidden_a,
                 h,
                 ffn_dim,
                 batch_size,
@@ -837,7 +850,7 @@ impl GpuForwardPass {
 
         // RMSNorm on last token's hidden state -> hidden_b (single token)
         encoder.setComputePipelineState(rmsnorm_pso);
-        set_buffer(&encoder, &batch_hidden_a, last_offset, 0);
+        set_buffer(&encoder, &bb.hidden_a, last_offset, 0);
         set_buffer(&encoder, self.weight_store.final_norm(), 0, 1);
         set_buffer(&encoder, &self.hidden_b, 0, 2);
         set_bytes(&encoder, &hidden_dim_u32, 3);
@@ -1578,6 +1591,88 @@ impl GpuForwardPass {
             depth: 1,
         };
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode per-token RMSNorm across a batch using buffer offsets.
+    ///
+    /// For each token in `0..batch_size`, dispatches rmsnorm_optimized with
+    /// input/output buffers offset by `tok * dim * sizeof(f32)`.
+    fn encode_rmsnorm_batched(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        input_buf: &ProtocolObject<dyn MTLBuffer>,
+        norm_weight: &ProtocolObject<dyn MTLBuffer>,
+        output_buf: &ProtocolObject<dyn MTLBuffer>,
+        dim: usize,
+        batch_size: usize,
+        rmsnorm_pso: &ProtocolObject<dyn MTLComputePipelineState>,
+    ) {
+        let f32_sz = std::mem::size_of::<f32>();
+        let dim_u32 = dim as u32;
+        let grid_1 = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        let tg_32 = MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
+        for tok in 0..batch_size {
+            let offset = tok * dim * f32_sz;
+            encoder.setComputePipelineState(rmsnorm_pso);
+            set_buffer(encoder, input_buf, offset, 0);
+            set_buffer(encoder, norm_weight, 0, 1);
+            set_buffer(encoder, output_buf, offset, 2);
+            set_bytes(encoder, &dim_u32, 3);
+            set_bytes(encoder, &self.rms_norm_eps, 4);
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_1, tg_32);
+        }
+    }
+
+    /// Encode per-token SiLU across a batch using buffer offsets.
+    ///
+    /// For each token in `0..batch_size`, dispatches ffn_silu with
+    /// gate/up/output buffers offset by `tok * ffn_dim * sizeof(f32)`.
+    fn encode_silu_batched(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        batch_gate: &ProtocolObject<dyn MTLBuffer>,
+        batch_up: &ProtocolObject<dyn MTLBuffer>,
+        batch_silu: &ProtocolObject<dyn MTLBuffer>,
+        ffn_dim: usize,
+        batch_size: usize,
+        silu_pso: &ProtocolObject<dyn MTLComputePipelineState>,
+    ) {
+        let f32_sz = std::mem::size_of::<f32>();
+        let params = LayerParams {
+            intermediate_dim: ffn_dim as u32,
+            seq_len: 1,
+            ..Default::default()
+        };
+        let tg_256 = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        for tok in 0..batch_size {
+            let ffn_offset = tok * ffn_dim * f32_sz;
+            encoder.setComputePipelineState(silu_pso);
+            set_buffer(encoder, &self.hidden_b, 0, 0); // dummy, unused by kernel
+            set_buffer(encoder, batch_gate, ffn_offset, 1);
+            set_buffer(encoder, batch_up, ffn_offset, 2);
+            set_buffer(encoder, batch_silu, ffn_offset, 3);
+            set_bytes(encoder, &params, 4);
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: ffn_dim,
+                    height: 1,
+                    depth: 1,
+                },
+                tg_256,
+            );
+        }
     }
 
     /// Fused SiLU + Q4_0 down-projection matvec with accumulate.
