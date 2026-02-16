@@ -622,7 +622,10 @@ mod tests {
             assert!(
                 diff < 1e-3,
                 "v5 basic Row {}: GPU={}, CPU={}, diff={}",
-                i, result[i], expected[i], diff
+                i,
+                result[i],
+                expected[i],
+                diff
             );
         }
 
@@ -676,7 +679,10 @@ mod tests {
             assert!(
                 diff < 1e-2,
                 "v5 576x576 Row {}: GPU={}, CPU={}, diff={}",
-                i, result[i], expected[i], diff
+                i,
+                result[i],
+                expected[i],
+                diff
             );
         }
         eprintln!(
@@ -724,7 +730,10 @@ mod tests {
             assert!(
                 diff < 1e-2,
                 "v5 192x576 Row {}: GPU={}, CPU={}, diff={}",
-                i, result[i], expected[i], diff
+                i,
+                result[i],
+                expected[i],
+                diff
             );
         }
         eprintln!(
@@ -770,7 +779,10 @@ mod tests {
             assert!(
                 diff < 1e-2,
                 "v5 1536x576 Row {}: GPU={}, CPU={}, diff={}",
-                i, result[i], expected[i], diff
+                i,
+                result[i],
+                expected[i],
+                diff
             );
         }
         eprintln!(
@@ -803,7 +815,9 @@ mod tests {
             }
         }
 
-        let input: Vec<f32> = (0..in_dim).map(|i| 0.05 * ((i % 20) as f32 - 10.0)).collect();
+        let input: Vec<f32> = (0..in_dim)
+            .map(|i| 0.05 * ((i % 20) as f32 - 10.0))
+            .collect();
 
         let expected = cpu_q4_0_dot(&weight_bytes, &input, out_dim, in_dim);
         let result =
@@ -817,7 +831,10 @@ mod tests {
             assert!(
                 diff < 1e-2,
                 "v5 576x1536 Row {}: GPU={}, CPU={}, diff={}",
-                i, result[i], expected[i], diff
+                i,
+                result[i],
+                expected[i],
+                diff
             );
         }
         eprintln!(
@@ -859,7 +876,10 @@ mod tests {
             assert!(
                 diff < 1e-3,
                 "v5 49152x576 Row {}: GPU={}, expected={}, diff={}",
-                i, result[i], expected_val, diff
+                i,
+                result[i],
+                expected_val,
+                diff
             );
         }
         eprintln!(
@@ -896,7 +916,8 @@ mod tests {
             assert!(
                 result[i].abs() < 1e-6,
                 "v5 Row {}: expected ~0.0 with zero scale, got {}",
-                i, result[i]
+                i,
+                result[i]
             );
         }
     }

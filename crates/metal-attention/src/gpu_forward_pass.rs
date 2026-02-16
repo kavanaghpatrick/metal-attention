@@ -261,10 +261,7 @@ impl GpuForwardPass {
 
         // Token history buffer for repetition penalty (shared storage for CPU writes).
         // Pre-allocate for up to 4096 tokens; grows if needed.
-        let token_history_buf = alloc_buffer(
-            &device.device,
-            4096 * std::mem::size_of::<u32>(),
-        );
+        let token_history_buf = alloc_buffer(&device.device, 4096 * std::mem::size_of::<u32>());
 
         // Build PSO cache and prewarm all kernels
         let mut pso_cache = PsoCache::new(device.library.clone());
@@ -824,13 +821,7 @@ impl GpuForwardPass {
 
             // ---- Per-token SiLU: silu(gate[tok]) * up[tok] -> silu[tok] ----
             self.encode_silu_batched(
-                &encoder,
-                &bb.gate,
-                &bb.up,
-                &bb.silu,
-                ffn_dim,
-                batch_size,
-                silu_pso,
+                &encoder, &bb.gate, &bb.up, &bb.silu, ffn_dim, batch_size, silu_pso,
             );
 
             // ---- Batched down-projection + residual accumulate ----
@@ -1358,18 +1349,9 @@ impl GpuForwardPass {
         // Use the same batched kernel with weight_c=weight_a (ignored since dim_c=0)
         // and output_c=output_a (ignored since dim_c=0)
         self.encode_batched_matvec_q4_0(
-            encoder,
-            weight_a,
-            weight_b,
-            weight_a, // dummy, unused (dim_c=0)
-            input_buf,
-            output_a,
-            output_b,
-            output_a, // dummy, unused (dim_c=0)
-            dim_a,
-            dim_b,
-            0,
-            in_dim,
+            encoder, weight_a, weight_b, weight_a, // dummy, unused (dim_c=0)
+            input_buf, output_a, output_b, output_a, // dummy, unused (dim_c=0)
+            dim_a, dim_b, 0, in_dim,
         );
     }
 
@@ -1871,8 +1853,7 @@ impl GpuForwardPass {
         set_bytes(encoder, &position_u32, 5);
         set_bytes(encoder, &self.rope_theta, 6);
 
-        let total_pairs =
-            (self.num_heads + self.num_kv_heads) * self.head_dim / 2;
+        let total_pairs = (self.num_heads + self.num_kv_heads) * self.head_dim / 2;
         let grid = MTLSize {
             width: total_pairs,
             height: 1,
@@ -2387,10 +2368,7 @@ impl GpuForwardPass {
         if self.token_history_len >= capacity {
             // Reallocate with 2x capacity
             let new_cap = capacity * 2;
-            let new_buf = alloc_buffer(
-                &self.device.device,
-                new_cap * std::mem::size_of::<u32>(),
-            );
+            let new_buf = alloc_buffer(&self.device.device, new_cap * std::mem::size_of::<u32>());
             // Copy old data
             unsafe {
                 let src = self.token_history_buf.contents().cast::<u32>().as_ptr();

@@ -654,7 +654,12 @@ fn run_inference(
 // GPU run subcommand
 // ---------------------------------------------------------------------------
 
-fn run_inference_gpu(model_path: PathBuf, prompt: String, max_tokens: usize, repeat_penalty: f32) -> Result<(), String> {
+fn run_inference_gpu(
+    model_path: PathBuf,
+    prompt: String,
+    max_tokens: usize,
+    repeat_penalty: f32,
+) -> Result<(), String> {
     if !model_path.exists() {
         return Err(format!(
             "Error: Model file not found: {}",

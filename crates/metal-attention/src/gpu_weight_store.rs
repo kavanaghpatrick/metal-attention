@@ -324,33 +324,38 @@ impl GpuWeightStore {
         let embed = alloc_buffer_with_data(device, &embed_f32_bytes);
 
         // LM head: try output.weight first, fall back to tied embedding
-        let (lm_head, lm_head_is_f32, lm_head_q8) =
-            if let Some(lm_info) = gguf.find_tensor("output.weight") {
-                let lm_data = gguf.tensor_data(lm_info);
-                eprintln!("output.weight: type={:?}", lm_info.gguf_type);
-                (
-                    make_weight_buffer(device, lm_data, "output.weight", page_size),
-                    false,
-                    None,
-                )
-            } else {
-                // Tied embeddings: keep both F32 (for fallback) and Q8_0 (for bandwidth)
-                let q8_buf = if embed_info.gguf_type == GgufType::Q8_0 {
-                    eprintln!(
+        let (lm_head, lm_head_is_f32, lm_head_q8) = if let Some(lm_info) =
+            gguf.find_tensor("output.weight")
+        {
+            let lm_data = gguf.tensor_data(lm_info);
+            eprintln!("output.weight: type={:?}", lm_info.gguf_type);
+            (
+                make_weight_buffer(device, lm_data, "output.weight", page_size),
+                false,
+                None,
+            )
+        } else {
+            // Tied embeddings: keep both F32 (for fallback) and Q8_0 (for bandwidth)
+            let q8_buf = if embed_info.gguf_type == GgufType::Q8_0 {
+                eprintln!(
                         "output.weight not found, using tied Q8_0 embedding for lm_head (bandwidth optimized)"
                     );
-                    Some(make_weight_buffer(
-                        device,
-                        embed_data,
-                        "token_embd.weight(q8_lm_head)",
-                        page_size,
-                    ))
-                } else {
-                    eprintln!("output.weight not found, using tied F32 embedding for lm_head");
-                    None
-                };
-                (alloc_buffer_with_data(device, &embed_f32_bytes), true, q8_buf)
+                Some(make_weight_buffer(
+                    device,
+                    embed_data,
+                    "token_embd.weight(q8_lm_head)",
+                    page_size,
+                ))
+            } else {
+                eprintln!("output.weight not found, using tied F32 embedding for lm_head");
+                None
             };
+            (
+                alloc_buffer_with_data(device, &embed_f32_bytes),
+                true,
+                q8_buf,
+            )
+        };
 
         // Final norm (F32, always copy)
         let final_norm_info = gguf

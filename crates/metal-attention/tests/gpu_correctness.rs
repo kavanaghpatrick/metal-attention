@@ -204,18 +204,20 @@ fn test_forward_prompt_matches_sequential() {
 
     // Test with prompts of different lengths
     let test_prompts: &[&[u32]] = &[
-        &[1, 2, 3, 4, 5, 6, 7],           // 7 tokens
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10,  // 32 tokens
-          11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-          21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
-          31, 32],
+        &[1, 2, 3, 4, 5, 6, 7], // 7 tokens
+        &[
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, // 32 tokens
+            11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+        ],
     ];
 
     for prompt in test_prompts {
         // --- Sequential path ---
         let mut gpu_seq = GpuForwardPass::from_gguf(path).expect("Failed to load GPU model");
         for &tok in &prompt[..prompt.len() - 1] {
-            let _ = gpu_seq.forward_token(tok).expect("sequential forward_token failed");
+            let _ = gpu_seq
+                .forward_token(tok)
+                .expect("sequential forward_token failed");
         }
         let seq_token = gpu_seq
             .forward_token_greedy(*prompt.last().unwrap())
@@ -232,7 +234,8 @@ fn test_forward_prompt_matches_sequential() {
             prompt.len()
         );
         assert_eq!(
-            seq_token, batch_token,
+            seq_token,
+            batch_token,
             "forward_prompt output differs from sequential path for prompt len={}",
             prompt.len()
         );

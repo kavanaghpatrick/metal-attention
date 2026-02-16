@@ -59,7 +59,10 @@ fn experiment_suite() {
     eprintln!("\n{}", "=".repeat(80));
     eprintln!("  PATH TO 1000+ TOK/S — EXPERIMENT SUITE");
     eprintln!("  SmolLM-135M Q4_0 | M4 120 GB/s | Current ~460 tok/s");
-    eprintln!("  Theoretical max: {:.0} tok/s (bandwidth-limited)", theoretical_max_toks());
+    eprintln!(
+        "  Theoretical max: {:.0} tok/s (bandwidth-limited)",
+        theoretical_max_toks()
+    );
     eprintln!("{}\n", "=".repeat(80));
 
     exp1_peak_bandwidth(&gpu, &pso_cache);
@@ -83,12 +86,16 @@ fn exp1_peak_bandwidth(gpu: &GpuDevice, pso_cache: &PsoCache) {
     eprintln!("━━━ Exp 1: Peak Achievable Bandwidth ━━━");
     eprintln!("  (Sets the ceiling for any bandwidth-bound approach)\n");
 
-    let pso = pso_cache.get(&PsoKey::simple("bandwidth_read_high_occupancy")).unwrap();
+    let pso = pso_cache
+        .get(&PsoKey::simple("bandwidth_read_high_occupancy"))
+        .unwrap();
 
     for size_mb in [8, 16, 32, 64, 86, 128, 256] {
         let n_bytes = size_mb * 1024 * 1024;
         let n_float4 = n_bytes / 16;
-        let data: Vec<f32> = (0..n_bytes / 4).map(|i| (i % 1000) as f32 * 0.001).collect();
+        let data: Vec<f32> = (0..n_bytes / 4)
+            .map(|i| (i % 1000) as f32 * 0.001)
+            .collect();
         let data_buf = alloc_buffer_with_data(&gpu.device, &data);
         let out_buf = alloc_buffer(&gpu.device, 1024 * 4);
         let n_float4_u32 = n_float4 as u32;
@@ -102,8 +109,16 @@ fn exp1_peak_bandwidth(gpu: &GpuDevice, pso_cache: &PsoCache) {
             set_buffer(&enc, &out_buf, 0, 1);
             set_bytes(&enc, &n_float4_u32, 2);
             enc.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize { width: 1024, height: 1, depth: 1 },
-                MTLSize { width: 256, height: 1, depth: 1 },
+                MTLSize {
+                    width: 1024,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
             );
             enc.endEncoding();
             cmd.commit();
@@ -121,8 +136,16 @@ fn exp1_peak_bandwidth(gpu: &GpuDevice, pso_cache: &PsoCache) {
             set_buffer(&enc, &out_buf, 0, 1);
             set_bytes(&enc, &n_float4_u32, 2);
             enc.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize { width: 1024, height: 1, depth: 1 },
-                MTLSize { width: 256, height: 1, depth: 1 },
+                MTLSize {
+                    width: 1024,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
             );
             enc.endEncoding();
             cmd.commit();
@@ -149,7 +172,9 @@ fn exp2_dispatch_overhead(gpu: &GpuDevice, pso_cache: &PsoCache) {
     eprintln!("━━━ Exp 2: Dispatch Overhead Isolation ━━━");
     eprintln!("  (Noop kernel — pure dispatch + pipeline + barrier cost)\n");
 
-    let pso = pso_cache.get(&PsoKey::simple("dispatch_overhead_noop")).unwrap();
+    let pso = pso_cache
+        .get(&PsoKey::simple("dispatch_overhead_noop"))
+        .unwrap();
     let out_buf = alloc_buffer(&gpu.device, 4);
 
     for n_dispatches in [1, 10, 30, 100, 150, 200, 302, 484, 1000] {
@@ -161,8 +186,16 @@ fn exp2_dispatch_overhead(gpu: &GpuDevice, pso_cache: &PsoCache) {
                 enc.setComputePipelineState(pso);
                 set_buffer(&enc, &out_buf, 0, 0);
                 enc.dispatchThreads_threadsPerThreadgroup(
-                    MTLSize { width: 1, height: 1, depth: 1 },
-                    MTLSize { width: 1, height: 1, depth: 1 },
+                    MTLSize {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
                 );
             }
             enc.endEncoding();
@@ -179,8 +212,16 @@ fn exp2_dispatch_overhead(gpu: &GpuDevice, pso_cache: &PsoCache) {
                 enc.setComputePipelineState(pso);
                 set_buffer(&enc, &out_buf, 0, 0);
                 enc.dispatchThreads_threadsPerThreadgroup(
-                    MTLSize { width: 1, height: 1, depth: 1 },
-                    MTLSize { width: 1, height: 1, depth: 1 },
+                    MTLSize {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
                 );
             }
             enc.endEncoding();
@@ -248,8 +289,16 @@ fn exp3_dispatch_scaling(gpu: &GpuDevice, pso_cache: &PsoCache) {
                 set_bytes(&enc, &in_dim, 4);
                 let n_groups = (rows_each + 7) / 8;
                 enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-                    MTLSize { width: 256, height: 1, depth: 1 },
+                    MTLSize {
+                        width: n_groups as usize,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
                 );
             }
             enc.endEncoding();
@@ -272,8 +321,16 @@ fn exp3_dispatch_scaling(gpu: &GpuDevice, pso_cache: &PsoCache) {
                 set_bytes(&enc, &in_dim, 4);
                 let n_groups = (rows_each + 7) / 8;
                 enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-                    MTLSize { width: 256, height: 1, depth: 1 },
+                    MTLSize {
+                        width: n_groups as usize,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
                 );
             }
             enc.endEncoding();
@@ -340,8 +397,16 @@ fn exp4_matvec_size_scaling(gpu: &GpuDevice, pso_cache: &PsoCache) {
             set_bytes(&enc, out_dim, 3);
             set_bytes(&enc, &in_dim, 4);
             enc.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-                MTLSize { width: 256, height: 1, depth: 1 },
+                MTLSize {
+                    width: n_groups as usize,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
             );
             enc.endEncoding();
             cmd.commit();
@@ -360,8 +425,16 @@ fn exp4_matvec_size_scaling(gpu: &GpuDevice, pso_cache: &PsoCache) {
             set_bytes(&enc, out_dim, 3);
             set_bytes(&enc, &in_dim, 4);
             enc.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-                MTLSize { width: 256, height: 1, depth: 1 },
+                MTLSize {
+                    width: n_groups as usize,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
             );
             enc.endEncoding();
             cmd.commit();
@@ -394,7 +467,9 @@ fn exp5_megakernel_fusion(gpu: &GpuDevice, pso_cache: &PsoCache) {
 
     let pso_rmsnorm = pso_cache.get(&PsoKey::simple("rmsnorm")).unwrap();
     let pso_matvec = pso_cache.get(&PsoKey::simple("matvec_q4_0")).unwrap();
-    let pso_mega = pso_cache.get(&PsoKey::simple("megakernel_rmsnorm_matvec")).unwrap();
+    let pso_mega = pso_cache
+        .get(&PsoKey::simple("megakernel_rmsnorm_matvec"))
+        .unwrap();
 
     let hidden = SMOLLM_HIDDEN;
     let out_dim = hidden; // Q projection: 576→576
@@ -427,8 +502,16 @@ fn exp5_megakernel_fusion(gpu: &GpuDevice, pso_cache: &PsoCache) {
         set_bytes(&enc, &hidden, 3);
         set_bytes(&enc, &eps, 4);
         enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: 1, height: 1, depth: 1 },
-            MTLSize { width: 256, height: 1, depth: 1 },
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
         );
         // matvec
         enc.setComputePipelineState(pso_matvec);
@@ -439,8 +522,16 @@ fn exp5_megakernel_fusion(gpu: &GpuDevice, pso_cache: &PsoCache) {
         set_bytes(&enc, &hidden, 4);
         let n_groups = (out_dim + 7) / 8;
         enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-            MTLSize { width: 256, height: 1, depth: 1 },
+            MTLSize {
+                width: n_groups as usize,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
         );
         enc.endEncoding();
         cmd.commit();
@@ -458,8 +549,16 @@ fn exp5_megakernel_fusion(gpu: &GpuDevice, pso_cache: &PsoCache) {
         set_bytes(&enc, &hidden, 3);
         set_bytes(&enc, &eps, 4);
         enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: 1, height: 1, depth: 1 },
-            MTLSize { width: 256, height: 1, depth: 1 },
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
         );
         enc.setComputePipelineState(pso_matvec);
         set_buffer(&enc, &mat_buf, 0, 0);
@@ -469,8 +568,16 @@ fn exp5_megakernel_fusion(gpu: &GpuDevice, pso_cache: &PsoCache) {
         set_bytes(&enc, &hidden, 4);
         let n_groups = (out_dim + 7) / 8;
         enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-            MTLSize { width: 256, height: 1, depth: 1 },
+            MTLSize {
+                width: n_groups as usize,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
         );
         enc.endEncoding();
         cmd.commit();
@@ -492,8 +599,16 @@ fn exp5_megakernel_fusion(gpu: &GpuDevice, pso_cache: &PsoCache) {
         set_bytes(&enc, &out_dim, 6);
         let n_groups = (out_dim + 7) / 8;
         enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-            MTLSize { width: 256, height: 1, depth: 1 },
+            MTLSize {
+                width: n_groups as usize,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
         );
         enc.endEncoding();
         cmd.commit();
@@ -514,8 +629,16 @@ fn exp5_megakernel_fusion(gpu: &GpuDevice, pso_cache: &PsoCache) {
         set_bytes(&enc, &out_dim, 6);
         let n_groups = (out_dim + 7) / 8;
         enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-            MTLSize { width: 256, height: 1, depth: 1 },
+            MTLSize {
+                width: n_groups as usize,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
         );
         enc.endEncoding();
         cmd.commit();
@@ -528,7 +651,10 @@ fn exp5_megakernel_fusion(gpu: &GpuDevice, pso_cache: &PsoCache) {
 
     eprintln!("  Separate (rmsnorm + matvec):  {:>7.1} us", separate_us);
     eprintln!("  Fused (megakernel):           {:>7.1} us", fused_us);
-    eprintln!("  Savings per fusion:           {:>7.1} us ({:.1}%)", savings, pct);
+    eprintln!(
+        "  Savings per fusion:           {:>7.1} us ({:.1}%)",
+        savings, pct
+    );
     eprintln!(
         "  If applied to all 7 rmsnorm+matvec pairs/layer × 30 layers = {} fusions:",
         7 * 30
@@ -555,7 +681,9 @@ fn exp6_multi_token_batch(gpu: &GpuDevice, pso_cache: &PsoCache) {
     eprintln!("  (Same weights read once, applied to N token vectors)\n");
 
     let pso_single = pso_cache.get(&PsoKey::simple("matvec_q4_0")).unwrap();
-    let pso_batch = pso_cache.get(&PsoKey::simple("bench_multi_token_matvec_q4_0")).unwrap();
+    let pso_batch = pso_cache
+        .get(&PsoKey::simple("bench_multi_token_matvec_q4_0"))
+        .unwrap();
 
     let in_dim: u32 = SMOLLM_HIDDEN;
     let out_dim: u32 = SMOLLM_HIDDEN; // 576→576
@@ -568,8 +696,9 @@ fn exp6_multi_token_batch(gpu: &GpuDevice, pso_cache: &PsoCache) {
     let weight_buf = alloc_buffer_with_data(&gpu.device, &weight_data);
 
     for batch_size in [1u32, 2, 4, 8, 16] {
-        let input_data: Vec<f32> =
-            (0..(batch_size * in_dim) as usize).map(|i| (i as f32) * 0.001).collect();
+        let input_data: Vec<f32> = (0..(batch_size * in_dim) as usize)
+            .map(|i| (i as f32) * 0.001)
+            .collect();
         let input_buf = alloc_buffer_with_data(&gpu.device, &input_data);
         let output_buf = alloc_buffer(&gpu.device, (batch_size * out_dim) as usize * 4);
 
@@ -587,8 +716,16 @@ fn exp6_multi_token_batch(gpu: &GpuDevice, pso_cache: &PsoCache) {
                 set_bytes(&enc, &out_dim, 3);
                 set_bytes(&enc, &in_dim, 4);
                 enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-                    MTLSize { width: 256, height: 1, depth: 1 },
+                    MTLSize {
+                        width: n_groups as usize,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
                 );
                 enc.endEncoding();
                 cmd.commit();
@@ -607,8 +744,16 @@ fn exp6_multi_token_batch(gpu: &GpuDevice, pso_cache: &PsoCache) {
                 set_bytes(&enc, &out_dim, 3);
                 set_bytes(&enc, &in_dim, 4);
                 enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-                    MTLSize { width: 256, height: 1, depth: 1 },
+                    MTLSize {
+                        width: n_groups as usize,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
                 );
                 enc.endEncoding();
                 cmd.commit();
@@ -637,8 +782,16 @@ fn exp6_multi_token_batch(gpu: &GpuDevice, pso_cache: &PsoCache) {
                 set_bytes(&enc, &in_dim, 4);
                 set_bytes(&enc, &batch_size, 5);
                 enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-                    MTLSize { width: 256, height: 1, depth: 1 },
+                    MTLSize {
+                        width: n_groups as usize,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
                 );
                 enc.endEncoding();
                 cmd.commit();
@@ -658,8 +811,16 @@ fn exp6_multi_token_batch(gpu: &GpuDevice, pso_cache: &PsoCache) {
                 set_bytes(&enc, &in_dim, 4);
                 set_bytes(&enc, &batch_size, 5);
                 enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-                    MTLSize { width: 256, height: 1, depth: 1 },
+                    MTLSize {
+                        width: n_groups as usize,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
                 );
                 enc.endEncoding();
                 cmd.commit();
@@ -695,10 +856,7 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
     let eps: f32 = 1e-5;
 
     // Allocate shared buffers
-    let input_buf = alloc_buffer_with_data(
-        &gpu.device,
-        &vec![0.01f32; hidden as usize],
-    );
+    let input_buf = alloc_buffer_with_data(&gpu.device, &vec![0.01f32; hidden as usize]);
     let norm_weight = alloc_buffer_with_data(&gpu.device, &vec![1.0f32; hidden as usize]);
     let norm_out = alloc_buffer(&gpu.device, hidden as usize * 4);
 
@@ -725,7 +883,9 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
 
     let pso_rmsnorm = pso_cache.get(&PsoKey::simple("rmsnorm")).unwrap();
     let pso_matvec = pso_cache.get(&PsoKey::simple("matvec_q4_0")).unwrap();
-    let pso_batched = pso_cache.get(&PsoKey::simple("matvec_q4_0_batched")).unwrap();
+    let pso_batched = pso_cache
+        .get(&PsoKey::simple("matvec_q4_0_batched"))
+        .unwrap();
 
     let iterations = 200;
 
@@ -751,8 +911,16 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
             set_bytes(&enc, &hidden, 3);
             set_bytes(&enc, &eps, 4);
             enc.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize { width: 1, height: 1, depth: 1 },
-                MTLSize { width: 256, height: 1, depth: 1 },
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
             );
             enc.endEncoding();
             cmd.commit();
@@ -772,8 +940,16 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
                 set_bytes(&enc, &hidden, 3);
                 set_bytes(&enc, &eps, 4);
                 enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize { width: 1, height: 1, depth: 1 },
-                    MTLSize { width: 256, height: 1, depth: 1 },
+                    MTLSize {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
                 );
             }
             enc.endEncoding();
@@ -781,7 +957,11 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
             cmd.waitUntilCompleted();
         }
         let total = start.elapsed().as_micros() as f64 / iterations as f64;
-        results.push(OpTime { name: "RMSNorm (61 dispatches)", per_layer: 2, total_us: total });
+        results.push(OpTime {
+            name: "RMSNorm (61 dispatches)",
+            per_layer: 2,
+            total_us: total,
+        });
     }
 
     // --- Batched QKV matvec (1 per layer = 30) ---
@@ -799,8 +979,16 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
             set_bytes(&enc, &total_out, 3);
             set_bytes(&enc, &hidden, 4);
             enc.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-                MTLSize { width: 256, height: 1, depth: 1 },
+                MTLSize {
+                    width: n_groups as usize,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
             );
             enc.endEncoding();
             cmd.commit();
@@ -819,8 +1007,16 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
                 set_bytes(&enc, &total_out, 3);
                 set_bytes(&enc, &hidden, 4);
                 enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-                    MTLSize { width: 256, height: 1, depth: 1 },
+                    MTLSize {
+                        width: n_groups as usize,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
                 );
             }
             enc.endEncoding();
@@ -828,7 +1024,11 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
             cmd.waitUntilCompleted();
         }
         let total = start.elapsed().as_micros() as f64 / iterations as f64;
-        results.push(OpTime { name: "Batched QKV matvec (30 dispatches)", per_layer: 1, total_us: total });
+        results.push(OpTime {
+            name: "Batched QKV matvec (30 dispatches)",
+            per_layer: 1,
+            total_us: total,
+        });
     }
 
     // --- O projection + accumulate (1 per layer = 30) ---
@@ -846,8 +1046,16 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
             set_bytes(&enc, &hidden, 3);
             set_bytes(&enc, &(heads * head_dim), 4);
             enc.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-                MTLSize { width: 256, height: 1, depth: 1 },
+                MTLSize {
+                    width: n_groups as usize,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
             );
             enc.endEncoding();
             cmd.commit();
@@ -866,8 +1074,16 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
                 set_bytes(&enc, &hidden, 3);
                 set_bytes(&enc, &(heads * head_dim), 4);
                 enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-                    MTLSize { width: 256, height: 1, depth: 1 },
+                    MTLSize {
+                        width: n_groups as usize,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
                 );
             }
             enc.endEncoding();
@@ -875,7 +1091,11 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
             cmd.waitUntilCompleted();
         }
         let total = start.elapsed().as_micros() as f64 / iterations as f64;
-        results.push(OpTime { name: "O proj matvec (30 dispatches)", per_layer: 1, total_us: total });
+        results.push(OpTime {
+            name: "O proj matvec (30 dispatches)",
+            per_layer: 1,
+            total_us: total,
+        });
     }
 
     // --- FFN gate+up batched (1 per layer = 30) ---
@@ -893,8 +1113,16 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
             set_bytes(&enc, &total_out, 3);
             set_bytes(&enc, &hidden, 4);
             enc.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-                MTLSize { width: 256, height: 1, depth: 1 },
+                MTLSize {
+                    width: n_groups as usize,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
             );
             enc.endEncoding();
             cmd.commit();
@@ -913,8 +1141,16 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
                 set_bytes(&enc, &total_out, 3);
                 set_bytes(&enc, &hidden, 4);
                 enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-                    MTLSize { width: 256, height: 1, depth: 1 },
+                    MTLSize {
+                        width: n_groups as usize,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
                 );
             }
             enc.endEncoding();
@@ -922,7 +1158,11 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
             cmd.waitUntilCompleted();
         }
         let total = start.elapsed().as_micros() as f64 / iterations as f64;
-        results.push(OpTime { name: "FFN gate+up batched (30 dispatches)", per_layer: 1, total_us: total });
+        results.push(OpTime {
+            name: "FFN gate+up batched (30 dispatches)",
+            per_layer: 1,
+            total_us: total,
+        });
     }
 
     // --- Down proj + accumulate (1 per layer = 30) ---
@@ -946,8 +1186,16 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
             set_bytes(&enc, &hidden, 3);
             set_bytes(&enc, &in_dim_down, 4);
             enc.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-                MTLSize { width: 256, height: 1, depth: 1 },
+                MTLSize {
+                    width: n_groups as usize,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
             );
             enc.endEncoding();
             cmd.commit();
@@ -966,8 +1214,16 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
                 set_bytes(&enc, &hidden, 3);
                 set_bytes(&enc, &in_dim_down, 4);
                 enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-                    MTLSize { width: 256, height: 1, depth: 1 },
+                    MTLSize {
+                        width: n_groups as usize,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
                 );
             }
             enc.endEncoding();
@@ -975,7 +1231,11 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
             cmd.waitUntilCompleted();
         }
         let total = start.elapsed().as_micros() as f64 / iterations as f64;
-        results.push(OpTime { name: "Down proj matvec (30 dispatches)", per_layer: 1, total_us: total });
+        results.push(OpTime {
+            name: "Down proj matvec (30 dispatches)",
+            per_layer: 1,
+            total_us: total,
+        });
     }
 
     // --- lm_head (1 dispatch) ---
@@ -992,8 +1252,16 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
             set_bytes(&enc, &SMOLLM_VOCAB, 3);
             set_bytes(&enc, &hidden, 4);
             enc.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-                MTLSize { width: 256, height: 1, depth: 1 },
+                MTLSize {
+                    width: n_groups as usize,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
             );
             enc.endEncoding();
             cmd.commit();
@@ -1011,15 +1279,27 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
             set_bytes(&enc, &SMOLLM_VOCAB, 3);
             set_bytes(&enc, &hidden, 4);
             enc.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize { width: n_groups as usize, height: 1, depth: 1 },
-                MTLSize { width: 256, height: 1, depth: 1 },
+                MTLSize {
+                    width: n_groups as usize,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
             );
             enc.endEncoding();
             cmd.commit();
             cmd.waitUntilCompleted();
         }
         let total = start.elapsed().as_micros() as f64 / iterations as f64;
-        results.push(OpTime { name: "lm_head (1 dispatch, 49152 rows)", per_layer: 0, total_us: total });
+        results.push(OpTime {
+            name: "lm_head (1 dispatch, 49152 rows)",
+            per_layer: 0,
+            total_us: total,
+        });
     }
 
     // --- Print results ---
@@ -1028,10 +1308,7 @@ fn exp7_forward_pass_breakdown(gpu: &GpuDevice, pso_cache: &PsoCache) {
     eprintln!("  {}", "-".repeat(67));
     for r in &results {
         let share = r.total_us / grand_total * 100.0;
-        eprintln!(
-            "  {:>45}  {:>8.1}  {:>5.1}%",
-            r.name, r.total_us, share
-        );
+        eprintln!("  {:>45}  {:>8.1}  {:>5.1}%", r.name, r.total_us, share);
     }
     eprintln!("  {}", "-".repeat(67));
     eprintln!("  {:>45}  {:>8.1}  100.0%", "TOTAL (measured)", grand_total);

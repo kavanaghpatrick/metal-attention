@@ -212,5 +212,10 @@ fn bench_gpu_prefill(c: &mut Criterion) {
     eprintln!("GPU prefill benchmark complete");
 }
 
-criterion_group!(benches, bench_gpu_decode, bench_cpu_decode, bench_gpu_prefill);
+criterion_group!(
+    benches,
+    bench_gpu_decode,
+    bench_cpu_decode,
+    bench_gpu_prefill
+);
 criterion_main!(benches);
