@@ -401,9 +401,9 @@ impl GpuForwardPass {
             // Single dispatch: 576+192+192 = 960 rows (was 3 separate dispatches)
             self.encode_batched_matvec_q4_0(
                 &encoder,
-                &attn.q,
-                &attn.k,
-                &attn.v,
+                &attn.q.buffer, attn.q.offset,
+                &attn.k.buffer, attn.k.offset,
+                &attn.v.buffer, attn.v.offset,
                 &self.hidden_b,
                 &self.scratch_q,
                 &self.scratch_k,
@@ -447,7 +447,7 @@ impl GpuForwardPass {
             // O projection + residual (fused): hidden_a += O_proj(attn_out)
             self.encode_matvec_q4_0_accumulate(
                 &encoder,
-                &attn.o,
+                &attn.o.buffer, attn.o.offset,
                 &self.scratch_attn_out,
                 &self.hidden_a,
                 self.hidden_size,
@@ -464,8 +464,8 @@ impl GpuForwardPass {
             // Batched gate/up projection: hidden_b -> scratch_gate, scratch_up
             self.encode_batched_matvec_q4_0_2(
                 &encoder,
-                &ffn.gate,
-                &ffn.up,
+                &ffn.gate.buffer, ffn.gate.offset,
+                &ffn.up.buffer, ffn.up.offset,
                 &self.hidden_b,
                 &self.scratch_gate,
                 &self.scratch_up,
@@ -480,7 +480,7 @@ impl GpuForwardPass {
             // Down projection + residual (fused): hidden_a += down(scratch_silu)
             self.encode_matvec_q4_0_accumulate(
                 &encoder,
-                &ffn.down,
+                &ffn.down.buffer, ffn.down.offset,
                 &self.scratch_silu,
                 &self.hidden_a,
                 self.hidden_size,
@@ -497,37 +497,39 @@ impl GpuForwardPass {
         );
 
         // Prefer Q6_K > Q8_0 > F32 > Q4_0 for lm_head (bandwidth optimization)
-        if let Some(q6k_buf) = self.weight_store.lm_head_q6k() {
+        if let Some(wb) = self.weight_store.lm_head_q6k() {
             self.encode_matvec_q6_k(
                 &encoder,
-                q6k_buf,
+                &wb.buffer, wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
                 self.hidden_size,
             );
-        } else if let Some(q8_buf) = self.weight_store.lm_head_q8() {
+        } else if let Some(wb) = self.weight_store.lm_head_q8() {
             self.encode_matvec_q8_0(
                 &encoder,
-                q8_buf,
+                &wb.buffer, wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
                 self.hidden_size,
             );
         } else if self.weight_store.lm_head_is_f32() {
+            let wb = self.weight_store.lm_head();
             self.encode_matvec_f32(
                 &encoder,
-                self.weight_store.lm_head(),
+                &wb.buffer, wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
                 self.hidden_size,
             );
         } else {
+            let wb = self.weight_store.lm_head();
             self.encode_matvec_q4_0(
                 &encoder,
-                self.weight_store.lm_head(),
+                &wb.buffer, wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
@@ -689,7 +691,7 @@ impl GpuForwardPass {
             // ---- Batched QKV matvec (weight cache reuse) ----
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
-                &attn.q,
+                &attn.q.buffer, attn.q.offset,
                 &bb.hidden_b,
                 &bb.q,
                 q_dim,
@@ -698,7 +700,7 @@ impl GpuForwardPass {
             );
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
-                &attn.k,
+                &attn.k.buffer, attn.k.offset,
                 &bb.hidden_b,
                 &bb.k,
                 kv_dim,
@@ -707,7 +709,7 @@ impl GpuForwardPass {
             );
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
-                &attn.v,
+                &attn.v.buffer, attn.v.offset,
                 &bb.hidden_b,
                 &bb.v,
                 kv_dim,
@@ -797,7 +799,7 @@ impl GpuForwardPass {
             let attn = self.weight_store.attn_proj(layer_idx);
             self.encode_multi_token_matvec_q4_0_accumulate(
                 &encoder,
-                &attn.o,
+                &attn.o.buffer, attn.o.offset,
                 &bb.attn_out,
                 &bb.hidden_a,
                 h,
@@ -821,7 +823,7 @@ impl GpuForwardPass {
             // ---- Batched gate/up matvec ----
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
-                &ffn.gate,
+                &ffn.gate.buffer, ffn.gate.offset,
                 &bb.hidden_b,
                 &bb.gate,
                 ffn_dim,
@@ -830,7 +832,7 @@ impl GpuForwardPass {
             );
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
-                &ffn.up,
+                &ffn.up.buffer, ffn.up.offset,
                 &bb.hidden_b,
                 &bb.up,
                 ffn_dim,
@@ -846,7 +848,7 @@ impl GpuForwardPass {
             // ---- Batched down-projection + residual accumulate ----
             self.encode_multi_token_matvec_q4_0_accumulate(
                 &encoder,
-                &ffn.down,
+                &ffn.down.buffer, ffn.down.offset,
                 &bb.silu,
                 &bb.hidden_a,
                 h,
@@ -869,37 +871,39 @@ impl GpuForwardPass {
 
         // lm_head: hidden_b -> logits_buf (single token, reuse existing buffers)
         // Prefer Q6_K > Q8_0 > F32 > Q4_0
-        if let Some(q6k_buf) = self.weight_store.lm_head_q6k() {
+        if let Some(wb) = self.weight_store.lm_head_q6k() {
             self.encode_matvec_q6_k(
                 &encoder,
-                q6k_buf,
+                &wb.buffer, wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
                 h,
             );
-        } else if let Some(q8_buf) = self.weight_store.lm_head_q8() {
+        } else if let Some(wb) = self.weight_store.lm_head_q8() {
             self.encode_matvec_q8_0(
                 &encoder,
-                q8_buf,
+                &wb.buffer, wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
                 h,
             );
         } else if self.weight_store.lm_head_is_f32() {
+            let wb = self.weight_store.lm_head();
             self.encode_matvec_f32(
                 &encoder,
-                self.weight_store.lm_head(),
+                &wb.buffer, wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
                 h,
             );
         } else {
+            let wb = self.weight_store.lm_head();
             self.encode_matvec_q4_0(
                 &encoder,
-                self.weight_store.lm_head(),
+                &wb.buffer, wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
@@ -1021,7 +1025,7 @@ impl GpuForwardPass {
         // Q projection: hidden_b -> scratch_q
         self.encode_matvec_q4_0(
             &encoder,
-            &attn.q,
+            &attn.q.buffer, attn.q.offset,
             &self.hidden_b,
             &self.scratch_q,
             self.num_heads * self.head_dim,
@@ -1031,7 +1035,7 @@ impl GpuForwardPass {
         // K projection: hidden_b -> scratch_k
         self.encode_matvec_q4_0(
             &encoder,
-            &attn.k,
+            &attn.k.buffer, attn.k.offset,
             &self.hidden_b,
             &self.scratch_k,
             self.num_kv_heads * self.head_dim,
@@ -1041,7 +1045,7 @@ impl GpuForwardPass {
         // V projection: hidden_b -> scratch_v
         self.encode_matvec_q4_0(
             &encoder,
-            &attn.v,
+            &attn.v.buffer, attn.v.offset,
             &self.hidden_b,
             &self.scratch_v,
             self.num_kv_heads * self.head_dim,
@@ -1088,7 +1092,7 @@ impl GpuForwardPass {
         // O projection: scratch_attn_out -> scratch_o
         self.encode_matvec_q4_0(
             &encoder,
-            &attn.o,
+            &attn.o.buffer, attn.o.offset,
             &self.scratch_attn_out,
             &self.scratch_o,
             self.hidden_size,
@@ -1133,7 +1137,7 @@ impl GpuForwardPass {
         // Gate projection: hidden_b -> scratch_gate
         self.encode_matvec_q4_0(
             &encoder,
-            &ffn.gate,
+            &ffn.gate.buffer, ffn.gate.offset,
             &self.hidden_b,
             &self.scratch_gate,
             self.intermediate_size,
@@ -1143,7 +1147,7 @@ impl GpuForwardPass {
         // Up projection: hidden_b -> scratch_up
         self.encode_matvec_q4_0(
             &encoder,
-            &ffn.up,
+            &ffn.up.buffer, ffn.up.offset,
             &self.hidden_b,
             &self.scratch_up,
             self.intermediate_size,
@@ -1156,7 +1160,7 @@ impl GpuForwardPass {
         // Down projection: scratch_silu -> scratch_ffn
         self.encode_matvec_q4_0(
             &encoder,
-            &ffn.down,
+            &ffn.down.buffer, ffn.down.offset,
             &self.scratch_silu,
             &self.scratch_ffn,
             self.hidden_size,
@@ -1202,20 +1206,20 @@ impl GpuForwardPass {
 
         // LM head matvec: hidden_b -> logits_buf [vocab_size]
         if self.weight_store.lm_head_is_f32() {
-            // Tied embeddings: F32 weights -> use F32 matvec kernel
+            let wb = self.weight_store.lm_head();
             self.encode_matvec_f32(
                 &encoder,
-                self.weight_store.lm_head(),
+                &wb.buffer, wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
                 self.hidden_size,
             );
         } else {
-            // Separate output.weight: Q4_0 -> use Q4_0 matvec kernel
+            let wb = self.weight_store.lm_head();
             self.encode_matvec_q4_0(
                 &encoder,
-                self.weight_store.lm_head(),
+                &wb.buffer, wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
@@ -1276,6 +1280,7 @@ impl GpuForwardPass {
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         weight_buf: &ProtocolObject<dyn MTLBuffer>,
+        weight_offset: usize,
         input_buf: &ProtocolObject<dyn MTLBuffer>,
         output_buf: &ProtocolObject<dyn MTLBuffer>,
         out_dim: usize,
@@ -1287,7 +1292,7 @@ impl GpuForwardPass {
             .expect("matvec_q4_0_v5_coalesced PSO not prewarmed");
 
         encoder.setComputePipelineState(pso);
-        set_buffer(encoder, weight_buf, 0, 0);
+        set_buffer(encoder, weight_buf, weight_offset, 0);
         set_buffer(encoder, input_buf, 0, 1);
         set_buffer(encoder, output_buf, 0, 2);
 
@@ -1318,8 +1323,11 @@ impl GpuForwardPass {
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         weight_a: &ProtocolObject<dyn MTLBuffer>,
+        offset_a: usize,
         weight_b: &ProtocolObject<dyn MTLBuffer>,
+        offset_b: usize,
         weight_c: &ProtocolObject<dyn MTLBuffer>,
+        offset_c: usize,
         input_buf: &ProtocolObject<dyn MTLBuffer>,
         output_a: &ProtocolObject<dyn MTLBuffer>,
         output_b: &ProtocolObject<dyn MTLBuffer>,
@@ -1335,9 +1343,9 @@ impl GpuForwardPass {
             .expect("matvec_q4_0_batched PSO not prewarmed");
 
         encoder.setComputePipelineState(pso);
-        set_buffer(encoder, weight_a, 0, 0);
-        set_buffer(encoder, weight_b, 0, 1);
-        set_buffer(encoder, weight_c, 0, 2);
+        set_buffer(encoder, weight_a, offset_a, 0);
+        set_buffer(encoder, weight_b, offset_b, 1);
+        set_buffer(encoder, weight_c, offset_c, 2);
         set_buffer(encoder, input_buf, 0, 3);
         set_buffer(encoder, output_a, 0, 4);
         set_buffer(encoder, output_b, 0, 5);
@@ -1367,7 +1375,9 @@ impl GpuForwardPass {
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         weight_a: &ProtocolObject<dyn MTLBuffer>,
+        offset_a: usize,
         weight_b: &ProtocolObject<dyn MTLBuffer>,
+        offset_b: usize,
         input_buf: &ProtocolObject<dyn MTLBuffer>,
         output_a: &ProtocolObject<dyn MTLBuffer>,
         output_b: &ProtocolObject<dyn MTLBuffer>,
@@ -1378,7 +1388,10 @@ impl GpuForwardPass {
         // Use the same batched kernel with weight_c=weight_a (ignored since dim_c=0)
         // and output_c=output_a (ignored since dim_c=0)
         self.encode_batched_matvec_q4_0(
-            encoder, weight_a, weight_b, weight_a, // dummy, unused (dim_c=0)
+            encoder,
+            weight_a, offset_a,
+            weight_b, offset_b,
+            weight_a, offset_a, // dummy, unused (dim_c=0)
             input_buf, output_a, output_b, output_a, // dummy, unused (dim_c=0)
             dim_a, dim_b, 0, in_dim,
         );
@@ -1391,6 +1404,7 @@ impl GpuForwardPass {
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         weight_buf: &ProtocolObject<dyn MTLBuffer>,
+        weight_offset: usize,
         input_buf: &ProtocolObject<dyn MTLBuffer>,
         output_buf: &ProtocolObject<dyn MTLBuffer>,
         out_dim: usize,
@@ -1402,7 +1416,7 @@ impl GpuForwardPass {
             .expect("matvec_f32_v2 PSO not prewarmed");
 
         encoder.setComputePipelineState(pso);
-        set_buffer(encoder, weight_buf, 0, 0);
+        set_buffer(encoder, weight_buf, weight_offset, 0);
         set_buffer(encoder, input_buf, 0, 1);
         set_buffer(encoder, output_buf, 0, 2);
 
@@ -1431,6 +1445,7 @@ impl GpuForwardPass {
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         weight_buf: &ProtocolObject<dyn MTLBuffer>,
+        weight_offset: usize,
         input_buf: &ProtocolObject<dyn MTLBuffer>,
         output_buf: &ProtocolObject<dyn MTLBuffer>,
         out_dim: usize,
@@ -1442,7 +1457,7 @@ impl GpuForwardPass {
             .expect("matvec_q6_k PSO not prewarmed");
 
         encoder.setComputePipelineState(pso);
-        set_buffer(encoder, weight_buf, 0, 0);
+        set_buffer(encoder, weight_buf, weight_offset, 0);
         set_buffer(encoder, input_buf, 0, 1);
         set_buffer(encoder, output_buf, 0, 2);
 
@@ -1471,6 +1486,7 @@ impl GpuForwardPass {
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         weight_buf: &ProtocolObject<dyn MTLBuffer>,
+        weight_offset: usize,
         input_buf: &ProtocolObject<dyn MTLBuffer>,
         output_buf: &ProtocolObject<dyn MTLBuffer>,
         out_dim: usize,
@@ -1482,7 +1498,7 @@ impl GpuForwardPass {
             .expect("matvec_q8_0 PSO not prewarmed");
 
         encoder.setComputePipelineState(pso);
-        set_buffer(encoder, weight_buf, 0, 0);
+        set_buffer(encoder, weight_buf, weight_offset, 0);
         set_buffer(encoder, input_buf, 0, 1);
         set_buffer(encoder, output_buf, 0, 2);
 
@@ -1521,6 +1537,7 @@ impl GpuForwardPass {
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         weight_buf: &ProtocolObject<dyn MTLBuffer>,
+        weight_offset: usize,
         input_buf: &ProtocolObject<dyn MTLBuffer>,
         output_buf: &ProtocolObject<dyn MTLBuffer>,
         out_dim: usize,
@@ -1532,7 +1549,7 @@ impl GpuForwardPass {
             .expect("matvec_q4_0_accumulate PSO not prewarmed");
 
         encoder.setComputePipelineState(pso);
-        set_buffer(encoder, weight_buf, 0, 0);
+        set_buffer(encoder, weight_buf, weight_offset, 0);
         set_buffer(encoder, input_buf, 0, 1);
         set_buffer(encoder, output_buf, 0, 2);
 
@@ -1563,6 +1580,7 @@ impl GpuForwardPass {
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         weight_buf: &ProtocolObject<dyn MTLBuffer>,
+        weight_offset: usize,
         input_buf: &ProtocolObject<dyn MTLBuffer>,
         output_buf: &ProtocolObject<dyn MTLBuffer>,
         out_dim: usize,
@@ -1575,7 +1593,7 @@ impl GpuForwardPass {
             .expect("multi_token_matvec_q4_0 PSO not prewarmed");
 
         encoder.setComputePipelineState(pso);
-        set_buffer(encoder, weight_buf, 0, 0);
+        set_buffer(encoder, weight_buf, weight_offset, 0);
         set_buffer(encoder, input_buf, 0, 1);
         set_buffer(encoder, output_buf, 0, 2);
 
@@ -1607,6 +1625,7 @@ impl GpuForwardPass {
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         weight_buf: &ProtocolObject<dyn MTLBuffer>,
+        weight_offset: usize,
         input_buf: &ProtocolObject<dyn MTLBuffer>,
         output_buf: &ProtocolObject<dyn MTLBuffer>,
         out_dim: usize,
@@ -1619,7 +1638,7 @@ impl GpuForwardPass {
             .expect("multi_token_matvec_q4_0_accumulate PSO not prewarmed");
 
         encoder.setComputePipelineState(pso);
-        set_buffer(encoder, weight_buf, 0, 0);
+        set_buffer(encoder, weight_buf, weight_offset, 0);
         set_buffer(encoder, input_buf, 0, 1);
         set_buffer(encoder, output_buf, 0, 2);
 
@@ -2273,9 +2292,9 @@ impl GpuForwardPass {
             // Batched Q/K/V projection: hidden_b -> scratch_q, scratch_k, scratch_v
             self.encode_batched_matvec_q4_0(
                 &encoder,
-                &attn.q,
-                &attn.k,
-                &attn.v,
+                &attn.q.buffer, attn.q.offset,
+                &attn.k.buffer, attn.k.offset,
+                &attn.v.buffer, attn.v.offset,
                 &self.hidden_b,
                 &self.scratch_q,
                 &self.scratch_k,
@@ -2312,7 +2331,7 @@ impl GpuForwardPass {
 
             self.encode_matvec_q4_0_accumulate(
                 &encoder,
-                &attn.o,
+                &attn.o.buffer, attn.o.offset,
                 &self.scratch_attn_out,
                 &self.hidden_a,
                 self.hidden_size,
@@ -2329,8 +2348,8 @@ impl GpuForwardPass {
             // Batched gate/up projection: hidden_b -> scratch_gate, scratch_up
             self.encode_batched_matvec_q4_0_2(
                 &encoder,
-                &ffn.gate,
-                &ffn.up,
+                &ffn.gate.buffer, ffn.gate.offset,
+                &ffn.up.buffer, ffn.up.offset,
                 &self.hidden_b,
                 &self.scratch_gate,
                 &self.scratch_up,
@@ -2345,7 +2364,7 @@ impl GpuForwardPass {
             // Down projection + residual (fused): hidden_a += down(scratch_silu)
             self.encode_matvec_q4_0_accumulate(
                 &encoder,
-                &ffn.down,
+                &ffn.down.buffer, ffn.down.offset,
                 &self.scratch_silu,
                 &self.hidden_a,
                 self.hidden_size,
@@ -2362,28 +2381,30 @@ impl GpuForwardPass {
         );
 
         // Prefer Q8_0 lm_head (halves bandwidth vs F32 tied embeddings)
-        if let Some(q8_buf) = self.weight_store.lm_head_q8() {
+        if let Some(wb) = self.weight_store.lm_head_q8() {
             self.encode_matvec_q8_0(
                 &encoder,
-                q8_buf,
+                &wb.buffer, wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
                 self.hidden_size,
             );
         } else if self.weight_store.lm_head_is_f32() {
+            let wb = self.weight_store.lm_head();
             self.encode_matvec_f32(
                 &encoder,
-                self.weight_store.lm_head(),
+                &wb.buffer, wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
                 self.hidden_size,
             );
         } else {
+            let wb = self.weight_store.lm_head();
             self.encode_matvec_q4_0(
                 &encoder,
-                self.weight_store.lm_head(),
+                &wb.buffer, wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,

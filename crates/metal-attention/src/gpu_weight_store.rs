@@ -22,19 +22,37 @@ use metal_attention_models::registry::ModelConfig;
 /// Q4_0 block size in bytes: 2 byte fp16 scale + 16 byte nibbles = 18 bytes per 32 elements.
 const Q4_0_BLOCK_BYTES: usize = 18;
 
+/// Metal buffer with byte offset for page-aligned zero-copy from GGUF mmap.
+///
+/// When GGUF tensor data isn't page-aligned, we round the pointer down to the
+/// nearest page boundary and store the offset. The Metal buffer starts at the
+/// page boundary, and callers pass `offset` to `set_buffer()` so the GPU reads
+/// from the correct position within the buffer.
+pub struct WeightBuffer {
+    pub buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub offset: usize,
+}
+
+impl WeightBuffer {
+    /// Create a WeightBuffer with zero offset (for copy-based or naturally aligned buffers).
+    pub fn zero_offset(buffer: Retained<ProtocolObject<dyn MTLBuffer>>) -> Self {
+        Self { buffer, offset: 0 }
+    }
+}
+
 /// Per-layer attention projection buffers (Q/K/V/O weights, raw Q4_0).
 pub struct AttnProjBuffers {
-    pub q: Retained<ProtocolObject<dyn MTLBuffer>>,
-    pub k: Retained<ProtocolObject<dyn MTLBuffer>>,
-    pub v: Retained<ProtocolObject<dyn MTLBuffer>>,
-    pub o: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub q: WeightBuffer,
+    pub k: WeightBuffer,
+    pub v: WeightBuffer,
+    pub o: WeightBuffer,
 }
 
 /// Per-layer FFN buffers (gate/up/down weights, Q4_0).
 pub struct FfnBuffers {
-    pub gate: Retained<ProtocolObject<dyn MTLBuffer>>,
-    pub up: Retained<ProtocolObject<dyn MTLBuffer>>,
-    pub down: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub gate: WeightBuffer,
+    pub up: WeightBuffer,
+    pub down: WeightBuffer,
 }
 
 /// Per-layer norm weight buffers (F32).
@@ -57,13 +75,13 @@ pub struct GpuWeightStore {
     /// Token embedding buffer (F32).
     embed: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// LM head projection buffer (Q4_0 or F32 for tied embeddings).
-    lm_head: Retained<ProtocolObject<dyn MTLBuffer>>,
+    lm_head: WeightBuffer,
     /// Whether the lm_head buffer contains F32 data (true for tied embeddings).
     lm_head_is_f32: bool,
     /// Q8_0 lm_head buffer (if tied embeddings, keeps original Q8_0 for bandwidth savings).
-    lm_head_q8: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    lm_head_q8: Option<WeightBuffer>,
     /// Q6_K lm_head buffer (raw quantized, avoids 512MB F32 dequant).
-    lm_head_q6k: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    lm_head_q6k: Option<WeightBuffer>,
     /// Final RMSNorm weight buffer (F32).
     final_norm: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Keep the GGUF mmap alive while zero-copy buffers reference it.
@@ -92,41 +110,48 @@ fn validate_q4_0_size(tensor_name: &str, data_len: usize, n_elements: u64) -> Re
     Ok(())
 }
 
-/// Create a Metal buffer from GGUF tensor data, using zero-copy when page-aligned.
+/// Create a Metal buffer from GGUF tensor data with page-aligned zero-copy.
 ///
-/// Returns a zero-copy buffer if the data pointer is page-aligned, otherwise
-/// falls back to a copy-based buffer and logs a warning.
+/// Rounds the data pointer down to the nearest page boundary and creates a
+/// zero-copy buffer from there. The returned `WeightBuffer` includes the byte
+/// offset from the page boundary to the actual data start. This enables
+/// zero-copy for ALL tensors in the GGUF mmap, not just naturally page-aligned ones.
+///
+/// Falls back to copy-based allocation (with offset=0) if zero-copy fails.
 fn make_weight_buffer(
     device: &ProtocolObject<dyn MTLDevice>,
     data: &[u8],
     tensor_name: &str,
     page_size: usize,
-) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+) -> WeightBuffer {
     let ptr = data.as_ptr() as usize;
+    let aligned_ptr = ptr & !(page_size - 1);
+    let offset = ptr - aligned_ptr;
+    let aligned_len = offset + data.len();
 
-    if ptr.is_multiple_of(page_size) {
-        // Page-aligned: try zero-copy
-        if let Some(buf) = unsafe {
-            create_weight_buffer(device, data.as_ptr() as *mut std::ffi::c_void, data.len())
-        } {
-            return buf;
-        }
-        // Zero-copy failed (shouldn't happen for aligned data), fall through
-        eprintln!(
-            "Warning: zero-copy buffer creation failed for {tensor_name}, falling back to copy"
-        );
-    } else {
-        // Silently fall back to copy for non-aligned tensors (common for GGUF files).
-        // Set GPU_DEBUG=1 to see per-tensor alignment warnings.
-        if std::env::var("GPU_DEBUG").is_ok() {
+    // Try zero-copy from page-aligned address
+    if let Some(buf) = unsafe {
+        create_weight_buffer(
+            device,
+            aligned_ptr as *mut std::ffi::c_void,
+            aligned_len,
+        )
+    } {
+        if std::env::var("GPU_DEBUG").is_ok() && offset > 0 {
             eprintln!(
-                "  tensor {tensor_name} not page-aligned (offset 0x{:x}), using copy",
-                ptr % page_size,
+                "  tensor {tensor_name} zero-copy with offset={offset} (page-aligned from 0x{aligned_ptr:x})"
             );
         }
+        return WeightBuffer { buffer: buf, offset };
     }
 
-    alloc_buffer_with_data(device, data)
+    // Zero-copy failed, fall back to copy (offset=0 since we copy exact data)
+    if std::env::var("GPU_DEBUG").is_ok() {
+        eprintln!(
+            "  tensor {tensor_name} zero-copy failed, falling back to copy"
+        );
+    }
+    WeightBuffer::zero_offset(alloc_buffer_with_data(device, data))
 }
 
 /// Dequantize Q8_0 data to F32.
@@ -508,7 +533,7 @@ impl GpuWeightStore {
                     None,
                 ),
                 GgufType::F32 => (
-                    alloc_buffer_with_data(device, lm_data),
+                    WeightBuffer::zero_offset(alloc_buffer_with_data(device, lm_data)),
                     true,
                     None,
                     None,
@@ -527,7 +552,7 @@ impl GpuWeightStore {
                         lm_data.len() as f64 / 1_048_576.0,
                         byte_len as f64 / 1_048_576.0
                     );
-                    (alloc_buffer_with_data(device, bytes), true, None, Some(q6k_buf))
+                    (WeightBuffer::zero_offset(alloc_buffer_with_data(device, bytes)), true, None, Some(q6k_buf))
                 }
                 _ => {
                     // Unsupported quant type — dequantize to F32
@@ -548,7 +573,7 @@ impl GpuWeightStore {
                     let byte_len = f32_vec.len() * std::mem::size_of::<f32>();
                     let ptr = f32_vec.as_ptr() as *const u8;
                     let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
-                    (alloc_buffer_with_data(device, bytes), true, None, None)
+                    (WeightBuffer::zero_offset(alloc_buffer_with_data(device, bytes)), true, None, None)
                 }
             }
         } else {
@@ -571,7 +596,7 @@ impl GpuWeightStore {
                 }
             };
             (
-                alloc_buffer_with_data(device, &embed_f32_bytes),
+                WeightBuffer::zero_offset(alloc_buffer_with_data(device, &embed_f32_bytes)),
                 true,
                 q8_buf,
                 None,
@@ -619,8 +644,8 @@ impl GpuWeightStore {
         &self.embed
     }
 
-    /// Get the LM head projection buffer.
-    pub fn lm_head(&self) -> &ProtocolObject<dyn MTLBuffer> {
+    /// Get the LM head weight buffer.
+    pub fn lm_head(&self) -> &WeightBuffer {
         &self.lm_head
     }
 
@@ -630,13 +655,13 @@ impl GpuWeightStore {
     }
 
     /// Get the Q8_0 lm_head buffer (if available, for bandwidth-optimized lm_head).
-    pub fn lm_head_q8(&self) -> Option<&ProtocolObject<dyn MTLBuffer>> {
-        self.lm_head_q8.as_deref()
+    pub fn lm_head_q8(&self) -> Option<&WeightBuffer> {
+        self.lm_head_q8.as_ref()
     }
 
     /// Get the Q6_K lm_head buffer (if available, saves ~4x bandwidth vs F32 dequant).
-    pub fn lm_head_q6k(&self) -> Option<&ProtocolObject<dyn MTLBuffer>> {
-        self.lm_head_q6k.as_deref()
+    pub fn lm_head_q6k(&self) -> Option<&WeightBuffer> {
+        self.lm_head_q6k.as_ref()
     }
 
     /// Get the final RMSNorm weight buffer.
