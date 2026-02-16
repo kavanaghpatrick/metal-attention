@@ -236,6 +236,7 @@ impl GpuForwardPass {
         let mut pso_cache = PsoCache::new(device.library.clone());
         let mut pso_keys = vec![
             PsoKey::simple("matvec_q4_0_v5_coalesced"),
+            PsoKey::simple("matvec_q4_0_batched"),
             PsoKey::simple("rmsnorm_optimized"),
             PsoKey::simple("residual_add"),
             PsoKey::simple("residual_add_inplace"),
@@ -343,32 +344,19 @@ impl GpuForwardPass {
             // RMSNorm: hidden_a -> hidden_b (compute once, reuse for Q/K/V)
             self.encode_rmsnorm(&encoder, &self.hidden_a, &norms.attn_norm, &self.hidden_b);
 
-            // Q projection: hidden_b -> scratch_q
-            self.encode_matvec_q4_0(
+            // Batched Q/K/V projection: hidden_b -> scratch_q, scratch_k, scratch_v
+            // Single dispatch: 576+192+192 = 960 rows (was 3 separate dispatches)
+            self.encode_batched_matvec_q4_0(
                 &encoder,
                 &attn.q,
-                &self.hidden_b,
-                &self.scratch_q,
-                self.num_heads * self.head_dim,
-                self.hidden_size,
-            );
-
-            // K projection: hidden_b -> scratch_k
-            self.encode_matvec_q4_0(
-                &encoder,
                 &attn.k,
-                &self.hidden_b,
-                &self.scratch_k,
-                self.num_kv_heads * self.head_dim,
-                self.hidden_size,
-            );
-
-            // V projection: hidden_b -> scratch_v
-            self.encode_matvec_q4_0(
-                &encoder,
                 &attn.v,
                 &self.hidden_b,
+                &self.scratch_q,
+                &self.scratch_k,
                 &self.scratch_v,
+                self.num_heads * self.head_dim,
+                self.num_kv_heads * self.head_dim,
                 self.num_kv_heads * self.head_dim,
                 self.hidden_size,
             );
@@ -428,22 +416,16 @@ impl GpuForwardPass {
             // RMSNorm: hidden_a -> hidden_b (compute once, reuse for gate/up)
             self.encode_rmsnorm(&encoder, &self.hidden_a, &norms.ffn_norm, &self.hidden_b);
 
-            // Gate projection: hidden_b -> scratch_gate
-            self.encode_matvec_q4_0(
+            // Batched gate/up projection: hidden_b -> scratch_gate, scratch_up
+            // Single dispatch: 1536+1536 = 3072 rows (was 2 separate dispatches)
+            self.encode_batched_matvec_q4_0_2(
                 &encoder,
                 &ffn.gate,
-                &self.hidden_b,
-                &self.scratch_gate,
-                self.intermediate_size,
-                self.hidden_size,
-            );
-
-            // Up projection: hidden_b -> scratch_up
-            self.encode_matvec_q4_0(
-                &encoder,
                 &ffn.up,
                 &self.hidden_b,
+                &self.scratch_gate,
                 &self.scratch_up,
+                self.intermediate_size,
                 self.intermediate_size,
                 self.hidden_size,
             );
@@ -895,6 +877,89 @@ impl GpuForwardPass {
             depth: 1,
         };
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode batched Q4_0 matvec: up to 3 projections in a single dispatch.
+    /// Merges Q/K/V or gate/up into one dispatch, reducing dispatch overhead.
+    /// total_rows = dim_a + dim_b + dim_c, dispatched as one grid.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_batched_matvec_q4_0(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        weight_a: &ProtocolObject<dyn MTLBuffer>,
+        weight_b: &ProtocolObject<dyn MTLBuffer>,
+        weight_c: &ProtocolObject<dyn MTLBuffer>,
+        input_buf: &ProtocolObject<dyn MTLBuffer>,
+        output_a: &ProtocolObject<dyn MTLBuffer>,
+        output_b: &ProtocolObject<dyn MTLBuffer>,
+        output_c: &ProtocolObject<dyn MTLBuffer>,
+        dim_a: usize,
+        dim_b: usize,
+        dim_c: usize,
+        in_dim: usize,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("matvec_q4_0_batched"))
+            .expect("matvec_q4_0_batched PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, weight_a, 0, 0);
+        set_buffer(encoder, weight_b, 0, 1);
+        set_buffer(encoder, weight_c, 0, 2);
+        set_buffer(encoder, input_buf, 0, 3);
+        set_buffer(encoder, output_a, 0, 4);
+        set_buffer(encoder, output_b, 0, 5);
+        set_buffer(encoder, output_c, 0, 6);
+
+        let dims: [u32; 4] = [dim_a as u32, dim_b as u32, dim_c as u32, in_dim as u32];
+        set_bytes(encoder, &dims, 7);
+
+        let total_rows = dim_a + dim_b + dim_c;
+        const ROWS_PER_TG: usize = 8;
+        let grid = MTLSize {
+            width: (total_rows + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode batched Q4_0 matvec for 2 projections (dim_c=0).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_batched_matvec_q4_0_2(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        weight_a: &ProtocolObject<dyn MTLBuffer>,
+        weight_b: &ProtocolObject<dyn MTLBuffer>,
+        input_buf: &ProtocolObject<dyn MTLBuffer>,
+        output_a: &ProtocolObject<dyn MTLBuffer>,
+        output_b: &ProtocolObject<dyn MTLBuffer>,
+        dim_a: usize,
+        dim_b: usize,
+        in_dim: usize,
+    ) {
+        // Use the same batched kernel with weight_c=weight_a (ignored since dim_c=0)
+        // and output_c=output_a (ignored since dim_c=0)
+        self.encode_batched_matvec_q4_0(
+            encoder,
+            weight_a,
+            weight_b,
+            weight_a, // dummy, unused (dim_c=0)
+            input_buf,
+            output_a,
+            output_b,
+            output_a, // dummy, unused (dim_c=0)
+            dim_a,
+            dim_b,
+            0,
+            in_dim,
+        );
     }
 
     /// Encode v2 multi-row F32 matvec: weight * input -> output.
@@ -1366,32 +1431,18 @@ impl GpuForwardPass {
             // RMSNorm: hidden_a -> hidden_b (compute once, reuse for Q/K/V)
             self.encode_rmsnorm(&encoder, &self.hidden_a, &norms.attn_norm, &self.hidden_b);
 
-            // Q projection: hidden_b -> scratch_q
-            self.encode_matvec_q4_0(
+            // Batched Q/K/V projection: hidden_b -> scratch_q, scratch_k, scratch_v
+            self.encode_batched_matvec_q4_0(
                 &encoder,
                 &attn.q,
-                &self.hidden_b,
-                &self.scratch_q,
-                self.num_heads * self.head_dim,
-                self.hidden_size,
-            );
-
-            // K projection: hidden_b -> scratch_k
-            self.encode_matvec_q4_0(
-                &encoder,
                 &attn.k,
-                &self.hidden_b,
-                &self.scratch_k,
-                self.num_kv_heads * self.head_dim,
-                self.hidden_size,
-            );
-
-            // V projection: hidden_b -> scratch_v
-            self.encode_matvec_q4_0(
-                &encoder,
                 &attn.v,
                 &self.hidden_b,
+                &self.scratch_q,
+                &self.scratch_k,
                 &self.scratch_v,
+                self.num_heads * self.head_dim,
+                self.num_kv_heads * self.head_dim,
                 self.num_kv_heads * self.head_dim,
                 self.hidden_size,
             );
@@ -1444,22 +1495,15 @@ impl GpuForwardPass {
             // RMSNorm: hidden_a -> hidden_b (compute once, reuse for gate/up)
             self.encode_rmsnorm(&encoder, &self.hidden_a, &norms.ffn_norm, &self.hidden_b);
 
-            // Gate projection: hidden_b -> scratch_gate
-            self.encode_matvec_q4_0(
+            // Batched gate/up projection: hidden_b -> scratch_gate, scratch_up
+            self.encode_batched_matvec_q4_0_2(
                 &encoder,
                 &ffn.gate,
-                &self.hidden_b,
-                &self.scratch_gate,
-                self.intermediate_size,
-                self.hidden_size,
-            );
-
-            // Up projection: hidden_b -> scratch_up
-            self.encode_matvec_q4_0(
-                &encoder,
                 &ffn.up,
                 &self.hidden_b,
+                &self.scratch_gate,
                 &self.scratch_up,
+                self.intermediate_size,
                 self.intermediate_size,
                 self.hidden_size,
             );
