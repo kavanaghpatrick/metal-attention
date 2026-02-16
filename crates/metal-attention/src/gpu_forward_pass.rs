@@ -238,6 +238,8 @@ impl GpuForwardPass {
             PsoKey::simple("matvec_q4_0_v5_coalesced"),
             PsoKey::simple("matvec_q4_0_batched"),
             PsoKey::simple("matvec_q8_0"),
+            PsoKey::simple("matvec_q4_0_accumulate"),
+            PsoKey::simple("silu_matvec_q4_0_accumulate"),
             PsoKey::simple("rmsnorm_optimized"),
             PsoKey::simple("residual_add"),
             PsoKey::simple("residual_add_inplace"),
@@ -393,24 +395,17 @@ impl GpuForwardPass {
             // Re-fetch attn weights for O projection
             let attn = self.weight_store.attn_proj(layer_idx);
 
-            // O projection: scratch_attn_out -> scratch_o
-            self.encode_matvec_q4_0(
+            // O projection + residual (fused): hidden_a += O_proj(attn_out)
+            self.encode_matvec_q4_0_accumulate(
                 &encoder,
                 &attn.o,
                 &self.scratch_attn_out,
-                &self.scratch_o,
+                &self.hidden_a,
                 self.hidden_size,
                 self.num_heads * self.head_dim,
             );
 
-            // In-place residual add: hidden_a += scratch_o
-            self.encode_residual_add_inplace(
-                &encoder,
-                &self.hidden_a,
-                &self.scratch_o,
-            );
-
-            // --- FFN block: rmsnorm -> gate/up matvec + SwiGLU + down + residual ---
+            // --- FFN: rmsnorm -> gate/up matvec + fused SiLU+down+residual ---
             let norms = self.weight_store.norm(layer_idx);
             let ffn = self.weight_store.ffn(layer_idx);
 
@@ -418,7 +413,6 @@ impl GpuForwardPass {
             self.encode_rmsnorm(&encoder, &self.hidden_a, &norms.ffn_norm, &self.hidden_b);
 
             // Batched gate/up projection: hidden_b -> scratch_gate, scratch_up
-            // Single dispatch: 1536+1536 = 3072 rows (was 2 separate dispatches)
             self.encode_batched_matvec_q4_0_2(
                 &encoder,
                 &ffn.gate,
@@ -434,21 +428,14 @@ impl GpuForwardPass {
             // SwiGLU: silu(gate) * up -> scratch_silu
             self.encode_ffn_silu(&encoder);
 
-            // Down projection: scratch_silu -> scratch_ffn
-            self.encode_matvec_q4_0(
+            // Down projection + residual (fused): hidden_a += down(scratch_silu)
+            self.encode_matvec_q4_0_accumulate(
                 &encoder,
                 &ffn.down,
                 &self.scratch_silu,
-                &self.scratch_ffn,
+                &self.hidden_a,
                 self.hidden_size,
                 self.intermediate_size,
-            );
-
-            // In-place residual add: hidden_a += scratch_ffn
-            self.encode_residual_add_inplace(
-                &encoder,
-                &self.hidden_a,
-                &self.scratch_ffn,
             );
         }
 
@@ -1064,6 +1051,89 @@ impl GpuForwardPass {
     /// out_dim(4), in_dim(5), eps(6).
     /// Dispatch: grid=(out_dim, 1, 1) threadgroups, threadgroup=(32, 1, 1).
     #[allow(clippy::too_many_arguments)]
+    /// Encode Q4_0 matvec with accumulate: output[row] += dot(weight_row, input).
+    /// Fuses matvec + residual_add_inplace into a single dispatch.
+    fn encode_matvec_q4_0_accumulate(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        weight_buf: &ProtocolObject<dyn MTLBuffer>,
+        input_buf: &ProtocolObject<dyn MTLBuffer>,
+        output_buf: &ProtocolObject<dyn MTLBuffer>,
+        out_dim: usize,
+        in_dim: usize,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("matvec_q4_0_accumulate"))
+            .expect("matvec_q4_0_accumulate PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, weight_buf, 0, 0);
+        set_buffer(encoder, input_buf, 0, 1);
+        set_buffer(encoder, output_buf, 0, 2);
+
+        let out_dim_u32 = out_dim as u32;
+        let in_dim_u32 = in_dim as u32;
+        set_bytes(encoder, &out_dim_u32, 3);
+        set_bytes(encoder, &in_dim_u32, 4);
+
+        const ROWS_PER_TG: usize = 8;
+        let grid = MTLSize {
+            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Fused SiLU + Q4_0 down-projection matvec with accumulate.
+    /// output[row] += dot(weight_row, silu(gate) * up)
+    /// Saves 2 dispatches per layer (SiLU + residual_add_inplace).
+    fn encode_silu_matvec_q4_0_accumulate(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        weight_buf: &ProtocolObject<dyn MTLBuffer>,
+        gate_buf: &ProtocolObject<dyn MTLBuffer>,
+        up_buf: &ProtocolObject<dyn MTLBuffer>,
+        output_buf: &ProtocolObject<dyn MTLBuffer>,
+        out_dim: usize,
+        in_dim: usize,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("silu_matvec_q4_0_accumulate"))
+            .expect("silu_matvec_q4_0_accumulate PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, weight_buf, 0, 0);
+        set_buffer(encoder, gate_buf, 0, 1);
+        set_buffer(encoder, up_buf, 0, 2);
+        set_buffer(encoder, output_buf, 0, 3);
+
+        let out_dim_u32 = out_dim as u32;
+        let in_dim_u32 = in_dim as u32;
+        set_bytes(encoder, &out_dim_u32, 4);
+        set_bytes(encoder, &in_dim_u32, 5);
+
+        const ROWS_PER_TG: usize = 8;
+        let grid = MTLSize {
+            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
     fn encode_fused_rmsnorm_matvec_q4_0(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -1561,26 +1631,19 @@ impl GpuForwardPass {
                 kv_len,
             );
 
-            // O projection: scratch_attn_out -> scratch_o
+            // O projection + residual (fused): hidden_a += O_proj(attn_out)
             let attn = self.weight_store.attn_proj(layer_idx);
 
-            self.encode_matvec_q4_0(
+            self.encode_matvec_q4_0_accumulate(
                 &encoder,
                 &attn.o,
                 &self.scratch_attn_out,
-                &self.scratch_o,
+                &self.hidden_a,
                 self.hidden_size,
                 self.num_heads * self.head_dim,
             );
 
-            // In-place residual add: hidden_a += scratch_o
-            self.encode_residual_add_inplace(
-                &encoder,
-                &self.hidden_a,
-                &self.scratch_o,
-            );
-
-            // --- FFN: rmsnorm -> gate/up matvec + SwiGLU + down + residual ---
+            // --- FFN: rmsnorm -> gate/up matvec + fused SiLU+down+residual ---
             let norms = self.weight_store.norm(layer_idx);
             let ffn = self.weight_store.ffn(layer_idx);
 
@@ -1600,23 +1663,17 @@ impl GpuForwardPass {
                 self.hidden_size,
             );
 
+            // SwiGLU: silu(gate) * up -> scratch_silu
             self.encode_ffn_silu(&encoder);
 
-            // Down projection: scratch_silu -> scratch_ffn
-            self.encode_matvec_q4_0(
+            // Down projection + residual (fused): hidden_a += down(scratch_silu)
+            self.encode_matvec_q4_0_accumulate(
                 &encoder,
                 &ffn.down,
                 &self.scratch_silu,
-                &self.scratch_ffn,
+                &self.hidden_a,
                 self.hidden_size,
                 self.intermediate_size,
-            );
-
-            // In-place residual add: hidden_a += scratch_ffn
-            self.encode_residual_add_inplace(
-                &encoder,
-                &self.hidden_a,
-                &self.scratch_ffn,
             );
         }
 
