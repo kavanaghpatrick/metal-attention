@@ -60,6 +60,8 @@ pub struct GpuWeightStore {
     lm_head: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Whether the lm_head buffer contains F32 data (true for tied embeddings).
     lm_head_is_f32: bool,
+    /// Q8_0 lm_head buffer (if tied embeddings, keeps original Q8_0 for bandwidth savings).
+    lm_head_q8: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     /// Final RMSNorm weight buffer (F32).
     final_norm: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Keep the GGUF mmap alive while zero-copy buffers reference it.
@@ -321,18 +323,34 @@ impl GpuWeightStore {
         };
         let embed = alloc_buffer_with_data(device, &embed_f32_bytes);
 
-        // LM head: try output.weight first, fall back to tied embedding (already F32)
-        let (lm_head, lm_head_is_f32) = if let Some(lm_info) = gguf.find_tensor("output.weight") {
-            let lm_data = gguf.tensor_data(lm_info);
-            eprintln!("output.weight: type={:?}", lm_info.gguf_type);
-            (
-                make_weight_buffer(device, lm_data, "output.weight", page_size),
-                false,
-            )
-        } else {
-            eprintln!("output.weight not found, using tied F32 embedding for lm_head");
-            (alloc_buffer_with_data(device, &embed_f32_bytes), true)
-        };
+        // LM head: try output.weight first, fall back to tied embedding
+        let (lm_head, lm_head_is_f32, lm_head_q8) =
+            if let Some(lm_info) = gguf.find_tensor("output.weight") {
+                let lm_data = gguf.tensor_data(lm_info);
+                eprintln!("output.weight: type={:?}", lm_info.gguf_type);
+                (
+                    make_weight_buffer(device, lm_data, "output.weight", page_size),
+                    false,
+                    None,
+                )
+            } else {
+                // Tied embeddings: keep both F32 (for fallback) and Q8_0 (for bandwidth)
+                let q8_buf = if embed_info.gguf_type == GgufType::Q8_0 {
+                    eprintln!(
+                        "output.weight not found, using tied Q8_0 embedding for lm_head (bandwidth optimized)"
+                    );
+                    Some(make_weight_buffer(
+                        device,
+                        embed_data,
+                        "token_embd.weight(q8_lm_head)",
+                        page_size,
+                    ))
+                } else {
+                    eprintln!("output.weight not found, using tied F32 embedding for lm_head");
+                    None
+                };
+                (alloc_buffer_with_data(device, &embed_f32_bytes), true, q8_buf)
+            };
 
         // Final norm (F32, always copy)
         let final_norm_info = gguf
@@ -348,6 +366,7 @@ impl GpuWeightStore {
             embed,
             lm_head,
             lm_head_is_f32,
+            lm_head_q8,
             final_norm,
             _gguf: gguf,
         })
@@ -381,6 +400,11 @@ impl GpuWeightStore {
     /// Whether the lm_head contains F32 data (tied embeddings) vs Q4_0.
     pub fn lm_head_is_f32(&self) -> bool {
         self.lm_head_is_f32
+    }
+
+    /// Get the Q8_0 lm_head buffer (if available, for bandwidth-optimized lm_head).
+    pub fn lm_head_q8(&self) -> Option<&ProtocolObject<dyn MTLBuffer>> {
+        self.lm_head_q8.as_deref()
     }
 
     /// Get the final RMSNorm weight buffer.

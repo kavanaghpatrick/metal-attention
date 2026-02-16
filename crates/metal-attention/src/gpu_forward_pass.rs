@@ -237,11 +237,13 @@ impl GpuForwardPass {
         let mut pso_keys = vec![
             PsoKey::simple("matvec_q4_0_v5_coalesced"),
             PsoKey::simple("matvec_q4_0_batched"),
+            PsoKey::simple("matvec_q8_0"),
             PsoKey::simple("rmsnorm_optimized"),
             PsoKey::simple("residual_add"),
             PsoKey::simple("residual_add_inplace"),
             PsoKey::simple("decode_attention"),
             PsoKey::simple("rope_apply"),
+            PsoKey::simple("rope_apply_dual"),
             PsoKey::simple("ffn_silu"),
             PsoKey::simple("kv_cache_copy"),
             PsoKey::simple("buffer_copy"),
@@ -361,9 +363,8 @@ impl GpuForwardPass {
                 self.hidden_size,
             );
 
-            // RoPE on Q and K
-            self.encode_rope(&encoder, &self.scratch_q, self.num_heads);
-            self.encode_rope(&encoder, &self.scratch_k, self.num_kv_heads);
+            // RoPE on Q and K (single dual-buffer dispatch)
+            self.encode_rope_dual(&encoder, &self.scratch_q, &self.scratch_k);
 
             // --- GPU-side KV cache append ---
             // Dispatches kv_cache_copy kernel, increments cache len on CPU.
@@ -459,7 +460,17 @@ impl GpuForwardPass {
             &self.hidden_b,
         );
 
-        if self.weight_store.lm_head_is_f32() {
+        // Prefer Q8_0 lm_head (halves bandwidth vs F32 tied embeddings)
+        if let Some(q8_buf) = self.weight_store.lm_head_q8() {
+            self.encode_matvec_q8_0(
+                &encoder,
+                q8_buf,
+                &self.hidden_b,
+                &self.logits_buf,
+                self.vocab_size,
+                self.hidden_size,
+            );
+        } else if self.weight_store.lm_head_is_f32() {
             self.encode_matvec_f32(
                 &encoder,
                 self.weight_store.lm_head(),
@@ -1003,6 +1014,46 @@ impl GpuForwardPass {
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 
+    /// Encode Q8_0 matvec: weight * input -> output.
+    /// Same dispatch geometry as Q4_0 v5: 256 threads, 8 rows/TG.
+    fn encode_matvec_q8_0(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        weight_buf: &ProtocolObject<dyn MTLBuffer>,
+        input_buf: &ProtocolObject<dyn MTLBuffer>,
+        output_buf: &ProtocolObject<dyn MTLBuffer>,
+        out_dim: usize,
+        in_dim: usize,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("matvec_q8_0"))
+            .expect("matvec_q8_0 PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, weight_buf, 0, 0);
+        set_buffer(encoder, input_buf, 0, 1);
+        set_buffer(encoder, output_buf, 0, 2);
+
+        let out_dim_u32 = out_dim as u32;
+        let in_dim_u32 = in_dim as u32;
+        set_bytes(encoder, &out_dim_u32, 3);
+        set_bytes(encoder, &in_dim_u32, 4);
+
+        const ROWS_PER_TG: usize = 8;
+        let grid = MTLSize {
+            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
     /// Encode fused RMSNorm + Q4_0 Matvec: rmsnorm(input) * dequant(weight) -> output.
     ///
     /// Eliminates the intermediate normalized buffer by computing RMS inline.
@@ -1133,6 +1184,48 @@ impl GpuForwardPass {
         };
         let tg = MTLSize {
             width: 32,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode dual-buffer RoPE: apply RoPE to both Q and K in a single dispatch.
+    /// Saves one dispatch per layer vs. two separate rope_apply calls.
+    fn encode_rope_dual(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        q_buf: &ProtocolObject<dyn MTLBuffer>,
+        k_buf: &ProtocolObject<dyn MTLBuffer>,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("rope_apply_dual"))
+            .expect("rope_apply_dual PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, q_buf, 0, 0);
+        set_buffer(encoder, k_buf, 0, 1);
+
+        let num_q_heads_u32 = self.num_heads as u32;
+        let num_k_heads_u32 = self.num_kv_heads as u32;
+        let head_dim_u32 = self.head_dim as u32;
+        let position_u32 = self.position as u32;
+        set_bytes(encoder, &num_q_heads_u32, 2);
+        set_bytes(encoder, &num_k_heads_u32, 3);
+        set_bytes(encoder, &head_dim_u32, 4);
+        set_bytes(encoder, &position_u32, 5);
+        set_bytes(encoder, &self.rope_theta, 6);
+
+        let total_pairs =
+            (self.num_heads + self.num_kv_heads) * self.head_dim / 2;
+        let grid = MTLSize {
+            width: total_pairs,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
             height: 1,
             depth: 1,
         };
@@ -1447,8 +1540,7 @@ impl GpuForwardPass {
                 self.hidden_size,
             );
 
-            self.encode_rope(&encoder, &self.scratch_q, self.num_heads);
-            self.encode_rope(&encoder, &self.scratch_k, self.num_kv_heads);
+            self.encode_rope_dual(&encoder, &self.scratch_q, &self.scratch_k);
 
             self.kv_caches.cache_mut(layer_idx).encode_kv_append(
                 &encoder,
@@ -1536,7 +1628,17 @@ impl GpuForwardPass {
             &self.hidden_b,
         );
 
-        if self.weight_store.lm_head_is_f32() {
+        // Prefer Q8_0 lm_head (halves bandwidth vs F32 tied embeddings)
+        if let Some(q8_buf) = self.weight_store.lm_head_q8() {
+            self.encode_matvec_q8_0(
+                &encoder,
+                q8_buf,
+                &self.hidden_b,
+                &self.logits_buf,
+                self.vocab_size,
+                self.hidden_size,
+            );
+        } else if self.weight_store.lm_head_is_f32() {
             self.encode_matvec_f32(
                 &encoder,
                 self.weight_store.lm_head(),
