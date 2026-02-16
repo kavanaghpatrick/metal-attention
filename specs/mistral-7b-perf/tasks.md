@@ -48,7 +48,7 @@ Focus: Native Q6_K matvec kernel + integration. Proves Q6_K works, eliminates 40
   - _Requirements: FR-7_
   - _Design: Component 1_
 
-- [ ] 1.5 Q6_K kernel correctness test
+- [x] 1.5 Q6_K kernel correctness test
   - **Do**: Add test `test_matvec_q6_k_gpu_vs_cpu` in `tests/gpu_correctness.rs`. Create synthetic Q6_K blocks with known values, run through GPU kernel, compare against Rust `dequantize_q6_k_to_f32` + F32 dot product. Test dimensions: (256, 256) small case and (4096, 32000) Mistral lm_head dims. Tolerance: atol=5e-2 for matvec output (quantization error).
   - **Files**: `crates/metal-attention/tests/gpu_correctness.rs`
   - **Done when**: Test passes with `cargo test --test gpu_correctness -- test_matvec_q6_k --test-threads=1`
