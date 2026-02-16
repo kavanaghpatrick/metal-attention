@@ -185,3 +185,56 @@ fn test_gpu_vs_cpu_greedy_match() {
          GPU={gpu_tokens:?} CPU={cpu_tokens:?}"
     );
 }
+
+/// Verify that forward_prompt (batched prefill) produces the same output
+/// token as sequential forward_token_greedy calls.
+///
+/// Tests with two different prompt lengths to cover both short and medium
+/// batch sizes. Both paths should produce identical output tokens since
+/// they use the same Q4_0 matvec kernels (just batched vs individual).
+#[test]
+#[ignore]
+fn test_forward_prompt_matches_sequential() {
+    let path = model_path();
+    assert!(
+        path.exists(),
+        "Model file not found: {path:?}. Download SmolLM-135M.Q4_0.gguf first."
+    );
+    let path = path.as_path();
+
+    // Test with prompts of different lengths
+    let test_prompts: &[&[u32]] = &[
+        &[1, 2, 3, 4, 5, 6, 7],           // 7 tokens
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10,  // 32 tokens
+          11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+          21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+          31, 32],
+    ];
+
+    for prompt in test_prompts {
+        // --- Sequential path ---
+        let mut gpu_seq = GpuForwardPass::from_gguf(path).expect("Failed to load GPU model");
+        for &tok in &prompt[..prompt.len() - 1] {
+            let _ = gpu_seq.forward_token(tok).expect("sequential forward_token failed");
+        }
+        let seq_token = gpu_seq
+            .forward_token_greedy(*prompt.last().unwrap())
+            .expect("sequential forward_token_greedy failed");
+
+        // --- Batched path ---
+        let mut gpu_batch = GpuForwardPass::from_gguf(path).expect("Failed to load GPU model");
+        let batch_token = gpu_batch
+            .forward_prompt(prompt)
+            .expect("forward_prompt failed");
+
+        eprintln!(
+            "Prompt len={}: sequential={seq_token}, batched={batch_token}",
+            prompt.len()
+        );
+        assert_eq!(
+            seq_token, batch_token,
+            "forward_prompt output differs from sequential path for prompt len={}",
+            prompt.len()
+        );
+    }
+}

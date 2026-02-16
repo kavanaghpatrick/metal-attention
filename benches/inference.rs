@@ -163,5 +163,54 @@ fn bench_cpu_decode(c: &mut Criterion) {
     eprintln!("CPU decode benchmark complete ({DECODE_TOKENS} tokens/iteration)");
 }
 
-criterion_group!(benches, bench_gpu_decode, bench_cpu_decode);
+/// Benchmark GPU batched prefill throughput with forward_prompt.
+///
+/// Measures tok/s for multi-token batched prefill at various prompt lengths.
+/// Uses forward_prompt which batches matvec operations for SLC cache reuse.
+fn bench_gpu_prefill(c: &mut Criterion) {
+    let path = model_path();
+    if !path.exists() {
+        eprintln!(
+            "SKIP bench_gpu_prefill: model not found at {}",
+            path.display()
+        );
+        return;
+    }
+
+    let mut gpu = GpuForwardPass::from_gguf(&path).expect("Failed to load GPU model");
+
+    // Warmup
+    for &tok in PREFILL_TOKENS {
+        let _ = gpu.forward_token(tok).expect("GPU warmup prefill failed");
+    }
+    gpu.reset();
+
+    let mut group = c.benchmark_group("prefill_throughput");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(15));
+
+    for &prompt_len in &[16u64, 32, 64, 128, 256] {
+        // Generate a synthetic prompt of the given length
+        let prompt: Vec<u32> = (1..=prompt_len as u32).collect();
+
+        group.throughput(criterion::Throughput::Elements(prompt_len));
+        group.bench_function(format!("gpu_prefill_{prompt_len}tok"), |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    gpu.reset();
+                    let start = std::time::Instant::now();
+                    let _ = gpu.forward_prompt(&prompt).expect("GPU prefill failed");
+                    total += start.elapsed();
+                }
+                total
+            })
+        });
+    }
+
+    group.finish();
+    eprintln!("GPU prefill benchmark complete");
+}
+
+criterion_group!(benches, bench_gpu_decode, bench_cpu_decode, bench_gpu_prefill);
 criterion_main!(benches);
