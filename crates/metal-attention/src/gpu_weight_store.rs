@@ -62,6 +62,8 @@ pub struct GpuWeightStore {
     lm_head_is_f32: bool,
     /// Q8_0 lm_head buffer (if tied embeddings, keeps original Q8_0 for bandwidth savings).
     lm_head_q8: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    /// Q6_K lm_head buffer (raw quantized, avoids 512MB F32 dequant).
+    lm_head_q6k: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     /// Final RMSNorm weight buffer (F32).
     final_norm: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Keep the GGUF mmap alive while zero-copy buffers reference it.
@@ -132,6 +134,160 @@ fn make_weight_buffer(
 /// Q8_0 block: 2 bytes fp16 scale (half d) + 32 bytes signed int8 values.
 /// Total: 34 bytes per 32 elements.
 /// Dequant: value = qs[i] * d
+/// Dequantize Q5_K super-blocks (256 elements each, 176 bytes per block).
+///
+/// Layout per super-block (176 bytes):
+///   - 2 bytes: fp16 d (scale)
+///   - 2 bytes: fp16 dmin (min value)
+///   - 12 bytes: scales/mins for 8 sub-blocks (6 bits each, packed)
+///   - 32 bytes: qh — high bit for each of 256 values
+///   - 128 bytes: qs — low 4 bits, packed in sub-block pairs
+fn dequantize_q5_k_to_f32(data: &[u8], n_elements: usize) -> Vec<f32> {
+    const QK: usize = 256;
+    const BLOCK_BYTES: usize = 176;
+    let n_blocks = n_elements / QK;
+    let mut out = vec![0.0f32; n_elements];
+
+    for b in 0..n_blocks {
+        let bp = b * BLOCK_BYTES;
+
+        let d = half::f16::from_bits(u16::from_le_bytes([data[bp], data[bp + 1]])).to_f32();
+        let dmin =
+            half::f16::from_bits(u16::from_le_bytes([data[bp + 2], data[bp + 3]])).to_f32();
+
+        // Unpack 6-bit scales and mins for 8 sub-blocks from 12 bytes
+        let scales_raw = &data[bp + 4..bp + 16];
+        let mut sc = [0u8; 8];
+        let mut mn = [0u8; 8];
+        for i in 0..8 {
+            if i < 4 {
+                sc[i] = scales_raw[i] & 0x3F;
+                mn[i] = scales_raw[i + 4] & 0x3F;
+            } else {
+                sc[i] = (scales_raw[i + 4] & 0x0F) | ((scales_raw[i - 4] >> 6) << 4);
+                mn[i] = (scales_raw[i + 4] >> 4) | ((scales_raw[i] >> 6) << 4);
+            }
+        }
+
+        let qh = &data[bp + 16..bp + 48]; // 32 bytes = 256 bits
+        let qs = &data[bp + 48..bp + 176]; // 128 bytes (sub-block pair packed)
+
+        // Process 4 pairs of sub-blocks (j=0..3), each pair = 64 elements
+        for j in 0..4 {
+            let sc1 = sc[2 * j] as f32;
+            let mn1 = mn[2 * j] as f32;
+            let sc2 = sc[2 * j + 1] as f32;
+            let mn2 = mn[2 * j + 1] as f32;
+            let q = &qs[32 * j..32 * (j + 1)]; // 32 bytes for this pair
+
+            for l in 0..32 {
+                let elem1 = 64 * j + l;
+                let elem2 = 64 * j + 32 + l;
+
+                // High bits: qh[l] packs 8 bits across all 4 pairs.
+                // Bit (2*j)   → first sub-block, bit (2*j+1) → second
+                let h1 = ((qh[l] >> (2 * j)) & 1) as u32;
+                let h2 = ((qh[l] >> (2 * j + 1)) & 1) as u32;
+
+                let q4_1 = (q[l] & 0x0F) as u32;
+                let q4_2 = (q[l] >> 4) as u32;
+
+                let q5_1 = q4_1 | (h1 << 4); // 5-bit value [0, 31]
+                let q5_2 = q4_2 | (h2 << 4);
+
+                out[b * QK + elem1] = d * sc1 * (q5_1 as f32) - dmin * mn1;
+                out[b * QK + elem2] = d * sc2 * (q5_2 as f32) - dmin * mn2;
+            }
+        }
+    }
+
+    out
+}
+
+/// Dequantize Q6_K super-blocks (256 elements each, 210 bytes per block).
+///
+/// Layout per super-block (210 bytes):
+///   - 128 bytes: ql — low 4 bits of 6-bit values
+///   - 64 bytes: qh — upper 2 bits of 6-bit values
+///   - 16 bytes: scales — signed int8 scales for 16 sub-blocks
+///   - 2 bytes: d — fp16 super-block scale
+fn dequantize_q6_k_to_f32(data: &[u8], n_elements: usize) -> Vec<f32> {
+    const QK: usize = 256;
+    const BLOCK_BYTES: usize = 210;
+    let n_blocks = n_elements / QK;
+    let mut out = vec![0.0f32; n_elements];
+
+    for b in 0..n_blocks {
+        let bp = b * BLOCK_BYTES;
+        let ql = &data[bp..bp + 128];
+        let qh = &data[bp + 128..bp + 192];
+        let scales = &data[bp + 192..bp + 208];
+        let d = half::f16::from_bits(u16::from_le_bytes([data[bp + 208], data[bp + 209]]))
+            .to_f32();
+
+        // Process two 128-element chunks (n=0, n=128)
+        for chunk in 0..2 {
+            let ql_off = chunk * 64;
+            let qh_off = chunk * 32;
+            let sc_off = chunk * 8;
+            let out_off = b * QK + chunk * 128;
+
+            for l in 0..32 {
+                let is = l / 16; // 0 or 1
+
+                // Reconstruct 6-bit values: 4 low bits from ql + 2 high bits from qh
+                let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32
+                    - 32;
+                let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4))
+                    as i32
+                    - 32;
+                let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32
+                    - 32;
+                let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4))
+                    as i32
+                    - 32;
+
+                let sc0 = scales[sc_off + is] as i8 as f32;
+                let sc1 = scales[sc_off + is + 2] as i8 as f32;
+                let sc2 = scales[sc_off + is + 4] as i8 as f32;
+                let sc3 = scales[sc_off + is + 6] as i8 as f32;
+
+                out[out_off + l] = d * sc0 * q1 as f32;
+                out[out_off + l + 32] = d * sc1 * q2 as f32;
+                out[out_off + l + 64] = d * sc2 * q3 as f32;
+                out[out_off + l + 96] = d * sc3 * q4 as f32;
+            }
+        }
+    }
+
+    out
+}
+
+fn dequantize_q4_0_to_f32(data: &[u8], n_elements: usize) -> Vec<f32> {
+    let n_blocks = n_elements / 32;
+    let mut out = vec![0.0f32; n_elements];
+
+    for b in 0..n_blocks {
+        let block_offset = b * 18; // 18 bytes per Q4_0 block: 2 (fp16 scale) + 16 (32 nibbles)
+
+        // Read fp16 scale (little-endian)
+        let d_bits = u16::from_le_bytes([data[block_offset], data[block_offset + 1]]);
+        let d = half::f16::from_bits(d_bits).to_f32();
+
+        // Q4_0 layout: bytes 0-15, low nibble → elements 0-15
+        //              bytes 0-15, high nibble → elements 16-31
+        for i in 0..16 {
+            let byte = data[block_offset + 2 + i];
+            let lo = (byte & 0x0F) as i32 - 8;
+            let hi = ((byte >> 4) & 0x0F) as i32 - 8;
+            out[b * 32 + i] = lo as f32 * d;
+            out[b * 32 + i + 16] = hi as f32 * d;
+        }
+    }
+
+    out
+}
+
 fn dequantize_q8_0_to_f32(data: &[u8], n_elements: usize) -> Vec<f32> {
     let n_blocks = n_elements / 32;
     let mut out = vec![0.0f32; n_elements];
@@ -309,51 +465,116 @@ impl GpuWeightStore {
                 let n_elements = embed_info.shape.iter().product::<u64>() as usize;
                 eprintln!("token_embd.weight: Q8_0, dequantizing {n_elements} elements to F32");
                 let f32_vec = dequantize_q8_0_to_f32(embed_data, n_elements);
-                // Safety: reinterpret Vec<f32> as bytes
+                let byte_len = f32_vec.len() * std::mem::size_of::<f32>();
+                let ptr = f32_vec.as_ptr() as *const u8;
+                unsafe { std::slice::from_raw_parts(ptr, byte_len) }.to_vec()
+            }
+            GgufType::Q4_0 => {
+                let n_elements = embed_info.shape.iter().product::<u64>() as usize;
+                eprintln!("token_embd.weight: Q4_0, dequantizing {n_elements} elements to F32");
+                let f32_vec = dequantize_q4_0_to_f32(embed_data, n_elements);
                 let byte_len = f32_vec.len() * std::mem::size_of::<f32>();
                 let ptr = f32_vec.as_ptr() as *const u8;
                 unsafe { std::slice::from_raw_parts(ptr, byte_len) }.to_vec()
             }
             other => {
                 return Err(format!(
-                    "Unsupported embedding type: {:?}. Expected F32 or Q8_0.",
+                    "Unsupported embedding type: {:?}. Expected F32, Q8_0, or Q4_0.",
                     other
                 ));
             }
         };
         let embed = alloc_buffer_with_data(device, &embed_f32_bytes);
 
-        // LM head: try output.weight first, fall back to tied embedding
-        let (lm_head, lm_head_is_f32, lm_head_q8) = if let Some(lm_info) =
+        // LM head: try output.weight first, fall back to tied embedding.
+        // Supported native types: Q4_0, Q8_0, Q6_K (native kernel), F32.
+        // Q5_K still dequantized to F32 at load time.
+        let (lm_head, lm_head_is_f32, lm_head_q8, lm_head_q6k) = if let Some(lm_info) =
             gguf.find_tensor("output.weight")
         {
             let lm_data = gguf.tensor_data(lm_info);
             eprintln!("output.weight: type={:?}", lm_info.gguf_type);
-            (
-                make_weight_buffer(device, lm_data, "output.weight", page_size),
-                false,
-                None,
-            )
+            match lm_info.gguf_type {
+                GgufType::Q4_0 => (
+                    make_weight_buffer(device, lm_data, "output.weight", page_size),
+                    false,
+                    None,
+                    None,
+                ),
+                GgufType::Q8_0 => (
+                    make_weight_buffer(device, lm_data, "output.weight", page_size),
+                    false,
+                    Some(make_weight_buffer(device, lm_data, "output.weight(q8)", page_size)),
+                    None,
+                ),
+                GgufType::F32 => (
+                    alloc_buffer_with_data(device, lm_data),
+                    true,
+                    None,
+                    None,
+                ),
+                GgufType::Q6_K => {
+                    // Native Q6_K kernel: store raw Q6_K buffer (108 MB vs 512 MB F32)
+                    let q6k_buf = make_weight_buffer(device, lm_data, "output.weight(q6k)", page_size);
+                    // Also dequantize to F32 as fallback
+                    let n_elements = lm_info.shape.iter().product::<u64>() as usize;
+                    let f32_vec = dequantize_q6_k_to_f32(lm_data, n_elements);
+                    let byte_len = f32_vec.len() * std::mem::size_of::<f32>();
+                    let ptr = f32_vec.as_ptr() as *const u8;
+                    let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                    eprintln!(
+                        "  Q6_K output.weight: native kernel ({:.1} MB) + F32 fallback ({:.1} MB)",
+                        lm_data.len() as f64 / 1_048_576.0,
+                        byte_len as f64 / 1_048_576.0
+                    );
+                    (alloc_buffer_with_data(device, bytes), true, None, Some(q6k_buf))
+                }
+                _ => {
+                    // Unsupported quant type — dequantize to F32
+                    let n_elements = lm_info.shape.iter().product::<u64>() as usize;
+                    eprintln!(
+                        "  Dequantizing {:?} output.weight ({} elements) to F32",
+                        lm_info.gguf_type, n_elements
+                    );
+                    let f32_vec = match lm_info.gguf_type {
+                        GgufType::Q5_K => dequantize_q5_k_to_f32(lm_data, n_elements),
+                        _ => {
+                            return Err(format!(
+                                "Unsupported output.weight type: {:?}. Cannot dequantize.",
+                                lm_info.gguf_type
+                            ));
+                        }
+                    };
+                    let byte_len = f32_vec.len() * std::mem::size_of::<f32>();
+                    let ptr = f32_vec.as_ptr() as *const u8;
+                    let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                    (alloc_buffer_with_data(device, bytes), true, None, None)
+                }
+            }
         } else {
-            // Tied embeddings: keep both F32 (for fallback) and Q8_0 (for bandwidth)
-            let q8_buf = if embed_info.gguf_type == GgufType::Q8_0 {
-                eprintln!(
+            // Tied embeddings: keep Q8_0/Q4_0 raw buffer for bandwidth-optimized lm_head
+            let q8_buf = match embed_info.gguf_type {
+                GgufType::Q8_0 => {
+                    eprintln!(
                         "output.weight not found, using tied Q8_0 embedding for lm_head (bandwidth optimized)"
                     );
-                Some(make_weight_buffer(
-                    device,
-                    embed_data,
-                    "token_embd.weight(q8_lm_head)",
-                    page_size,
-                ))
-            } else {
-                eprintln!("output.weight not found, using tied F32 embedding for lm_head");
-                None
+                    Some(make_weight_buffer(
+                        device,
+                        embed_data,
+                        "token_embd.weight(q8_lm_head)",
+                        page_size,
+                    ))
+                }
+                _ => {
+                    eprintln!("output.weight not found, using tied F32 embedding for lm_head");
+                    None
+                }
             };
             (
                 alloc_buffer_with_data(device, &embed_f32_bytes),
                 true,
                 q8_buf,
+                None,
             )
         };
 
@@ -372,6 +593,7 @@ impl GpuWeightStore {
             lm_head,
             lm_head_is_f32,
             lm_head_q8,
+            lm_head_q6k,
             final_norm,
             _gguf: gguf,
         })
@@ -410,6 +632,11 @@ impl GpuWeightStore {
     /// Get the Q8_0 lm_head buffer (if available, for bandwidth-optimized lm_head).
     pub fn lm_head_q8(&self) -> Option<&ProtocolObject<dyn MTLBuffer>> {
         self.lm_head_q8.as_deref()
+    }
+
+    /// Get the Q6_K lm_head buffer (if available, saves ~4x bandwidth vs F32 dequant).
+    pub fn lm_head_q6k(&self) -> Option<&ProtocolObject<dyn MTLBuffer>> {
+        self.lm_head_q6k.as_deref()
     }
 
     /// Get the final RMSNorm weight buffer.

@@ -155,11 +155,16 @@ impl GpuForwardPass {
             .get_u32("llama.feed_forward_length")
             .unwrap_or(1536) as usize;
 
-        // Vocab size: try metadata, fall back to embed tensor shape
+        // Vocab size: try metadata, fall back to embed tensor shape.
+        // GGUF stores 2D tensors as [columns, rows] so vocab_size is shape[1].
         let vocab_size = if let Some(v) = gguf.metadata.get_u32("llama.vocab_size") {
             v as usize
         } else if let Some(embed_info) = gguf.find_tensor("token_embd.weight") {
-            embed_info.shape[0] as usize
+            if embed_info.shape.len() >= 2 {
+                embed_info.shape[1] as usize
+            } else {
+                embed_info.shape[0] as usize
+            }
         } else {
             49152 // SmolLM-135M default
         };
@@ -291,6 +296,11 @@ impl GpuForwardPass {
         if weight_store.lm_head_is_f32() {
             pso_keys.push(PsoKey::simple("matvec_f32_v2"));
             pso_keys.push(PsoKey::simple("rmsnorm_matvec_f32"));
+        }
+        if weight_store.lm_head_q6k().is_some() {
+            pso_keys.push(PsoKey::simple("matvec_q6_k"));
+            pso_keys.push(PsoKey::simple("multi_token_matvec_q6_k"));
+            pso_keys.push(PsoKey::simple("multi_token_matvec_q6_k_accumulate"));
         }
         pso_cache.prewarm(&pso_keys);
 
@@ -486,8 +496,17 @@ impl GpuForwardPass {
             &self.hidden_b,
         );
 
-        // Prefer Q8_0 lm_head (halves bandwidth vs F32 tied embeddings)
-        if let Some(q8_buf) = self.weight_store.lm_head_q8() {
+        // Prefer Q6_K > Q8_0 > F32 > Q4_0 for lm_head (bandwidth optimization)
+        if let Some(q6k_buf) = self.weight_store.lm_head_q6k() {
+            self.encode_matvec_q6_k(
+                &encoder,
+                q6k_buf,
+                &self.hidden_b,
+                &self.logits_buf,
+                self.vocab_size,
+                self.hidden_size,
+            );
+        } else if let Some(q8_buf) = self.weight_store.lm_head_q8() {
             self.encode_matvec_q8_0(
                 &encoder,
                 q8_buf,
@@ -849,7 +868,17 @@ impl GpuForwardPass {
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_1, tg_32);
 
         // lm_head: hidden_b -> logits_buf (single token, reuse existing buffers)
-        if let Some(q8_buf) = self.weight_store.lm_head_q8() {
+        // Prefer Q6_K > Q8_0 > F32 > Q4_0
+        if let Some(q6k_buf) = self.weight_store.lm_head_q6k() {
+            self.encode_matvec_q6_k(
+                &encoder,
+                q6k_buf,
+                &self.hidden_b,
+                &self.logits_buf,
+                self.vocab_size,
+                h,
+            );
+        } else if let Some(q8_buf) = self.weight_store.lm_head_q8() {
             self.encode_matvec_q8_0(
                 &encoder,
                 q8_buf,
@@ -1371,6 +1400,46 @@ impl GpuForwardPass {
             .pso_cache
             .get(&PsoKey::simple("matvec_f32_v2"))
             .expect("matvec_f32_v2 PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, weight_buf, 0, 0);
+        set_buffer(encoder, input_buf, 0, 1);
+        set_buffer(encoder, output_buf, 0, 2);
+
+        let out_dim_u32 = out_dim as u32;
+        let in_dim_u32 = in_dim as u32;
+        set_bytes(encoder, &out_dim_u32, 3);
+        set_bytes(encoder, &in_dim_u32, 4);
+
+        const ROWS_PER_TG: usize = 8;
+        let grid = MTLSize {
+            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode Q6_K matvec: weight * input -> output.
+    /// Raw byte buffer with 210-byte super-blocks. 256 threads, 8 rows/TG.
+    fn encode_matvec_q6_k(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        weight_buf: &ProtocolObject<dyn MTLBuffer>,
+        input_buf: &ProtocolObject<dyn MTLBuffer>,
+        output_buf: &ProtocolObject<dyn MTLBuffer>,
+        out_dim: usize,
+        in_dim: usize,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("matvec_q6_k"))
+            .expect("matvec_q6_k PSO not prewarmed");
 
         encoder.setComputePipelineState(pso);
         set_buffer(encoder, weight_buf, 0, 0);
