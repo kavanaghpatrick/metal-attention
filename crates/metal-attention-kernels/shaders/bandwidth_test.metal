@@ -222,7 +222,7 @@ kernel void megakernel_rmsnorm_matvec(
 // Inner loop processes all batch_size tokens for that row.
 // ---------------------------------------------------------------------------
 
-kernel void multi_token_matvec_q4_0(
+kernel void bench_multi_token_matvec_q4_0(
     device const BlockQ4_0* weight  [[buffer(0)]],
     device const float*     input   [[buffer(1)]],  // [batch_size, in_dim]
     device float*           output  [[buffer(2)]],  // [batch_size, out_dim]

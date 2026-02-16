@@ -174,6 +174,53 @@ impl GpuKVCache {
         self.len += 1;
     }
 
+    /// GPU-side KV cache append with source buffer offsets.
+    ///
+    /// Same as `encode_kv_append` but reads K/V from `src_offset` bytes
+    /// into the source buffers. Used by `forward_prompt` to index into
+    /// batch K/V buffers for per-token append.
+    pub fn encode_kv_append_offset(
+        &mut self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        pso: &ProtocolObject<dyn MTLComputePipelineState>,
+        k_src: &ProtocolObject<dyn MTLBuffer>,
+        v_src: &ProtocolObject<dyn MTLBuffer>,
+        src_offset: usize,
+    ) {
+        assert!(
+            self.len < self.max_len,
+            "KV cache full: len={} >= max_len={}",
+            self.len,
+            self.max_len
+        );
+
+        encoder.setComputePipelineState(pso);
+
+        set_buffer(encoder, k_src, src_offset, 0);
+        set_buffer(encoder, v_src, src_offset, 1);
+        set_buffer(encoder, &self.k_buf, 0, 2);
+        set_buffer(encoder, &self.v_buf, 0, 3);
+
+        let kv_dim_u32 = self.kv_dim as u32;
+        let row_idx_u32 = self.len as u32;
+        set_bytes(encoder, &kv_dim_u32, 4);
+        set_bytes(encoder, &row_idx_u32, 5);
+
+        let grid_size = MTLSize {
+            width: self.kv_dim,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup_size = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+
+        self.len += 1;
+    }
+
     /// Get the key cache buffer.
     pub fn k_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
         &self.k_buf

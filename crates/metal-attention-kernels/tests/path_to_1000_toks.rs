@@ -53,7 +53,7 @@ fn experiment_suite() {
         PsoKey::simple("matvec_q4_0_batched"),
         PsoKey::simple("rmsnorm"),
         PsoKey::simple("megakernel_rmsnorm_matvec"),
-        PsoKey::simple("multi_token_matvec_q4_0"),
+        PsoKey::simple("bench_multi_token_matvec_q4_0"),
     ]);
 
     eprintln!("\n{}", "=".repeat(80));
@@ -555,7 +555,7 @@ fn exp6_multi_token_batch(gpu: &GpuDevice, pso_cache: &PsoCache) {
     eprintln!("  (Same weights read once, applied to N token vectors)\n");
 
     let pso_single = pso_cache.get(&PsoKey::simple("matvec_q4_0")).unwrap();
-    let pso_batch = pso_cache.get(&PsoKey::simple("multi_token_matvec_q4_0")).unwrap();
+    let pso_batch = pso_cache.get(&PsoKey::simple("bench_multi_token_matvec_q4_0")).unwrap();
 
     let in_dim: u32 = SMOLLM_HIDDEN;
     let out_dim: u32 = SMOLLM_HIDDEN; // 576→576

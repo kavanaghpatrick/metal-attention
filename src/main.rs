@@ -62,6 +62,10 @@ enum Commands {
         #[arg(long, default_value = "1.1")]
         repeat_penalty: f32,
 
+        /// GPU repetition penalty (1.0 = disabled, applied on-GPU before argmax)
+        #[arg(long, default_value = "1.1")]
+        gpu_repeat_penalty: f32,
+
         /// Use GPU forward pass (Metal compute kernels)
         #[arg(long)]
         gpu: bool,
@@ -125,10 +129,11 @@ fn main() {
             top_p,
             top_k,
             repeat_penalty,
+            gpu_repeat_penalty,
             gpu,
         } => {
             if gpu {
-                if let Err(e) = run_inference_gpu(model, prompt, max_tokens) {
+                if let Err(e) = run_inference_gpu(model, prompt, max_tokens, gpu_repeat_penalty) {
                     eprintln!("{e}");
                     process::exit(1);
                 }
@@ -649,7 +654,7 @@ fn run_inference(
 // GPU run subcommand
 // ---------------------------------------------------------------------------
 
-fn run_inference_gpu(model_path: PathBuf, prompt: String, max_tokens: usize) -> Result<(), String> {
+fn run_inference_gpu(model_path: PathBuf, prompt: String, max_tokens: usize, repeat_penalty: f32) -> Result<(), String> {
     if !model_path.exists() {
         return Err(format!(
             "Error: Model file not found: {}",
@@ -667,6 +672,7 @@ fn run_inference_gpu(model_path: PathBuf, prompt: String, max_tokens: usize) -> 
     // Construct GPU forward pass
     eprintln!("Loading GPU forward pass...");
     let mut gpu = GpuForwardPass::from_gguf(&model_path)?;
+    gpu.set_repetition_penalty(repeat_penalty);
 
     // Tokenize prompt
     let prompt_tokens = tokenizer.encode(&prompt);
@@ -675,30 +681,29 @@ fn run_inference_gpu(model_path: PathBuf, prompt: String, max_tokens: usize) -> 
     }
 
     eprintln!(
-        "Prompt: {} tokens | Generating up to {} tokens (GPU, greedy)",
+        "Prompt: {} tokens | Generating up to {} tokens (GPU, greedy, repeat_penalty={})",
         prompt_tokens.len(),
-        max_tokens
+        max_tokens,
+        repeat_penalty
     );
 
     let start = Instant::now();
     let mut stdout = std::io::stdout();
 
-    // Prefill: run forward_token for each prompt token except last (discard logits)
+    // Prefill: batched forward_prompt processes all tokens in one pass
     let prefill_start = Instant::now();
-    for &tok in &prompt_tokens[..prompt_tokens.len() - 1] {
-        gpu.forward_token(tok)?;
-    }
-    // Last prompt token uses greedy path to get first generated token
-    let mut next_token = gpu.forward_token_greedy(*prompt_tokens.last().unwrap())?;
+    let mut next_token = gpu.forward_prompt(&prompt_tokens)?;
     let prefill_elapsed = prefill_start.elapsed();
 
     // Decode loop: GPU-side greedy argmax
     let mut token_count: usize = 0;
     let decode_start = Instant::now();
 
+    let ignore_eos = std::env::var("IGNORE_EOS").is_ok();
+
     for _ in 0..max_tokens {
-        // Stop on EOS
-        if next_token == eos_id {
+        // Stop on EOS (unless IGNORE_EOS is set)
+        if next_token == eos_id && !ignore_eos {
             break;
         }
 
