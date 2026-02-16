@@ -3,14 +3,22 @@
 //! Compares GpuForwardPass (fused Q4_0 Metal kernels) against HybridModel (CPU F32)
 //! using real SmolLM-135M weights. Tests are `#[ignore]` because they require
 //! the model file at `models/SmolLM-135M.Q4_0.gguf`.
+//!
+//! Also includes synthetic Q6_K matvec kernel correctness tests that do NOT
+//! require model files — they create known Q6_K blocks and compare GPU vs CPU.
 
 use std::path::{Path, PathBuf};
 
 use metal_attention::gpu_forward_pass::GpuForwardPass;
 use metal_attention::model::HybridModel;
 use metal_attention::sampling::sample_greedy;
+use metal_attention_kernels::buffer::{alloc_buffer, alloc_buffer_with_data, read_buffer_slice};
 use metal_attention_kernels::device::GpuDevice;
-use metal_attention_kernels::pipeline::PsoCache;
+use metal_attention_kernels::dispatch::{set_buffer, set_bytes};
+use metal_attention_kernels::pipeline::{PsoCache, PsoKey};
+use objc2_metal::{
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+};
 
 /// Resolve model path relative to the workspace root.
 ///
@@ -240,4 +248,295 @@ fn test_forward_prompt_matches_sequential() {
             prompt.len()
         );
     }
+}
+
+// ============================================================================
+// Q6_K matvec GPU vs CPU correctness tests
+// ============================================================================
+
+const Q6K_BLOCK_SIZE: usize = 256;
+const Q6K_BLOCK_BYTES: usize = 210;
+
+/// Simple deterministic LCG PRNG for reproducible test data.
+struct Lcg {
+    state: u64,
+}
+
+impl Lcg {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.state
+    }
+
+    fn next_f32(&mut self) -> f32 {
+        let val = self.next_u64();
+        ((val >> 33) as f32) / (u32::MAX as f32 / 2.0) - 1.0
+    }
+
+    fn next_u8(&mut self) -> u8 {
+        (self.next_u64() >> 40) as u8
+    }
+}
+
+/// Create a synthetic Q6_K super-block (210 bytes) with controlled random data.
+///
+/// Layout: ql[128] + qh[64] + scales[16] + d(half) = 210 bytes.
+fn create_q6k_block(rng: &mut Lcg, scale: f32) -> Vec<u8> {
+    let mut block = Vec::with_capacity(Q6K_BLOCK_BYTES);
+
+    // ql[128]: random bytes (low 4-bit nibbles for quant values)
+    for _ in 0..128 {
+        block.push(rng.next_u8());
+    }
+
+    // qh[64]: random bytes (high 2-bit pairs)
+    for _ in 0..64 {
+        block.push(rng.next_u8());
+    }
+
+    // scales[16]: signed int8 sub-block scales in range [-10, 10]
+    for _ in 0..16 {
+        let s = ((rng.next_u64() % 21) as i8) - 10;
+        block.push(s as u8);
+    }
+
+    // d: fp16 super-block scale
+    let d_bits = half::f16::from_f32(scale).to_bits();
+    block.extend_from_slice(&d_bits.to_le_bytes());
+
+    assert_eq!(block.len(), Q6K_BLOCK_BYTES);
+    block
+}
+
+/// CPU reference: dequantize Q6_K blocks for a single row of `in_dim` elements.
+///
+/// Matches the Rust `dequantize_q6_k_to_f32` from gpu_weight_store.rs exactly.
+fn cpu_dequantize_q6_k_row(block_data: &[u8], n_elements: usize) -> Vec<f32> {
+    let n_blocks = n_elements / Q6K_BLOCK_SIZE;
+    let mut out = vec![0.0f32; n_elements];
+
+    for b in 0..n_blocks {
+        let bp = b * Q6K_BLOCK_BYTES;
+        let ql = &block_data[bp..bp + 128];
+        let qh = &block_data[bp + 128..bp + 192];
+        let scales = &block_data[bp + 192..bp + 208];
+        let d = half::f16::from_bits(u16::from_le_bytes([
+            block_data[bp + 208],
+            block_data[bp + 209],
+        ]))
+        .to_f32();
+
+        for chunk in 0..2 {
+            let ql_off = chunk * 64;
+            let qh_off = chunk * 32;
+            let sc_off = chunk * 8;
+            let out_off = b * Q6K_BLOCK_SIZE + chunk * 128;
+
+            for l in 0..32 {
+                let is = l / 16;
+
+                let q1 =
+                    ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
+                let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4))
+                    as i32
+                    - 32;
+                let q3 =
+                    ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4))
+                    as i32
+                    - 32;
+
+                let sc0 = scales[sc_off + is] as i8 as f32;
+                let sc1 = scales[sc_off + is + 2] as i8 as f32;
+                let sc2 = scales[sc_off + is + 4] as i8 as f32;
+                let sc3 = scales[sc_off + is + 6] as i8 as f32;
+
+                out[out_off + l] = d * sc0 * q1 as f32;
+                out[out_off + l + 32] = d * sc1 * q2 as f32;
+                out[out_off + l + 64] = d * sc2 * q3 as f32;
+                out[out_off + l + 96] = d * sc3 * q4 as f32;
+            }
+        }
+    }
+
+    out
+}
+
+/// CPU reference: Q6_K matvec = dequantize each row + dot product with input.
+fn cpu_matvec_q6_k(
+    weight_bytes: &[u8],
+    input: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+) -> Vec<f32> {
+    let n_blocks_per_row = in_dim / Q6K_BLOCK_SIZE;
+    let row_bytes = n_blocks_per_row * Q6K_BLOCK_BYTES;
+
+    let mut output = vec![0.0f32; out_dim];
+    for row in 0..out_dim {
+        let row_start = row * row_bytes;
+        let row_data = &weight_bytes[row_start..row_start + row_bytes];
+        let dequant = cpu_dequantize_q6_k_row(row_data, in_dim);
+
+        let mut sum = 0.0f64; // Use f64 for CPU reference to avoid accumulation drift
+        for i in 0..in_dim {
+            sum += dequant[i] as f64 * input[i] as f64;
+        }
+        output[row] = sum as f32;
+    }
+    output
+}
+
+/// Run matvec_q6_k on GPU: weight[out_dim, in_dim/256 * 210] * input[in_dim] -> output[out_dim].
+fn gpu_matvec_q6_k(
+    weight_bytes: &[u8],
+    input: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+) -> Vec<f32> {
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    pso_cache.prewarm(&[PsoKey::simple("matvec_q6_k")]);
+
+    let weight_buf = alloc_buffer_with_data(&device.device, weight_bytes);
+    let input_buf = alloc_buffer_with_data(&device.device, input);
+    let output_buf = alloc_buffer(&device.device, out_dim * std::mem::size_of::<f32>());
+
+    let cmd_buf = device.command_queue.commandBuffer().expect("cmd buf");
+    let encoder = cmd_buf.computeCommandEncoder().expect("encoder");
+
+    let pso = pso_cache
+        .get(&PsoKey::simple("matvec_q6_k"))
+        .expect("matvec_q6_k PSO not found");
+    encoder.setComputePipelineState(pso);
+    set_buffer(&encoder, &weight_buf, 0, 0);
+    set_buffer(&encoder, &input_buf, 0, 1);
+    set_buffer(&encoder, &output_buf, 0, 2);
+
+    let out_dim_u32 = out_dim as u32;
+    let in_dim_u32 = in_dim as u32;
+    set_bytes(&encoder, &out_dim_u32, 3);
+    set_bytes(&encoder, &in_dim_u32, 4);
+
+    const ROWS_PER_TG: usize = 8;
+    let grid = MTLSize {
+        width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+
+    encoder.endEncoding();
+    cmd_buf.commit();
+    cmd_buf.waitUntilCompleted();
+
+    unsafe { read_buffer_slice(&output_buf, out_dim) }
+}
+
+/// Create synthetic Q6_K weight matrix: [out_dim, in_dim] packed as Q6_K blocks.
+fn create_q6k_weight_matrix(rng: &mut Lcg, out_dim: usize, in_dim: usize) -> Vec<u8> {
+    assert_eq!(in_dim % Q6K_BLOCK_SIZE, 0);
+    let n_blocks_per_row = in_dim / Q6K_BLOCK_SIZE;
+    let total_bytes = out_dim * n_blocks_per_row * Q6K_BLOCK_BYTES;
+    let mut bytes = Vec::with_capacity(total_bytes);
+
+    for _row in 0..out_dim {
+        for _b in 0..n_blocks_per_row {
+            // Scale in a reasonable range for inference weights
+            let scale = rng.next_f32() * 0.01;
+            let block = create_q6k_block(rng, scale);
+            bytes.extend_from_slice(&block);
+        }
+    }
+
+    assert_eq!(bytes.len(), total_bytes);
+    bytes
+}
+
+/// Core test: GPU matvec_q6_k matches CPU dequant+dot product.
+fn test_q6k_matvec_dims(in_dim: usize, out_dim: usize) {
+    assert_eq!(in_dim % Q6K_BLOCK_SIZE, 0, "in_dim must be multiple of 256");
+
+    let mut rng = Lcg::new(42 + in_dim as u64 * 1000 + out_dim as u64);
+
+    // Create synthetic Q6_K weight matrix
+    let weight_bytes = create_q6k_weight_matrix(&mut rng, out_dim, in_dim);
+
+    // Create random input vector
+    let input: Vec<f32> = (0..in_dim).map(|_| rng.next_f32() * 0.5).collect();
+
+    // GPU path
+    let gpu_output = gpu_matvec_q6_k(&weight_bytes, &input, out_dim, in_dim);
+
+    // CPU reference path
+    let cpu_output = cpu_matvec_q6_k(&weight_bytes, &input, out_dim, in_dim);
+
+    // Compare
+    assert_eq!(gpu_output.len(), out_dim);
+    assert_eq!(cpu_output.len(), out_dim);
+
+    // Check no NaN/Inf
+    assert!(
+        !gpu_output.iter().any(|v| v.is_nan() || v.is_infinite()),
+        "GPU output contains NaN or Inf"
+    );
+    assert!(
+        !cpu_output.iter().any(|v| v.is_nan() || v.is_infinite()),
+        "CPU output contains NaN or Inf"
+    );
+
+    let mut max_diff = 0.0f32;
+    let mut max_diff_idx = 0;
+    let mut mean_diff = 0.0f64;
+    for (i, (&g, &c)) in gpu_output.iter().zip(cpu_output.iter()).enumerate() {
+        let diff = (g - c).abs();
+        mean_diff += diff as f64;
+        if diff > max_diff {
+            max_diff = diff;
+            max_diff_idx = i;
+        }
+    }
+    mean_diff /= out_dim as f64;
+
+    eprintln!(
+        "Q6_K matvec ({in_dim}->{out_dim}): max_diff={max_diff:.6} at [{max_diff_idx}] \
+         (gpu={:.6}, cpu={:.6}), mean_diff={mean_diff:.6}",
+        gpu_output[max_diff_idx], cpu_output[max_diff_idx],
+    );
+
+    // Tolerance: 5e-2 for quantization + FP accumulation differences
+    const TOLERANCE: f32 = 5e-2;
+    assert!(
+        max_diff < TOLERANCE,
+        "Q6_K matvec ({in_dim}->{out_dim}): max abs diff {max_diff:.6} at index {max_diff_idx} \
+         exceeds tolerance {TOLERANCE} (gpu={:.6}, cpu={:.6})",
+        gpu_output[max_diff_idx],
+        cpu_output[max_diff_idx],
+    );
+}
+
+/// Q6_K matvec correctness: small dimensions (256, 256).
+/// No model file required — uses synthetic Q6_K blocks.
+#[test]
+fn test_matvec_q6_k_gpu_vs_cpu_small() {
+    test_q6k_matvec_dims(256, 256);
+}
+
+/// Q6_K matvec correctness: Mistral-7B lm_head dimensions (4096, 32000).
+/// No model file required — uses synthetic Q6_K blocks.
+#[test]
+fn test_matvec_q6_k_gpu_vs_cpu_mistral_lm_head() {
+    test_q6k_matvec_dims(4096, 32000);
 }

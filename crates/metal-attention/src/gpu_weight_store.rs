@@ -537,7 +537,7 @@ impl GpuWeightStore {
                         lm_info.gguf_type, n_elements
                     );
                     let f32_vec = match lm_info.gguf_type {
-                        GgufType::Q5_K => dequantize_q5_k_to_f32(lm_data, n_elements),
+                        GgufType::Q5_K_S | GgufType::Q5_K_M => dequantize_q5_k_to_f32(lm_data, n_elements),
                         _ => {
                             return Err(format!(
                                 "Unsupported output.weight type: {:?}. Cannot dequantize.",
