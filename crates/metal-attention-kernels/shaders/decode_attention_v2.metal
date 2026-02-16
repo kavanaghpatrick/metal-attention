@@ -125,22 +125,37 @@ kernel void decode_attention_v2(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // -----------------------------------------------------------------------
-    // Phase 3: Weighted V sum — position-parallel accumulation
+    // Phase 3: Weighted V sum — all 256 threads active
     //
-    // Strategy: each thread handles one or more dimensions of the output.
-    // For head_dim=64, threads 0-63 each handle one dimension.
-    // Threads 64-255 are idle in this phase (head_dim < 256).
+    // For head_dim=64: 256/64 = 4 threads per dimension.
+    // Each thread accumulates over a strided subset of positions, then
+    // we reduce the 4 partial sums per dimension via threadgroup memory.
     //
-    // Each active thread loops over all kv_len positions for its dimension.
-    // This gives coalesced V cache reads (adjacent threads read adjacent dims).
+    // Thread mapping: dim = tid % head_dim, chunk = tid / head_dim
+    // Thread strides over positions: pos = chunk, chunk + threads_per_dim, ...
     // -----------------------------------------------------------------------
     device float* out_head = output + head_id * head_dim;
 
-    if (tid < head_dim) {
-        float acc = 0.0f;
-        for (uint pos = 0; pos < kv_len; pos++) {
-            acc += scores[pos] * v_cache[pos * kv_stride + kv_offset + tid];
+    const uint threads_per_dim = 256 / head_dim;  // 4 for head_dim=64
+    const uint dim = tid % head_dim;
+    const uint chunk = tid / head_dim;
+
+    float acc = 0.0f;
+    for (uint pos = chunk; pos < kv_len; pos += threads_per_dim) {
+        acc += scores[pos] * v_cache[pos * kv_stride + kv_offset + dim];
+    }
+
+    // Store partial sum — reuse scores[] since softmax weights already consumed
+    threadgroup float partials[256];
+    partials[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // First thread of each dimension group reduces and writes output
+    if (chunk == 0) {
+        float result = partials[dim];
+        for (uint c = 1; c < threads_per_dim; c++) {
+            result += partials[dim + c * head_dim];
         }
-        out_head[tid] = acc;
+        out_head[dim] = result;
     }
 }
