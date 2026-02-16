@@ -244,6 +244,7 @@ impl GpuForwardPass {
             PsoKey::simple("residual_add"),
             PsoKey::simple("residual_add_inplace"),
             PsoKey::simple("decode_attention"),
+            PsoKey::simple("decode_attention_v2"),
             PsoKey::simple("rope_apply"),
             PsoKey::simple("rope_apply_dual"),
             PsoKey::simple("ffn_silu"),
@@ -1302,8 +1303,9 @@ impl GpuForwardPass {
         encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
     }
 
-    /// Encode decode attention: Q + KV cache -> output.
-    /// Dispatch: grid=(num_heads) threadgroups, threadgroup=(32).
+    /// Encode decode attention v2: Q + KV cache -> output.
+    /// Uses 256 threads (8 simdgroups) per head for better occupancy.
+    /// Dispatch: grid=(num_heads) threadgroups, threadgroup=(256).
     fn encode_decode_attention(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -1315,8 +1317,8 @@ impl GpuForwardPass {
     ) {
         let pso = self
             .pso_cache
-            .get(&PsoKey::simple("decode_attention"))
-            .expect("decode_attention PSO not prewarmed");
+            .get(&PsoKey::simple("decode_attention_v2"))
+            .expect("decode_attention_v2 PSO not prewarmed");
 
         encoder.setComputePipelineState(pso);
         set_buffer(encoder, q_buf, 0, 0);
@@ -1340,7 +1342,7 @@ impl GpuForwardPass {
             depth: 1,
         };
         let tg = MTLSize {
-            width: 32,
+            width: 256,
             height: 1,
             depth: 1,
         };

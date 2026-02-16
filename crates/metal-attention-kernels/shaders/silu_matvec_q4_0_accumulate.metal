@@ -63,7 +63,8 @@ kernel void silu_matvec_q4_0_accumulate(
                                  up[base + i + 2],
                                  up[base + i + 3]);
             // silu(x) = x / (1 + exp(-x)) = x * sigmoid(x)
-            float4 silu_lo = g_lo / (1.0f + exp(-g_lo)) * u_lo;
+            // Use fast::exp for ~2x faster approximate exp
+            float4 silu_lo = g_lo / (1.0f + float4(fast::exp(-g_lo.x), fast::exp(-g_lo.y), fast::exp(-g_lo.z), fast::exp(-g_lo.w))) * u_lo;
 
             // Same for high nibble elements
             float4 g_hi = float4(gate[base + i + 16],
@@ -74,7 +75,7 @@ kernel void silu_matvec_q4_0_accumulate(
                                  up[base + i + 17],
                                  up[base + i + 18],
                                  up[base + i + 19]);
-            float4 silu_hi = g_hi / (1.0f + exp(-g_hi)) * u_hi;
+            float4 silu_hi = g_hi / (1.0f + float4(fast::exp(-g_hi.x), fast::exp(-g_hi.y), fast::exp(-g_hi.z), fast::exp(-g_hi.w))) * u_hi;
 
             // Dequantize Q4_0 weight values
             float4 lo_vals = float4(int(block.qs[i]   & 0x0F) - 8,
