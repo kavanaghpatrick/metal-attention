@@ -126,6 +126,92 @@ pub fn dispatch_matvec_q4_0(
     unsafe { read_buffer_slice(&output_buf, out_dim) }
 }
 
+/// Run v5 coalesced multi-row Q4_0 dequant + matrix-vector multiply on the GPU.
+///
+/// Uses 256 threads (8 simdgroups), each simdgroup handles 1 row.
+/// Dispatches ceil(out_dim/8) threadgroups.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_matvec_q4_0_v5(
+    device: &GpuDevice,
+    pso_cache: &mut PsoCache,
+    weight_bytes: &[u8],
+    input: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+) -> Vec<f32> {
+    assert_eq!(in_dim % Q4_0_BLOCK_SIZE, 0, "in_dim must be multiple of 32");
+    assert_eq!(input.len(), in_dim, "input length mismatch");
+
+    let n_blocks_per_row = in_dim / Q4_0_BLOCK_SIZE;
+    let expected_bytes = out_dim * n_blocks_per_row * Q4_0_BYTES_PER_BLOCK;
+    assert_eq!(
+        weight_bytes.len(),
+        expected_bytes,
+        "weight_bytes length mismatch: got {}, expected {} (out_dim={}, in_dim={}, blocks_per_row={})",
+        weight_bytes.len(),
+        expected_bytes,
+        out_dim,
+        in_dim,
+        n_blocks_per_row
+    );
+
+    let weight_buf = alloc_buffer_with_data(&device.device, weight_bytes);
+    let input_buf = alloc_buffer_with_data(&device.device, input);
+    let output_buf = alloc_buffer(&device.device, out_dim * std::mem::size_of::<f32>());
+
+    let pso_key = PsoKey::simple("matvec_q4_0_v5_coalesced");
+    let pso = pso_cache.get_or_compile(&pso_key);
+
+    let command_buffer = device
+        .command_queue
+        .commandBuffer()
+        .expect("Failed to create command buffer");
+    let encoder = command_buffer
+        .computeCommandEncoder()
+        .expect("Failed to create compute encoder");
+
+    encoder.setComputePipelineState(pso);
+    set_buffer(&encoder, &weight_buf, 0, 0);
+    set_buffer(&encoder, &input_buf, 0, 1);
+    set_buffer(&encoder, &output_buf, 0, 2);
+
+    let out_dim_u32 = out_dim as u32;
+    let in_dim_u32 = in_dim as u32;
+    set_bytes(&encoder, &out_dim_u32, 3);
+    set_bytes(&encoder, &in_dim_u32, 4);
+
+    // 8 rows per threadgroup, 256 threads (8 simdgroups × 32 threads)
+    const ROWS_PER_TG: usize = 8;
+    let threadgroups_per_grid = MTLSize {
+        width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+        height: 1,
+        depth: 1,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+
+    encoder
+        .dispatchThreadgroups_threadsPerThreadgroup(threadgroups_per_grid, threads_per_threadgroup);
+    encoder.endEncoding();
+
+    command_buffer.commit();
+    command_buffer.waitUntilCompleted();
+
+    let status = command_buffer.status();
+    assert_eq!(
+        status,
+        objc2_metal::MTLCommandBufferStatus::Completed,
+        "matvec_q4_0_v5 command buffer failed with status {:?}. Error: {:?}",
+        status,
+        command_buffer.error()
+    );
+
+    unsafe { read_buffer_slice(&output_buf, out_dim) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,6 +579,324 @@ mod tests {
                 "Row {}: expected ~0.0 with zero scale, got {}",
                 i,
                 result[i]
+            );
+        }
+    }
+
+    // ============================================================
+    // v5 coalesced kernel tests
+    // ============================================================
+
+    #[test]
+    fn test_matvec_q4_0_v5_basic() {
+        let gpu = GpuDevice::new();
+        let mut pso_cache = PsoCache::new(gpu.library.clone());
+
+        let out_dim = 2;
+        let in_dim = 32;
+
+        let mut values_0 = [0i8; 32];
+        for i in 0..16 {
+            values_0[i] = (i as i8) - 8;
+            values_0[i + 16] = (i as i8) - 8;
+        }
+        let block_0 = encode_q4_0_block(1.0, &values_0);
+
+        let values_1 = [3i8; 32];
+        let block_1 = encode_q4_0_block(2.0, &values_1);
+
+        let mut weight_bytes = Vec::new();
+        weight_bytes.extend_from_slice(&block_0);
+        weight_bytes.extend_from_slice(&block_1);
+
+        let input = vec![1.0f32; in_dim];
+
+        let expected = cpu_q4_0_dot(&weight_bytes, &input, out_dim, in_dim);
+
+        let result =
+            dispatch_matvec_q4_0_v5(&gpu, &mut pso_cache, &weight_bytes, &input, out_dim, in_dim);
+
+        assert_eq!(result.len(), out_dim);
+        for i in 0..out_dim {
+            let diff = (result[i] - expected[i]).abs();
+            assert!(
+                diff < 1e-3,
+                "v5 basic Row {}: GPU={}, CPU={}, diff={}",
+                i, result[i], expected[i], diff
+            );
+        }
+
+        assert!(
+            (result[0] - (-16.0)).abs() < 1e-3,
+            "v5 Row 0 expected -16.0, got {}",
+            result[0]
+        );
+        assert!(
+            (result[1] - 192.0).abs() < 1e-3,
+            "v5 Row 1 expected 192.0, got {}",
+            result[1]
+        );
+    }
+
+    #[test]
+    fn test_matvec_q4_0_v5_576x576() {
+        let gpu = GpuDevice::new();
+        let mut pso_cache = PsoCache::new(gpu.library.clone());
+
+        let out_dim = 576;
+        let in_dim = 576;
+        let n_blocks_per_row = in_dim / Q4_0_BLOCK_SIZE;
+
+        let mut weight_bytes =
+            Vec::with_capacity(out_dim * n_blocks_per_row * Q4_0_BYTES_PER_BLOCK);
+        for row in 0..out_dim {
+            for b in 0..n_blocks_per_row {
+                let scale = 0.01 * ((row * n_blocks_per_row + b) % 100 + 1) as f32;
+                let mut values = [0i8; 32];
+                for i in 0..32 {
+                    values[i] = ((row + b + i) % 15) as i8 - 7;
+                }
+                let block = encode_q4_0_block(scale, &values);
+                weight_bytes.extend_from_slice(&block);
+            }
+        }
+
+        let input: Vec<f32> = (0..in_dim).map(|i| 0.1 * ((i % 10) as f32 - 5.0)).collect();
+
+        let expected = cpu_q4_0_dot(&weight_bytes, &input, out_dim, in_dim);
+
+        let result =
+            dispatch_matvec_q4_0_v5(&gpu, &mut pso_cache, &weight_bytes, &input, out_dim, in_dim);
+
+        assert_eq!(result.len(), out_dim);
+        let mut max_diff = 0.0f32;
+        for i in 0..out_dim {
+            let diff = (result[i] - expected[i]).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 1e-2,
+                "v5 576x576 Row {}: GPU={}, CPU={}, diff={}",
+                i, result[i], expected[i], diff
+            );
+        }
+        eprintln!(
+            "test_matvec_q4_0_v5_576x576: max_diff={:.6}, all {} rows OK",
+            max_diff, out_dim
+        );
+    }
+
+    #[test]
+    fn test_matvec_q4_0_v5_192x576() {
+        let gpu = GpuDevice::new();
+        let mut pso_cache = PsoCache::new(gpu.library.clone());
+
+        let out_dim = 192;
+        let in_dim = 576;
+        let n_blocks_per_row = in_dim / Q4_0_BLOCK_SIZE;
+
+        let mut weight_bytes =
+            Vec::with_capacity(out_dim * n_blocks_per_row * Q4_0_BYTES_PER_BLOCK);
+        for row in 0..out_dim {
+            for b in 0..n_blocks_per_row {
+                let scale = 0.02 * ((row * n_blocks_per_row + b) % 50 + 1) as f32;
+                let mut values = [0i8; 32];
+                for i in 0..32 {
+                    values[i] = ((row + b * 3 + i) % 15) as i8 - 7;
+                }
+                let block = encode_q4_0_block(scale, &values);
+                weight_bytes.extend_from_slice(&block);
+            }
+        }
+
+        let input: Vec<f32> = (0..in_dim)
+            .map(|i| 0.05 * ((i % 20) as f32 - 10.0))
+            .collect();
+
+        let expected = cpu_q4_0_dot(&weight_bytes, &input, out_dim, in_dim);
+        let result =
+            dispatch_matvec_q4_0_v5(&gpu, &mut pso_cache, &weight_bytes, &input, out_dim, in_dim);
+
+        assert_eq!(result.len(), out_dim);
+        let mut max_diff = 0.0f32;
+        for i in 0..out_dim {
+            let diff = (result[i] - expected[i]).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 1e-2,
+                "v5 192x576 Row {}: GPU={}, CPU={}, diff={}",
+                i, result[i], expected[i], diff
+            );
+        }
+        eprintln!(
+            "test_matvec_q4_0_v5_192x576: max_diff={:.6}, all {} rows OK",
+            max_diff, out_dim
+        );
+    }
+
+    #[test]
+    fn test_matvec_q4_0_v5_1536x576() {
+        let gpu = GpuDevice::new();
+        let mut pso_cache = PsoCache::new(gpu.library.clone());
+
+        let out_dim = 1536;
+        let in_dim = 576;
+        let n_blocks_per_row = in_dim / Q4_0_BLOCK_SIZE;
+
+        let mut weight_bytes =
+            Vec::with_capacity(out_dim * n_blocks_per_row * Q4_0_BYTES_PER_BLOCK);
+        for row in 0..out_dim {
+            for b in 0..n_blocks_per_row {
+                let scale = 0.01 * ((row * n_blocks_per_row + b) % 100 + 1) as f32;
+                let mut values = [0i8; 32];
+                for i in 0..32 {
+                    values[i] = ((row + b + i) % 15) as i8 - 7;
+                }
+                let block = encode_q4_0_block(scale, &values);
+                weight_bytes.extend_from_slice(&block);
+            }
+        }
+
+        let input: Vec<f32> = (0..in_dim).map(|i| 0.1 * ((i % 10) as f32 - 5.0)).collect();
+
+        let expected = cpu_q4_0_dot(&weight_bytes, &input, out_dim, in_dim);
+        let result =
+            dispatch_matvec_q4_0_v5(&gpu, &mut pso_cache, &weight_bytes, &input, out_dim, in_dim);
+
+        assert_eq!(result.len(), out_dim);
+        let mut max_diff = 0.0f32;
+        for i in 0..out_dim {
+            let diff = (result[i] - expected[i]).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 1e-2,
+                "v5 1536x576 Row {}: GPU={}, CPU={}, diff={}",
+                i, result[i], expected[i], diff
+            );
+        }
+        eprintln!(
+            "test_matvec_q4_0_v5_1536x576: max_diff={:.6}, all {} rows OK",
+            max_diff, out_dim
+        );
+    }
+
+    #[test]
+    fn test_matvec_q4_0_v5_576x1536() {
+        // Down projection: 576x1536
+        let gpu = GpuDevice::new();
+        let mut pso_cache = PsoCache::new(gpu.library.clone());
+
+        let out_dim = 576;
+        let in_dim = 1536;
+        let n_blocks_per_row = in_dim / Q4_0_BLOCK_SIZE; // 48
+
+        let mut weight_bytes =
+            Vec::with_capacity(out_dim * n_blocks_per_row * Q4_0_BYTES_PER_BLOCK);
+        for row in 0..out_dim {
+            for b in 0..n_blocks_per_row {
+                let scale = 0.01 * ((row * n_blocks_per_row + b) % 100 + 1) as f32;
+                let mut values = [0i8; 32];
+                for i in 0..32 {
+                    values[i] = ((row + b + i) % 15) as i8 - 7;
+                }
+                let block = encode_q4_0_block(scale, &values);
+                weight_bytes.extend_from_slice(&block);
+            }
+        }
+
+        let input: Vec<f32> = (0..in_dim).map(|i| 0.05 * ((i % 20) as f32 - 10.0)).collect();
+
+        let expected = cpu_q4_0_dot(&weight_bytes, &input, out_dim, in_dim);
+        let result =
+            dispatch_matvec_q4_0_v5(&gpu, &mut pso_cache, &weight_bytes, &input, out_dim, in_dim);
+
+        assert_eq!(result.len(), out_dim);
+        let mut max_diff = 0.0f32;
+        for i in 0..out_dim {
+            let diff = (result[i] - expected[i]).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 1e-2,
+                "v5 576x1536 Row {}: GPU={}, CPU={}, diff={}",
+                i, result[i], expected[i], diff
+            );
+        }
+        eprintln!(
+            "test_matvec_q4_0_v5_576x1536: max_diff={:.6}, all {} rows OK",
+            max_diff, out_dim
+        );
+    }
+
+    #[test]
+    fn test_matvec_q4_0_v5_49152x576() {
+        let gpu = GpuDevice::new();
+        let mut pso_cache = PsoCache::new(gpu.library.clone());
+
+        let out_dim = 49152;
+        let in_dim = 576;
+        let n_blocks_per_row = in_dim / Q4_0_BLOCK_SIZE;
+
+        let block_ones = encode_q4_0_block(1.0, &[1i8; 32]);
+
+        let mut weight_bytes =
+            Vec::with_capacity(out_dim * n_blocks_per_row * Q4_0_BYTES_PER_BLOCK);
+        for _row in 0..out_dim {
+            for _b in 0..n_blocks_per_row {
+                weight_bytes.extend_from_slice(&block_ones);
+            }
+        }
+
+        let input = vec![1.0f32; in_dim];
+        let expected_val = in_dim as f32;
+
+        let result =
+            dispatch_matvec_q4_0_v5(&gpu, &mut pso_cache, &weight_bytes, &input, out_dim, in_dim);
+
+        assert_eq!(result.len(), out_dim);
+        let mut max_diff = 0.0f32;
+        for i in 0..out_dim {
+            let diff = (result[i] - expected_val).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 1e-3,
+                "v5 49152x576 Row {}: GPU={}, expected={}, diff={}",
+                i, result[i], expected_val, diff
+            );
+        }
+        eprintln!(
+            "test_matvec_q4_0_v5_49152x576: max_diff={:.6}, all {} rows OK",
+            max_diff, out_dim
+        );
+    }
+
+    #[test]
+    fn test_matvec_q4_0_v5_zero_scale() {
+        let gpu = GpuDevice::new();
+        let mut pso_cache = PsoCache::new(gpu.library.clone());
+
+        let out_dim = 4;
+        let in_dim = 32;
+
+        let mut weight_bytes = Vec::new();
+        for row in 0..out_dim {
+            let mut values = [0i8; 32];
+            for i in 0..32 {
+                values[i] = ((row + i) % 15) as i8 - 7;
+            }
+            let block = encode_q4_0_block(0.0, &values);
+            weight_bytes.extend_from_slice(&block);
+        }
+
+        let input: Vec<f32> = (0..in_dim).map(|i| (i as f32 + 1.0) * 0.5).collect();
+
+        let result =
+            dispatch_matvec_q4_0_v5(&gpu, &mut pso_cache, &weight_bytes, &input, out_dim, in_dim);
+
+        assert_eq!(result.len(), out_dim);
+        for i in 0..out_dim {
+            assert!(
+                result[i].abs() < 1e-6,
+                "v5 Row {}: expected ~0.0 with zero scale, got {}",
+                i, result[i]
             );
         }
     }
