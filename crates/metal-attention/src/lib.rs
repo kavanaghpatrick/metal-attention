@@ -12,6 +12,7 @@ pub mod gpu_weight_store;
 pub mod inference;
 pub mod model;
 pub mod sampling;
+pub mod speculative;
 
 // Re-exports for convenience
 pub use config::InferenceConfig;
