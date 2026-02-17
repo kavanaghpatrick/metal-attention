@@ -63,11 +63,7 @@ impl SpeculativeDecoder {
     /// - `draft_path`: Path to the draft model GGUF file (e.g., SmolLM-135M).
     /// - `target_path`: Path to the target model GGUF file (e.g., Mistral-7B).
     /// - `n_draft`: Number of draft tokens to propose per speculation round.
-    pub fn new(
-        draft_path: &Path,
-        target_path: &Path,
-        n_draft: usize,
-    ) -> Result<Self, String> {
+    pub fn new(draft_path: &Path, target_path: &Path, n_draft: usize) -> Result<Self, String> {
         let draft = GpuForwardPass::from_gguf(draft_path)?;
         let target = GpuForwardPass::from_gguf(target_path)?;
         Ok(Self {
@@ -78,11 +74,7 @@ impl SpeculativeDecoder {
     }
 
     /// Create from pre-loaded models (useful for tests).
-    pub fn from_models(
-        draft: GpuForwardPass,
-        target: GpuForwardPass,
-        n_draft: usize,
-    ) -> Self {
+    pub fn from_models(draft: GpuForwardPass, target: GpuForwardPass, n_draft: usize) -> Self {
         Self {
             draft,
             target,
@@ -248,7 +240,9 @@ impl SpeculativeDecoder {
             // Draft processed [last_token, d₁, ..., d_{N-1}] (N tokens),
             // so draft position = P + N.
             // Feed dₙ to draft to sync both at P + N + 1.
-            let _ = self.draft.forward_token_greedy(*draft_tokens.last().unwrap())?;
+            let _ = self
+                .draft
+                .forward_token_greedy(*draft_tokens.last().unwrap())?;
             // Now both at position P + N + 1. Bonus is NOT fed.
         }
 

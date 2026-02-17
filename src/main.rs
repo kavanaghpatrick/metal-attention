@@ -143,14 +143,14 @@ fn main() {
             draft,
             draft_tokens,
         } => {
-            if gpu && draft.is_some() {
-                if let Err(e) = run_inference_speculative(
-                    model,
-                    draft.unwrap(),
-                    prompt,
-                    max_tokens,
-                    draft_tokens,
-                ) {
+            if let Some(draft_path) = draft {
+                if !gpu {
+                    eprintln!("--draft requires --gpu");
+                    process::exit(1);
+                }
+                if let Err(e) =
+                    run_inference_speculative(model, draft_path, prompt, max_tokens, draft_tokens)
+                {
                     eprintln!("{e}");
                     process::exit(1);
                 }

@@ -42,15 +42,17 @@ fn test_speculative_greedy_matches_target() {
     let mut target_tokens = vec![first_token];
     let mut next = first_token;
     for _ in 1..max_tokens {
-        next = gpu.forward_token_greedy(next).expect("forward_token_greedy failed");
+        next = gpu
+            .forward_token_greedy(next)
+            .expect("forward_token_greedy failed");
         target_tokens.push(next);
     }
     eprintln!("Target tokens: {target_tokens:?}");
 
     // --- Speculative decode (same model as draft + target) ---
     eprintln!("Speculative decode (draft=target)...");
-    let mut decoder = SpeculativeDecoder::new(path, path, 4)
-        .expect("Failed to create SpeculativeDecoder");
+    let mut decoder =
+        SpeculativeDecoder::new(path, path, 4).expect("Failed to create SpeculativeDecoder");
 
     let mut spec_collected = Vec::new();
     let (spec_tokens, stats) = decoder
