@@ -145,7 +145,7 @@ fn test_multiple_tensors_correct_shapes() {
         .add_string("general.architecture", "llama")
         .add_tensor_zeros("token_embd.weight", &[1000, 128], GgufType::F16)
         .add_tensor_zeros("blk.0.attn_q.weight", &[128, 128], GgufType::Q4_0)
-        .add_tensor_zeros("blk.0.ffn_gate.weight", &[512, 128], GgufType::Q4_K_M)
+        .add_tensor_zeros("blk.0.ffn_gate.weight", &[512, 128], GgufType::Q4_K)
         .add_tensor_zeros("output.weight", &[1000, 128], GgufType::F16)
         .build();
 
@@ -162,7 +162,7 @@ fn test_multiple_tensors_correct_shapes() {
 
     let gate = file.find_tensor("blk.0.ffn_gate.weight").unwrap();
     assert_eq!(gate.shape, vec![512, 128]);
-    assert_eq!(gate.gguf_type, GgufType::Q4_K_M);
+    assert_eq!(gate.gguf_type, GgufType::Q4_K);
 
     let output = file.find_tensor("output.weight").unwrap();
     assert_eq!(output.shape, vec![1000, 128]);

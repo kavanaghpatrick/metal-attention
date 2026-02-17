@@ -595,7 +595,7 @@ mod tests {
             .add_string("general.architecture", "llama")
             .add_tensor_zeros("token_embd.weight", &[32000, 4096], GgufType::F16)
             .add_tensor_zeros("blk.0.attn_q.weight", &[4096, 4096], GgufType::Q4_0)
-            .add_tensor_zeros("blk.0.ffn_gate.weight", &[11008, 4096], GgufType::Q4_K_M)
+            .add_tensor_zeros("blk.0.ffn_gate.weight", &[11008, 4096], GgufType::Q4_K)
             .build();
 
         let file = GgufFile::from_bytes(data).expect("parse failed");
@@ -609,7 +609,7 @@ mod tests {
         assert_eq!(q.gguf_type, GgufType::Q4_0);
 
         let gate = file.find_tensor("blk.0.ffn_gate.weight").unwrap();
-        assert_eq!(gate.gguf_type, GgufType::Q4_K_M);
+        assert_eq!(gate.gguf_type, GgufType::Q4_K);
     }
 
     #[test]

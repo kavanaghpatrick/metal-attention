@@ -540,3 +540,125 @@ fn test_matvec_q6_k_gpu_vs_cpu_small() {
 fn test_matvec_q6_k_gpu_vs_cpu_mistral_lm_head() {
     test_q6k_matvec_dims(4096, 32000);
 }
+
+// ============================================================================
+// Mistral-7B Q6_K end-to-end validation
+// ============================================================================
+
+/// Resolve Mistral-7B model path relative to workspace root.
+fn mistral_model_path() -> PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    Path::new(manifest_dir).join("../../models/mistral-7b-v0.1.Q4_0.gguf")
+}
+
+/// End-to-end validation of Q6_K kernel on Mistral-7B.
+///
+/// Verifies:
+/// 1. Model loads successfully with Q6_K lm_head buffer (~108 MB, not 512 MB F32)
+/// 2. forward_token produces valid logits (no NaN/Inf)
+/// 3. Greedy decode generates coherent text (valid token IDs)
+/// 4. Logs tok/s performance for regression tracking
+///
+/// Requires Mistral-7B Q4_0 model file (3.8 GB). Ignored by default.
+#[test]
+#[ignore]
+fn test_mistral_q6k_end_to_end() {
+    let path = mistral_model_path();
+    assert!(
+        path.exists(),
+        "Mistral-7B model not found: {path:?}. Download mistral-7b-v0.1.Q4_0.gguf first."
+    );
+    let path = path.as_path();
+
+    // --- Load model (Q6_K buffer allocation logged during from_gguf) ---
+    eprintln!("Loading Mistral-7B Q4_0 model...");
+    let load_start = std::time::Instant::now();
+    let mut gpu = GpuForwardPass::from_gguf(path).expect("Failed to load Mistral-7B");
+    let load_time = load_start.elapsed();
+    eprintln!("Model loaded in {:.2}s", load_time.as_secs_f64());
+
+    // Verify model dimensions match Mistral-7B
+    assert_eq!(gpu.vocab_size(), 32000, "Mistral-7B vocab_size should be 32000");
+    assert_eq!(gpu.hidden_size(), 4096, "Mistral-7B hidden_size should be 4096");
+
+    // --- Prefill with a short prompt ---
+    // Tokens for "The capital of France is" (approximate; exact tokenization varies)
+    let prompt_tokens: &[u32] = &[1, 415, 5765, 302, 4429, 349];
+    eprintln!("Prefilling {} tokens...", prompt_tokens.len());
+
+    let mut logits = Vec::new();
+    for &tok in prompt_tokens {
+        logits = gpu.forward_token(tok).expect("Mistral forward_token failed during prefill");
+    }
+
+    // Verify logits are valid
+    assert_eq!(
+        logits.len(),
+        32000,
+        "Mistral-7B should produce 32000 logits, got {}",
+        logits.len()
+    );
+    assert!(
+        !logits.iter().any(|v| v.is_nan()),
+        "Logits contain NaN after prefill"
+    );
+    assert!(
+        !logits.iter().any(|v| v.is_infinite()),
+        "Logits contain Inf after prefill"
+    );
+
+    // --- Greedy decode 20 tokens and measure throughput ---
+    let decode_count = 20;
+    let mut generated_tokens = Vec::with_capacity(decode_count);
+    let mut next_token = sample_greedy(&logits);
+    generated_tokens.push(next_token);
+
+    let decode_start = std::time::Instant::now();
+    for _ in 1..decode_count {
+        logits = gpu.forward_token(next_token).expect("Mistral forward_token failed during decode");
+
+        // Verify no NaN/Inf on every step
+        assert!(
+            !logits.iter().any(|v| v.is_nan() || v.is_infinite()),
+            "Logits contain NaN or Inf during decode"
+        );
+
+        next_token = sample_greedy(&logits);
+        generated_tokens.push(next_token);
+    }
+    let decode_elapsed = decode_start.elapsed();
+
+    // --- Compute tok/s ---
+    // decode_count - 1 because first token came from prefill logits
+    let tokens_decoded = (decode_count - 1) as f64;
+    let tok_per_sec = tokens_decoded / decode_elapsed.as_secs_f64();
+
+    eprintln!("Generated tokens: {generated_tokens:?}");
+    eprintln!(
+        "Decode performance: {tokens_decoded:.0} tokens in {:.3}s = {tok_per_sec:.1} tok/s",
+        decode_elapsed.as_secs_f64()
+    );
+
+    // --- Verify coherence ---
+    // All generated tokens should be valid (< vocab_size)
+    for (i, &tok) in generated_tokens.iter().enumerate() {
+        assert!(
+            (tok as usize) < 32000,
+            "Token {} at position {} exceeds vocab_size 32000",
+            tok,
+            i
+        );
+    }
+
+    // Verify we got diverse output (not all same token = degenerate)
+    let unique_tokens: std::collections::HashSet<u32> = generated_tokens.iter().copied().collect();
+    assert!(
+        unique_tokens.len() >= 3,
+        "Only {} unique tokens in {} generated — likely degenerate output: {:?}",
+        unique_tokens.len(),
+        decode_count,
+        generated_tokens
+    );
+
+    eprintln!("Mistral-7B Q6_K end-to-end: PASS ({tok_per_sec:.1} tok/s)");
+}

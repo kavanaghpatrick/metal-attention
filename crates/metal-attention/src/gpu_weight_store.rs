@@ -161,12 +161,17 @@ fn make_weight_buffer(
 /// Dequant: value = qs[i] * d
 /// Dequantize Q5_K super-blocks (256 elements each, 176 bytes per block).
 ///
+/// Matches llama.cpp's `dequantize_row_q5_K` exactly.
+///
 /// Layout per super-block (176 bytes):
-///   - 2 bytes: fp16 d (scale)
-///   - 2 bytes: fp16 dmin (min value)
-///   - 12 bytes: scales/mins for 8 sub-blocks (6 bits each, packed)
+///   - 2 bytes: fp16 d (super-block scale)
+///   - 2 bytes: fp16 dmin (super-block min)
+///   - 12 bytes: scales/mins for 8 sub-blocks (6 bits each, packed via K4 scheme)
 ///   - 32 bytes: qh — high bit for each of 256 values
 ///   - 128 bytes: qs — low 4 bits, packed in sub-block pairs
+///
+/// Sub-block pairing: consecutive (is, is+1) where is = 0,2,4,6.
+/// Output interleaving: low nibble and high nibble alternate per byte.
 fn dequantize_q5_k_to_f32(data: &[u8], n_elements: usize) -> Vec<f32> {
     const QK: usize = 256;
     const BLOCK_BYTES: usize = 176;
@@ -180,7 +185,7 @@ fn dequantize_q5_k_to_f32(data: &[u8], n_elements: usize) -> Vec<f32> {
         let dmin =
             half::f16::from_bits(u16::from_le_bytes([data[bp + 2], data[bp + 3]])).to_f32();
 
-        // Unpack 6-bit scales and mins for 8 sub-blocks from 12 bytes
+        // Unpack 6-bit scales and mins for 8 sub-blocks from 12 bytes (K4 scheme)
         let scales_raw = &data[bp + 4..bp + 16];
         let mut sc = [0u8; 8];
         let mut mn = [0u8; 8];
@@ -195,34 +200,33 @@ fn dequantize_q5_k_to_f32(data: &[u8], n_elements: usize) -> Vec<f32> {
         }
 
         let qh = &data[bp + 16..bp + 48]; // 32 bytes = 256 bits
-        let qs = &data[bp + 48..bp + 176]; // 128 bytes (sub-block pair packed)
+        let ql = &data[bp + 48..bp + 176]; // 128 bytes
 
-        // Process 4 pairs of sub-blocks (j=0..3), each pair = 64 elements
-        for j in 0..4 {
-            let sc1 = sc[2 * j] as f32;
-            let mn1 = mn[2 * j] as f32;
-            let sc2 = sc[2 * j + 1] as f32;
-            let mn2 = mn[2 * j + 1] as f32;
-            let q = &qs[32 * j..32 * (j + 1)]; // 32 bytes for this pair
+        // Process 4 pairs of sub-blocks (j=0..3).
+        // Each pair: sub-block 2*j (low nibble) and sub-block 2*j+1 (high nibble).
+        // Output: 64 elements per pair, interleaved [low, high, low, high, ...].
+        let mut y = b * QK;
+        let mut ql_off = 0;
+        for j in 0..4usize {
+            // Sub-block 2*j: scale = sc[2*j], min = mn[2*j]
+            let d1 = d * sc[2 * j] as f32;
+            let m1 = dmin * mn[2 * j] as f32;
+            // Sub-block 2*j+1: scale = sc[2*j+1], min = mn[2*j+1]
+            let d2 = d * sc[2 * j + 1] as f32;
+            let m2 = dmin * mn[2 * j + 1] as f32;
 
             for l in 0..32 {
-                let elem1 = 64 * j + l;
-                let elem2 = 64 * j + 32 + l;
-
-                // High bits: qh[l] packs 8 bits across all 4 pairs.
-                // Bit (2*j)   → first sub-block, bit (2*j+1) → second
                 let h1 = ((qh[l] >> (2 * j)) & 1) as u32;
                 let h2 = ((qh[l] >> (2 * j + 1)) & 1) as u32;
 
-                let q4_1 = (q[l] & 0x0F) as u32;
-                let q4_2 = (q[l] >> 4) as u32;
+                let q5_lo = (ql[ql_off + l] as u32 & 0x0F) | (h1 << 4);
+                let q5_hi = (ql[ql_off + l] as u32 >> 4) | (h2 << 4);
 
-                let q5_1 = q4_1 | (h1 << 4); // 5-bit value [0, 31]
-                let q5_2 = q4_2 | (h2 << 4);
-
-                out[b * QK + elem1] = d * sc1 * (q5_1 as f32) - dmin * mn1;
-                out[b * QK + elem2] = d * sc2 * (q5_2 as f32) - dmin * mn2;
+                out[y] = d1 * q5_lo as f32 - m1;
+                out[y + 1] = d2 * q5_hi as f32 - m2;
+                y += 2;
             }
+            ql_off += 32;
         }
     }
 
@@ -562,7 +566,7 @@ impl GpuWeightStore {
                         lm_info.gguf_type, n_elements
                     );
                     let f32_vec = match lm_info.gguf_type {
-                        GgufType::Q5_K_S | GgufType::Q5_K_M => dequantize_q5_k_to_f32(lm_data, n_elements),
+                        GgufType::Q5_K => dequantize_q5_k_to_f32(lm_data, n_elements),
                         _ => {
                             return Err(format!(
                                 "Unsupported output.weight type: {:?}. Cannot dequantize.",

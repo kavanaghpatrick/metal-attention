@@ -939,15 +939,12 @@ impl GpuForwardPass {
             // --- Attention block ---
             self.encode_attention_projections(layer_idx)?;
 
-            if layer_idx < 2 {
-                let q =
-                    unsafe { read_buffer_slice(&self.scratch_q, self.num_heads * self.head_dim) };
-                let k = unsafe {
-                    read_buffer_slice(&self.scratch_k, self.num_kv_heads * self.head_dim)
-                };
-                let (qn, qmin, qmax) = buf_stats(&q);
-                let (kn, kmin, kmax) = buf_stats(&k);
-                eprintln!("  [L{layer_idx} attn_proj] Q: nan={qn} min={qmin:.4} max={qmax:.4}  K: nan={kn} min={kmin:.4} max={kmax:.4}");
+            {
+                let h = unsafe { read_buffer_slice(&self.hidden_a, self.hidden_size) };
+                let (hn, hmin, hmax) = buf_stats(&h);
+                if hn || hmin.is_nan() || hmax.is_nan() || hmin.abs() > 1e10 || hmax.abs() > 1e10 {
+                    eprintln!("  [L{layer_idx} attn_proj] PROBLEM: hidden_a: nan={hn} min={hmin:.4} max={hmax:.4}");
+                }
             }
 
             // CPU-side KV cache append (requires GPU work completed)
@@ -958,21 +955,23 @@ impl GpuForwardPass {
             // Decode attention + O projection + residual add
             self.encode_attention_output(layer_idx)?;
 
-            if layer_idx < 2 {
+            {
                 let h = unsafe { read_buffer_slice(&self.hidden_a, self.hidden_size) };
                 let (hn, hmin, hmax) = buf_stats(&h);
-                eprintln!(
-                    "  [L{layer_idx} attn_out] hidden_a: nan={hn} min={hmin:.4} max={hmax:.4}"
-                );
+                if hn || hmin.is_nan() || hmax.is_nan() || hmin.abs() > 1e6 || hmax.abs() > 1e6 {
+                    eprintln!("  [L{layer_idx} attn_out] PROBLEM: nan={hn} min={hmin:.4} max={hmax:.4}");
+                }
             }
 
             // --- FFN block ---
             self.encode_ffn_block(layer_idx)?;
 
-            if layer_idx < 2 {
+            {
                 let h = unsafe { read_buffer_slice(&self.hidden_a, self.hidden_size) };
                 let (hn, hmin, hmax) = buf_stats(&h);
-                eprintln!("  [L{layer_idx} ffn] hidden_a: nan={hn} min={hmin:.4} max={hmax:.4}");
+                if hn || hmin.is_nan() || hmax.is_nan() || hmin.abs() > 1e6 || hmax.abs() > 1e6 {
+                    eprintln!("  [L{layer_idx} ffn] PROBLEM: nan={hn} min={hmin:.4} max={hmax:.4}");
+                }
             }
         }
 
@@ -1187,6 +1186,7 @@ impl GpuForwardPass {
 
     /// Encode final RMSNorm + lm_head matvec to produce logits.
     fn encode_final_logits(&self) -> Result<(), String> {
+        // Step 1: RMSNorm (separate command buffer for debug readback)
         let cmd_buf = self
             .device
             .command_queue
@@ -1204,11 +1204,52 @@ impl GpuForwardPass {
             &self.hidden_b,
         );
 
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        validate_command_buffer(&cmd_buf, "final_rmsnorm", 0)?;
+
+        // Debug: check hidden_a and hidden_b after RMSNorm
+        let debug = std::env::var("GPU_DEBUG").is_ok();
+        if debug {
+            let ha = unsafe { read_buffer_slice(&self.hidden_a, self.hidden_size) };
+            let hb = unsafe { read_buffer_slice(&self.hidden_b, self.hidden_size) };
+            let (han, hamin, hamax) = buf_stats(&ha);
+            let (hbn, hbmin, hbmax) = buf_stats(&hb);
+            eprintln!("  [final_rmsnorm] hidden_a: nan={han} min={hamin:.4} max={hamax:.4}");
+            eprintln!("  [final_rmsnorm] hidden_b: nan={hbn} min={hbmin:.4} max={hbmax:.4}");
+            eprintln!("  [final_rmsnorm] lm_head_is_f32={} lm_head_q6k={} lm_head_q8={} lm_head.offset={}",
+                self.weight_store.lm_head_is_f32(),
+                self.weight_store.lm_head_q6k().is_some(),
+                self.weight_store.lm_head_q8().is_some(),
+                self.weight_store.lm_head().offset,
+            );
+        }
+
+        // Step 2: lm_head matvec (separate command buffer)
+        let cmd_buf2 = self
+            .device
+            .command_queue
+            .commandBuffer()
+            .expect("Failed to create command buffer");
+        let encoder2 = cmd_buf2
+            .computeCommandEncoder()
+            .expect("Failed to create compute encoder");
+
         // LM head matvec: hidden_b -> logits_buf [vocab_size]
-        if self.weight_store.lm_head_is_f32() {
+        if let Some(wb) = self.weight_store.lm_head_q6k() {
+            self.encode_matvec_q6_k(
+                &encoder2,
+                &wb.buffer, wb.offset,
+                &self.hidden_b,
+                &self.logits_buf,
+                self.vocab_size,
+                self.hidden_size,
+            );
+        } else if self.weight_store.lm_head_is_f32() {
             let wb = self.weight_store.lm_head();
             self.encode_matvec_f32(
-                &encoder,
+                &encoder2,
                 &wb.buffer, wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
@@ -1218,7 +1259,7 @@ impl GpuForwardPass {
         } else {
             let wb = self.weight_store.lm_head();
             self.encode_matvec_q4_0(
-                &encoder,
+                &encoder2,
                 &wb.buffer, wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
@@ -1227,10 +1268,10 @@ impl GpuForwardPass {
             );
         }
 
-        encoder.endEncoding();
-        cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
-        validate_command_buffer(&cmd_buf, "final_logits", 0)
+        encoder2.endEncoding();
+        cmd_buf2.commit();
+        cmd_buf2.waitUntilCompleted();
+        validate_command_buffer(&cmd_buf2, "final_logits", 0)
     }
 
     // -----------------------------------------------------------------------

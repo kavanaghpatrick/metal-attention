@@ -18,15 +18,13 @@ pub enum GgufType {
     #[allow(non_camel_case_types)]
     Q3_K = 11,
     #[allow(non_camel_case_types)]
-    Q4_K_S = 12,
+    Q4_K = 12,
     #[allow(non_camel_case_types)]
-    Q4_K_M = 13,
+    Q5_K = 13,
     #[allow(non_camel_case_types)]
-    Q5_K_S = 14,
+    Q6_K = 14,
     #[allow(non_camel_case_types)]
-    Q5_K_M = 15,
-    #[allow(non_camel_case_types)]
-    Q6_K = 18,
+    Q8_K = 15,
     I8 = 24,
     I16 = 25,
     I32 = 26,
@@ -49,11 +47,10 @@ impl GgufType {
             9 => Some(Self::Q8_1),
             10 => Some(Self::Q2_K),
             11 => Some(Self::Q3_K),
-            12 => Some(Self::Q4_K_S),
-            13 => Some(Self::Q4_K_M),
-            14 => Some(Self::Q5_K_S),
-            15 => Some(Self::Q5_K_M),
-            18 => Some(Self::Q6_K),
+            12 => Some(Self::Q4_K),
+            13 => Some(Self::Q5_K),
+            14 => Some(Self::Q6_K),
+            15 => Some(Self::Q8_K),
             24 => Some(Self::I8),
             25 => Some(Self::I16),
             26 => Some(Self::I32),
@@ -74,9 +71,10 @@ impl GgufType {
             Self::Q8_0 | Self::Q8_1 => 32,
             Self::Q2_K => 256,
             Self::Q3_K => 256,
-            Self::Q4_K_S | Self::Q4_K_M => 256,
-            Self::Q5_K_S | Self::Q5_K_M => 256,
+            Self::Q4_K => 256,
+            Self::Q5_K => 256,
             Self::Q6_K => 256,
+            Self::Q8_K => 256,
         }
     }
 
@@ -108,16 +106,14 @@ impl GgufType {
             Self::Q2_K => 84,
             // Q3_K: 256/4=64 qs + 256/8=32 hmask + 12 scales + 2 d = 110
             Self::Q3_K => 110,
-            // Q4_K_S: 256/2=128 qs + 12 scales + 2 d + 2 dmin = 144
-            Self::Q4_K_S => 144,
-            // Q4_K_M: same as Q4_K_S
-            Self::Q4_K_M => 144,
-            // Q5_K_S: 256/2=128 qs + 256/8=32 qh + 12 scales + 2 d + 2 dmin = 176
-            Self::Q5_K_S => 176,
-            // Q5_K_M: same as Q5_K_S
-            Self::Q5_K_M => 176,
-            // Q6_K: 256*3/4=192 ql + 256/2=128 qh + 256/16=16 scales + 2 d = 210
+            // Q4_K: 256/2=128 qs + 12 scales + 2 d + 2 dmin = 144
+            Self::Q4_K => 144,
+            // Q5_K: 256/2=128 qs + 256/8=32 qh + 12 scales + 2 d + 2 dmin = 176
+            Self::Q5_K => 176,
+            // Q6_K: 256/2=128 ql + 256/4=64 qh + 256/16=16 scales + 2 d = 210
             Self::Q6_K => 210,
+            // Q8_K: 256 qs + 16 bsums (int16) + 4 d (float32) = 292
+            Self::Q8_K => 292,
         }
     }
 
@@ -139,8 +135,8 @@ mod tests {
         assert_eq!(GgufType::from_u32(1), Some(GgufType::F16));
         assert_eq!(GgufType::from_u32(2), Some(GgufType::Q4_0));
         assert_eq!(GgufType::from_u32(8), Some(GgufType::Q8_0));
-        assert_eq!(GgufType::from_u32(13), Some(GgufType::Q4_K_M));
-        assert_eq!(GgufType::from_u32(18), Some(GgufType::Q6_K));
+        assert_eq!(GgufType::from_u32(13), Some(GgufType::Q5_K));
+        assert_eq!(GgufType::from_u32(14), Some(GgufType::Q6_K));
         assert_eq!(GgufType::from_u32(99), None);
     }
 
@@ -150,8 +146,9 @@ mod tests {
         assert_eq!(GgufType::F16.block_size(), 1);
         assert_eq!(GgufType::Q4_0.block_size(), 32);
         assert_eq!(GgufType::Q8_0.block_size(), 32);
-        assert_eq!(GgufType::Q4_K_M.block_size(), 256);
+        assert_eq!(GgufType::Q4_K.block_size(), 256);
         assert_eq!(GgufType::Q6_K.block_size(), 256);
+        assert_eq!(GgufType::Q8_K.block_size(), 256);
     }
 
     #[test]
@@ -160,7 +157,10 @@ mod tests {
         assert_eq!(GgufType::F16.bytes_per_block(), 2);
         assert_eq!(GgufType::Q4_0.bytes_per_block(), 18);
         assert_eq!(GgufType::Q8_0.bytes_per_block(), 34);
-        assert_eq!(GgufType::Q4_K_M.bytes_per_block(), 144);
+        assert_eq!(GgufType::Q4_K.bytes_per_block(), 144);
+        assert_eq!(GgufType::Q5_K.bytes_per_block(), 176);
+        assert_eq!(GgufType::Q6_K.bytes_per_block(), 210);
+        assert_eq!(GgufType::Q8_K.bytes_per_block(), 292);
     }
 
     #[test]
@@ -173,7 +173,9 @@ mod tests {
         assert_eq!(GgufType::Q4_0.tensor_byte_size(32), 18);
         // 64 Q4_0 elements = 2 blocks * 18 = 36
         assert_eq!(GgufType::Q4_0.tensor_byte_size(64), 36);
-        // 256 Q4_K_M elements = 1 block * 144 bytes = 144
-        assert_eq!(GgufType::Q4_K_M.tensor_byte_size(256), 144);
+        // 256 Q4_K elements = 1 block * 144 bytes = 144
+        assert_eq!(GgufType::Q4_K.tensor_byte_size(256), 144);
+        assert_eq!(GgufType::Q5_K.tensor_byte_size(256), 176);
+        assert_eq!(GgufType::Q6_K.tensor_byte_size(256), 210);
     }
 }

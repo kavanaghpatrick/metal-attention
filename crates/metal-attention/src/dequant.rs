@@ -163,7 +163,7 @@ mod tests {
         // Q4_K_M is not supported by dequantize_tensor
         let data = GgufBuilder::new()
             .add_string("general.architecture", "llama")
-            .add_tensor_zeros("qkm_test.weight", &[256], GgufType::Q4_K_M)
+            .add_tensor_zeros("qkm_test.weight", &[256], GgufType::Q4_K)
             .build();
 
         let gguf = GgufFile::from_bytes(data).expect("parse failed");
