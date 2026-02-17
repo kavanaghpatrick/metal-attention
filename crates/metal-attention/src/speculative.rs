@@ -2,9 +2,9 @@
 //! verified in batch by the target model.
 //!
 //! Draft model generates N candidate tokens autoregressively, then
-//! the target model verifies all N tokens in a single batched
-//! `forward_prompt_logits` call. Tokens are accepted greedily
-//! (argmax match) with KV cache rollback on rejection.
+//! the target model verifies all N+1 tokens (last_token + drafts) in a
+//! single batched `forward_prompt_logits` call. Tokens are accepted
+//! greedily (argmax match) with KV cache rollback on rejection.
 
 use std::path::Path;
 
@@ -113,20 +113,18 @@ impl SpeculativeDecoder {
             return Err("prompt must not be empty".to_string());
         }
 
-        // Prefill both models with the prompt
-        let draft_token = self.draft.forward_prompt(prompt)?;
+        // Prefill both models with the prompt.
+        // After forward_prompt, both models have the full prompt in their KV caches
+        // at position 0..N-1 and return the argmax predicted next token.
+        let _draft_token = self.draft.forward_prompt(prompt)?;
         let target_token = self.target.forward_prompt(prompt)?;
 
-        // Use target's first token (more accurate)
+        // Use target's first token (more accurate).
+        // Both models' KV caches are identical (full prompt). The next round
+        // will feed target_token to both models as part of its normal flow.
         let mut last_token = target_token;
         let mut generated = vec![last_token];
         callback(last_token);
-
-        // If draft and target diverge on first token, rollback draft
-        if draft_token != target_token {
-            self.draft.rollback_to(self.draft.position() - 1);
-            let _ = self.draft.forward_token_greedy(target_token)?;
-        }
 
         let mut stats = SpecStats::new();
         stats.tokens_accepted += 1;
@@ -136,7 +134,6 @@ impl SpeculativeDecoder {
             generated.extend_from_slice(&accepted);
 
             if accepted.is_empty() {
-                // Should not happen — at minimum the target produces 1 token
                 break;
             }
             last_token = *accepted.last().unwrap();
@@ -150,6 +147,19 @@ impl SpeculativeDecoder {
 
     /// Run one speculation round: draft N tokens, verify, accept/reject.
     ///
+    /// Both models start at the same position P. Neither model has processed
+    /// `last_token` as input yet (it was the output of the previous step).
+    ///
+    /// Algorithm:
+    /// 1. Draft generates N tokens: feeds [last_token, d₁, ..., d_{N-1}],
+    ///    returns [d₁, d₂, ..., dₙ]. Draft position becomes P + N.
+    /// 2. Target verifies by processing [last_token, d₁, ..., dₙ] in one batch.
+    ///    target_logits[k] = logits after seeing [last_token, d₁, ..., dₖ].
+    ///    argmax(target_logits[k]) should match draft_tokens[k] for acceptance.
+    /// 3. On rejection at k: rollback both to P + k + 1 (keep last_token + d₁..dₖ₋₁).
+    ///    On all-accepted: sync draft to P + N + 1 (feed dₙ to draft).
+    ///    The bonus/replacement token is NOT fed; next round handles it.
+    ///
     /// Returns the accepted tokens from this round (always >= 1).
     fn speculation_round(
         &mut self,
@@ -159,10 +169,12 @@ impl SpeculativeDecoder {
     ) -> Result<Vec<u32>, String> {
         stats.rounds += 1;
 
-        // Phase 1: Draft N tokens autoregressively
         let draft_pos_before = self.draft.position();
         let target_pos_before = self.target.position();
 
+        // Phase 1: Draft N tokens autoregressively.
+        // Feeds: last_token → d₁, d₁ → d₂, ..., d_{N-1} → dₙ.
+        // Draft position after: P + N.
         let mut draft_tokens = Vec::with_capacity(self.n_draft);
         let mut current = last_token;
         for _ in 0..self.n_draft {
@@ -171,115 +183,73 @@ impl SpeculativeDecoder {
         }
         stats.tokens_drafted += draft_tokens.len();
 
-        // Phase 2: Verify all draft tokens with target model in one batch
-        // The verification input is [last_token, draft_0, draft_1, ..., draft_{N-2}]
-        // This gives us logits at positions corresponding to draft_0, draft_1, ..., draft_{N-1}
-        // But actually — the target already processed last_token during its previous step.
-        // We need to feed the draft tokens to get logits at each position.
-        let verify_input: Vec<u32> = draft_tokens.clone();
+        // Phase 2: Verify with target model in one batch.
+        // Include last_token so the target processes the same sequence as the draft.
+        // verify_input = [last_token, d₁, d₂, ..., dₙ]  (N+1 tokens)
+        // target_logits[k] = logits after processing verify_input[0..=k]
+        //   → argmax(target_logits[k]) = what target predicts after seeing
+        //     [last_token, d₁, ..., dₖ]
+        //   → Compare with draft_tokens[k] to verify acceptance.
+        let mut verify_input = Vec::with_capacity(1 + self.n_draft);
+        verify_input.push(last_token);
+        verify_input.extend_from_slice(&draft_tokens);
         let target_logits = self.target.forward_prompt_logits(&verify_input)?;
 
-        // Phase 3: Accept/reject (greedy)
-        // target_logits[i] are the logits after processing draft_tokens[i]
-        // The target's greedy pick at position i is what the target would have
-        // generated if it saw tokens [0..=i]. Compare with draft_tokens[i+1]
-        // (the next draft token) for acceptance.
-        //
-        // More precisely:
-        // - target_logits[0] = logits after target sees draft_tokens[0]
-        //   → target would produce argmax(target_logits[0]) as next token
-        //   → compare with draft_tokens[1] (if exists)
-        // - target_logits[N-1] = logits after target sees all draft tokens
-        //   → this gives us one "bonus" token even if all drafts rejected
-
+        // Phase 3: Greedy accept/reject.
+        // target_logits[k] predicts the token after [last_token, d₁, ..., dₖ].
+        // For k=0: predicts after last_token → should match d₁ = draft_tokens[0].
+        // For k=j: predicts after [last_token, d₁, ..., dⱼ] → should match draft_tokens[j].
+        // For k=N: predicts after all → bonus token (no draft token to compare).
         let mut accepted = Vec::new();
         let mut first_rejection = None;
 
-        for i in 0..draft_tokens.len() {
-            let target_pick = sample_greedy(&target_logits[i]);
-            if i == 0 {
-                // First draft token: we need to check if the target agrees
-                // with draft_tokens[0]. But draft_tokens[0] was generated
-                // by the draft model from last_token. The target already
-                // consumed last_token. Now target_logits[0] is what the
-                // target produces after consuming draft_tokens[0].
-                // We accept draft_tokens[0] if target's pick at position
-                // i-1 would have been draft_tokens[0]. But we don't have
-                // that logit! We'd need the logits from the target's
-                // perspective BEFORE consuming draft_tokens[0].
-                //
-                // Simpler approach for greedy: accept draft_tokens[i] and
-                // use target_logits[i] to determine the NEXT token.
-                // Accept all consecutive matches.
-                accepted.push(draft_tokens[i]);
+        for k in 0..draft_tokens.len() {
+            let target_pick = sample_greedy(&target_logits[k]);
+            if target_pick == draft_tokens[k] {
+                // Target agrees with draft's prediction
+                accepted.push(draft_tokens[k]);
                 stats.draft_accepted += 1;
-                callback(draft_tokens[i]);
-
-                // Check if the target would have picked a different next token
-                if i + 1 < draft_tokens.len() && target_pick != draft_tokens[i + 1] {
-                    // Target disagrees on what comes next — accept up to here
-                    // and use target's pick as the bonus token
-                    accepted.push(target_pick);
-                    stats.tokens_accepted += 1;
-                    callback(target_pick);
-                    first_rejection = Some(i + 1);
-                    break;
-                }
-            } else if i + 1 < draft_tokens.len() {
-                // Middle tokens: check if target agrees with next draft token
-                accepted.push(draft_tokens[i]);
-                stats.draft_accepted += 1;
-                callback(draft_tokens[i]);
-
-                if target_pick != draft_tokens[i + 1] {
-                    accepted.push(target_pick);
-                    stats.tokens_accepted += 1;
-                    callback(target_pick);
-                    first_rejection = Some(i + 1);
-                    break;
-                }
+                callback(draft_tokens[k]);
             } else {
-                // Last draft token: always accept + bonus from target
-                accepted.push(draft_tokens[i]);
-                stats.draft_accepted += 1;
-                callback(draft_tokens[i]);
-
-                // Bonus token from target
+                // Target disagrees — use target's pick instead
                 accepted.push(target_pick);
-                stats.tokens_accepted += 1;
                 callback(target_pick);
+                first_rejection = Some(k);
+                break;
             }
         }
 
-        stats.tokens_accepted += accepted.len().saturating_sub(1); // bonus already counted
+        // If all draft tokens accepted, add bonus from target
+        if first_rejection.is_none() {
+            let bonus = sample_greedy(&target_logits[draft_tokens.len()]);
+            accepted.push(bonus);
+            callback(bonus);
+        }
 
-        // Phase 4: Rollback rejected tokens from both models' KV caches
-        if let Some(reject_idx) = first_rejection {
-            // Draft model: rollback to before the rejected draft tokens
-            let draft_rollback = draft_pos_before + reject_idx;
-            self.draft.rollback_to(draft_rollback);
+        stats.tokens_accepted += accepted.len();
 
-            // Target model: rollback to match accepted count
-            // Target processed all draft_tokens via forward_prompt_logits,
-            // but we only want to keep accepted.len() - 1 positions
-            // (the bonus token hasn't been fed yet)
-            let target_rollback = target_pos_before + reject_idx;
-            self.target.rollback_to(target_rollback);
+        // Phase 4: Rollback and sync KV caches.
+        // After this phase, both models should have identical KV state.
+        // The last accepted token is NOT fed to either model — the next round
+        // will include it as last_token in its verify_input/draft generation.
+        if let Some(k) = first_rejection {
+            // Rejected at position k. Keep KV entries for:
+            // [last_token, d₁, ..., d_{k-1}] = k+1 entries from pos_before.
+            // (d_k was rejected, target_pick replaces it but isn't fed yet.)
+            let sync_pos = draft_pos_before + k + 1;
+            self.draft.rollback_to(sync_pos);
 
-            // Feed the bonus token (target's pick) through both models
-            // so they're synced for the next round
-            let bonus = accepted.last().copied().unwrap();
-            let _ = self.draft.forward_token_greedy(bonus)?;
-            let _ = self.target.forward_token_greedy(bonus)?;
+            let target_sync_pos = target_pos_before + k + 1;
+            self.target.rollback_to(target_sync_pos);
         } else {
-            // All draft tokens accepted + bonus: draft needs to catch up
-            // with the bonus token
-            let bonus = accepted.last().copied().unwrap();
-
-            // Target already processed all draft tokens via forward_prompt_logits.
-            // Now feed the bonus token to both.
-            let _ = self.draft.forward_token_greedy(bonus)?;
-            let _ = self.target.forward_token_greedy(bonus)?;
+            // All N draft tokens accepted + bonus.
+            // Target processed [last_token, d₁, ..., dₙ] (N+1 tokens),
+            // so target position = P + N + 1.
+            // Draft processed [last_token, d₁, ..., d_{N-1}] (N tokens),
+            // so draft position = P + N.
+            // Feed dₙ to draft to sync both at P + N + 1.
+            let _ = self.draft.forward_token_greedy(*draft_tokens.last().unwrap())?;
+            // Now both at position P + N + 1. Bonus is NOT fed.
         }
 
         Ok(accepted)
