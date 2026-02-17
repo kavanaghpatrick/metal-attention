@@ -778,3 +778,79 @@ fn test_mistral_batch_vs_sequential() {
 
     eprintln!("test_mistral_batch_vs_sequential: PASS (both={seq_token})");
 }
+
+// ============================================================================
+// KV cache rollback correctness
+// ============================================================================
+
+/// Verify that KV cache rollback + re-append produces identical logits.
+///
+/// Process tokens [1,2,3,4,5], capture logits at position 5.
+/// Rollback to position 3, re-process [4,5], compare logits.
+/// Must match exactly since the same data is read/written.
+#[test]
+#[ignore]
+fn test_kv_cache_rollback() {
+    let path = model_path();
+    assert!(
+        path.exists(),
+        "Model file not found: {path:?}. Download SmolLM-135M.Q4_0.gguf first."
+    );
+    let path = path.as_path();
+
+    let tokens: &[u32] = &[1, 2, 3, 4, 5];
+
+    // --- Full forward pass: process all 5 tokens ---
+    let mut gpu = GpuForwardPass::from_gguf(path).expect("Failed to load model");
+    let mut logits_at_5 = Vec::new();
+    for &tok in tokens {
+        logits_at_5 = gpu.forward_token(tok).expect("forward_token failed");
+    }
+    assert_eq!(gpu.position(), 5);
+
+    // --- Rollback to position 3 (after tokens [1,2,3]) ---
+    gpu.rollback_to(3);
+    assert_eq!(gpu.position(), 3);
+
+    // --- Re-process tokens [4, 5] ---
+    let mut logits_after_rollback = Vec::new();
+    for &tok in &tokens[3..] {
+        logits_after_rollback = gpu.forward_token(tok).expect("forward_token after rollback failed");
+    }
+    assert_eq!(gpu.position(), 5);
+
+    // --- Compare logits ---
+    assert_eq!(
+        logits_at_5.len(),
+        logits_after_rollback.len(),
+        "Logit vector lengths differ: original={} rollback={}",
+        logits_at_5.len(),
+        logits_after_rollback.len()
+    );
+
+    let max_diff = logits_at_5
+        .iter()
+        .zip(logits_after_rollback.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    eprintln!(
+        "KV cache rollback: max logit diff = {max_diff:.6} (expect 0.0)"
+    );
+
+    // Must be bit-identical (same GPU ops, same data)
+    assert!(
+        max_diff == 0.0,
+        "Logits differ after rollback+re-append: max_diff={max_diff:.6}"
+    );
+
+    // Verify greedy tokens match
+    let token_original = sample_greedy(&logits_at_5);
+    let token_rollback = sample_greedy(&logits_after_rollback);
+    assert_eq!(
+        token_original, token_rollback,
+        "Greedy tokens differ: original={token_original} rollback={token_rollback}"
+    );
+
+    eprintln!("test_kv_cache_rollback: PASS (greedy token={token_original})");
+}
