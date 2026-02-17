@@ -662,3 +662,69 @@ fn test_mistral_q6k_end_to_end() {
 
     eprintln!("Mistral-7B Q6_K end-to-end: PASS ({tok_per_sec:.1} tok/s)");
 }
+
+/// Verify that forward_prompt (batched prefill) works for Mistral-7B GQA.
+///
+/// Loads Mistral-7B, calls forward_prompt() with a 32-token prompt, and
+/// verifies the returned token is valid (< vocab_size). This tests the
+/// batched Q4_0 matvec path with Mistral-7B's GQA (32 Q heads / 8 KV heads)
+/// and the Q6_K lm_head dispatch.
+#[test]
+#[ignore]
+fn test_mistral_forward_prompt() {
+    let path = mistral_model_path();
+    assert!(
+        path.exists(),
+        "Mistral-7B model not found: {path:?}. Download mistral-7b-v0.1.Q4_0.gguf first."
+    );
+    let path = path.as_path();
+
+    // 32-token prompt (synthetic token IDs, all valid for Mistral vocab_size=32000)
+    let prompt: Vec<u32> = (1..=32).collect();
+
+    eprintln!("Loading Mistral-7B for forward_prompt test...");
+    let load_start = std::time::Instant::now();
+    let mut gpu = GpuForwardPass::from_gguf(path).expect("Failed to load Mistral-7B");
+    eprintln!("Model loaded in {:.2}s", load_start.elapsed().as_secs_f64());
+
+    // Call forward_prompt with the 32-token prompt
+    eprintln!("Running forward_prompt with {} tokens...", prompt.len());
+    let prefill_start = std::time::Instant::now();
+    let result_token = gpu
+        .forward_prompt(&prompt)
+        .expect("forward_prompt failed on Mistral-7B");
+    let prefill_elapsed = prefill_start.elapsed();
+
+    let tok_per_sec = prompt.len() as f64 / prefill_elapsed.as_secs_f64();
+    eprintln!(
+        "forward_prompt: {} tokens in {:.3}s = {:.1} tok/s, output token = {}",
+        prompt.len(),
+        prefill_elapsed.as_secs_f64(),
+        tok_per_sec,
+        result_token
+    );
+
+    // Verify output token is valid
+    assert!(
+        (result_token as usize) < 32000,
+        "forward_prompt returned invalid token {} (vocab_size=32000)",
+        result_token
+    );
+
+    // Verify we can continue generating after forward_prompt
+    let logits = gpu
+        .forward_token(result_token)
+        .expect("forward_token after forward_prompt failed");
+    assert_eq!(logits.len(), 32000, "Expected 32000 logits after decode step");
+    assert!(
+        !logits.iter().any(|v| v.is_nan() || v.is_infinite()),
+        "Logits contain NaN or Inf after decode step following forward_prompt"
+    );
+
+    let next_token = sample_greedy(&logits);
+    eprintln!(
+        "Continued generation: token after forward_prompt={result_token}, next={next_token}"
+    );
+
+    eprintln!("test_mistral_forward_prompt: PASS ({tok_per_sec:.1} tok/s prefill)");
+}
