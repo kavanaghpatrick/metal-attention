@@ -13,6 +13,7 @@ pub mod inference;
 pub mod model;
 pub mod sampling;
 pub mod speculative;
+mod eagle_head;
 
 // Re-exports for convenience
 pub use config::InferenceConfig;
