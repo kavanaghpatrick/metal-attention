@@ -870,15 +870,16 @@ impl GpuForwardPass {
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_1, tg_32);
 
         // lm_head: hidden_b -> logits_buf (single token, reuse existing buffers)
-        // Prefer Q6_K > Q8_0 > F32 > Q4_0
+        // Prefer Q6_K (batched) > Q8_0 > F32 > Q4_0
         if let Some(wb) = self.weight_store.lm_head_q6k() {
-            self.encode_matvec_q6_k(
+            self.encode_multi_token_matvec_q6_k(
                 &encoder,
                 &wb.buffer, wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
                 h,
+                1, // single token (last token only)
             );
         } else if let Some(wb) = self.weight_store.lm_head_q8() {
             self.encode_matvec_q8_0(
@@ -1677,6 +1678,51 @@ impl GpuForwardPass {
             .pso_cache
             .get(&PsoKey::simple("multi_token_matvec_q4_0_accumulate"))
             .expect("multi_token_matvec_q4_0_accumulate PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, weight_buf, weight_offset, 0);
+        set_buffer(encoder, input_buf, 0, 1);
+        set_buffer(encoder, output_buf, 0, 2);
+
+        let out_dim_u32 = out_dim as u32;
+        let in_dim_u32 = in_dim as u32;
+        let batch_size_u32 = batch_size as u32;
+        set_bytes(encoder, &out_dim_u32, 3);
+        set_bytes(encoder, &in_dim_u32, 4);
+        set_bytes(encoder, &batch_size_u32, 5);
+
+        const ROWS_PER_TG: usize = 8;
+        let grid = MTLSize {
+            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode multi-token Q6_K matvec: output[batch] = W * input[batch].
+    /// Same dispatch pattern as Q4_0 but uses the Q6_K kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_multi_token_matvec_q6_k(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        weight_buf: &ProtocolObject<dyn MTLBuffer>,
+        weight_offset: usize,
+        input_buf: &ProtocolObject<dyn MTLBuffer>,
+        output_buf: &ProtocolObject<dyn MTLBuffer>,
+        out_dim: usize,
+        in_dim: usize,
+        batch_size: usize,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("multi_token_matvec_q6_k"))
+            .expect("multi_token_matvec_q6_k PSO not prewarmed");
 
         encoder.setComputePipelineState(pso);
         set_buffer(encoder, weight_buf, weight_offset, 0);
