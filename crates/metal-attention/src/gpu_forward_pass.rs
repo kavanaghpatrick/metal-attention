@@ -1100,13 +1100,13 @@ impl GpuForwardPass {
             .expect("Failed to create compute encoder");
 
         let initial_pos = self.position;
-        let hidden_dim_u32 = h as u32;
+        let _hidden_dim_u32 = h as u32;
         let num_heads_u32 = self.num_heads as u32;
         let num_kv_heads_u32 = self.num_kv_heads as u32;
         let head_dim_u32 = self.head_dim as u32;
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
 
-        let grid_1 = MTLSize {
+        let _grid_1 = MTLSize {
             width: 1,
             height: 1,
             depth: 1,
@@ -1347,7 +1347,7 @@ impl GpuForwardPass {
                 set_bytes(&encoder, &in_dim_u32, 4);
                 const ROWS_PER_TG: usize = 8;
                 let grid = MTLSize {
-                    width: (self.vocab_size + ROWS_PER_TG - 1) / ROWS_PER_TG,
+                    width: self.vocab_size.div_ceil(ROWS_PER_TG),
                     height: 1,
                     depth: 1,
                 };
@@ -1376,7 +1376,7 @@ impl GpuForwardPass {
                 set_bytes(&encoder, &in_dim_u32, 4);
                 const ROWS_PER_TG: usize = 8;
                 let grid = MTLSize {
-                    width: (self.vocab_size + ROWS_PER_TG - 1) / ROWS_PER_TG,
+                    width: self.vocab_size.div_ceil(ROWS_PER_TG),
                     height: 1,
                     depth: 1,
                 };
@@ -1826,6 +1826,7 @@ impl GpuForwardPass {
     /// Encode v5 coalesced Q4_0 dequant + matvec: weight * input -> output.
     /// Uses multi-row dispatch: 8 rows per threadgroup, 256 threads (8 simdgroups).
     /// Dispatch: grid=(ceil(out_dim/8)) threadgroups, threadgroup=(256).
+    #[allow(clippy::too_many_arguments)]
     fn encode_matvec_q4_0(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -1853,7 +1854,7 @@ impl GpuForwardPass {
 
         const ROWS_PER_TG: usize = 8;
         let grid = MTLSize {
-            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            width: out_dim.div_ceil(ROWS_PER_TG),
             height: 1,
             depth: 1,
         };
@@ -1907,7 +1908,7 @@ impl GpuForwardPass {
         let total_rows = dim_a + dim_b + dim_c;
         const ROWS_PER_TG: usize = 8;
         let grid = MTLSize {
-            width: (total_rows + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            width: total_rows.div_ceil(ROWS_PER_TG),
             height: 1,
             depth: 1,
         };
@@ -1948,6 +1949,7 @@ impl GpuForwardPass {
     /// Encode v2 multi-row F32 matvec: weight * input -> output.
     /// Uses 8 rows per threadgroup, 256 threads (8 simdgroups), float4 vectorized reads.
     /// Dispatch: grid=(ceil(out_dim/8)) threadgroups, threadgroup=(256).
+    #[allow(clippy::too_many_arguments)]
     fn encode_matvec_f32(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -1975,7 +1977,7 @@ impl GpuForwardPass {
 
         const ROWS_PER_TG: usize = 8;
         let grid = MTLSize {
-            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            width: out_dim.div_ceil(ROWS_PER_TG),
             height: 1,
             depth: 1,
         };
@@ -1989,6 +1991,7 @@ impl GpuForwardPass {
 
     /// Encode Q6_K matvec: weight * input -> output.
     /// Raw byte buffer with 210-byte super-blocks. 256 threads, 8 rows/TG.
+    #[allow(clippy::too_many_arguments)]
     fn encode_matvec_q6_k(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -2016,7 +2019,7 @@ impl GpuForwardPass {
 
         const ROWS_PER_TG: usize = 8;
         let grid = MTLSize {
-            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            width: out_dim.div_ceil(ROWS_PER_TG),
             height: 1,
             depth: 1,
         };
@@ -2030,6 +2033,7 @@ impl GpuForwardPass {
 
     /// Encode Q8_0 matvec: weight * input -> output.
     /// Same dispatch geometry as Q4_0 v5: 256 threads, 8 rows/TG.
+    #[allow(clippy::too_many_arguments)]
     fn encode_matvec_q8_0(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -2057,7 +2061,7 @@ impl GpuForwardPass {
 
         const ROWS_PER_TG: usize = 8;
         let grid = MTLSize {
-            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            width: out_dim.div_ceil(ROWS_PER_TG),
             height: 1,
             depth: 1,
         };
@@ -2108,7 +2112,7 @@ impl GpuForwardPass {
 
         const ROWS_PER_TG: usize = 8;
         let grid = MTLSize {
-            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            width: out_dim.div_ceil(ROWS_PER_TG),
             height: 1,
             depth: 1,
         };
@@ -2154,7 +2158,7 @@ impl GpuForwardPass {
 
         const ROWS_PER_TG: usize = 8;
         let grid = MTLSize {
-            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            width: out_dim.div_ceil(ROWS_PER_TG),
             height: 1,
             depth: 1,
         };
@@ -2199,7 +2203,7 @@ impl GpuForwardPass {
 
         const ROWS_PER_TG: usize = 8;
         let grid = MTLSize {
-            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            width: out_dim.div_ceil(ROWS_PER_TG),
             height: 1,
             depth: 1,
         };
@@ -2244,7 +2248,7 @@ impl GpuForwardPass {
 
         const ROWS_PER_TG: usize = 8;
         let grid = MTLSize {
-            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            width: out_dim.div_ceil(ROWS_PER_TG),
             height: 1,
             depth: 1,
         };
@@ -2260,6 +2264,7 @@ impl GpuForwardPass {
     ///
     /// For each token in `0..batch_size`, dispatches rmsnorm_optimized with
     /// input/output buffers offset by `tok * dim * sizeof(f32)`.
+    #[allow(clippy::too_many_arguments)]
     fn encode_rmsnorm_batched(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -2298,6 +2303,7 @@ impl GpuForwardPass {
     ///
     /// For each token in `0..batch_size`, dispatches ffn_silu with
     /// gate/up/output buffers offset by `tok * ffn_dim * sizeof(f32)`.
+    #[allow(clippy::too_many_arguments)]
     fn encode_silu_batched(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -2341,6 +2347,7 @@ impl GpuForwardPass {
     /// Fused SiLU + Q4_0 down-projection matvec with accumulate.
     /// output[row] += dot(weight_row, silu(gate) * up)
     /// Saves 2 dispatches per layer (SiLU + residual_add_inplace).
+    #[allow(dead_code, clippy::too_many_arguments)]
     fn encode_silu_matvec_q4_0_accumulate(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -2369,7 +2376,7 @@ impl GpuForwardPass {
 
         const ROWS_PER_TG: usize = 8;
         let grid = MTLSize {
-            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            width: out_dim.div_ceil(ROWS_PER_TG),
             height: 1,
             depth: 1,
         };
@@ -2381,6 +2388,7 @@ impl GpuForwardPass {
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 
+    #[allow(dead_code, clippy::too_many_arguments)]
     fn encode_fused_rmsnorm_matvec_q4_0(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -2632,6 +2640,7 @@ impl GpuForwardPass {
     /// Encode in-place residual addition: a[i] += b[i].
     /// Eliminates the separate output buffer + buffer_copy dispatch.
     /// Dispatch: grid=(dim), threadgroup=(256).
+    #[allow(dead_code)]
     fn encode_residual_add_inplace(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,

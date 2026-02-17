@@ -130,26 +130,23 @@ fn make_weight_buffer(
     let aligned_len = offset + data.len();
 
     // Try zero-copy from page-aligned address
-    if let Some(buf) = unsafe {
-        create_weight_buffer(
-            device,
-            aligned_ptr as *mut std::ffi::c_void,
-            aligned_len,
-        )
-    } {
+    if let Some(buf) =
+        unsafe { create_weight_buffer(device, aligned_ptr as *mut std::ffi::c_void, aligned_len) }
+    {
         if std::env::var("GPU_DEBUG").is_ok() && offset > 0 {
             eprintln!(
                 "  tensor {tensor_name} zero-copy with offset={offset} (page-aligned from 0x{aligned_ptr:x})"
             );
         }
-        return WeightBuffer { buffer: buf, offset };
+        return WeightBuffer {
+            buffer: buf,
+            offset,
+        };
     }
 
     // Zero-copy failed, fall back to copy (offset=0 since we copy exact data)
     if std::env::var("GPU_DEBUG").is_ok() {
-        eprintln!(
-            "  tensor {tensor_name} zero-copy failed, falling back to copy"
-        );
+        eprintln!("  tensor {tensor_name} zero-copy failed, falling back to copy");
     }
     WeightBuffer::zero_offset(alloc_buffer_with_data(device, data))
 }
@@ -182,8 +179,7 @@ fn dequantize_q5_k_to_f32(data: &[u8], n_elements: usize) -> Vec<f32> {
         let bp = b * BLOCK_BYTES;
 
         let d = half::f16::from_bits(u16::from_le_bytes([data[bp], data[bp + 1]])).to_f32();
-        let dmin =
-            half::f16::from_bits(u16::from_le_bytes([data[bp + 2], data[bp + 3]])).to_f32();
+        let dmin = half::f16::from_bits(u16::from_le_bytes([data[bp + 2], data[bp + 3]])).to_f32();
 
         // Unpack 6-bit scales and mins for 8 sub-blocks from 12 bytes (K4 scheme)
         let scales_raw = &data[bp + 4..bp + 16];
@@ -251,8 +247,7 @@ fn dequantize_q6_k_to_f32(data: &[u8], n_elements: usize) -> Vec<f32> {
         let ql = &data[bp..bp + 128];
         let qh = &data[bp + 128..bp + 192];
         let scales = &data[bp + 192..bp + 208];
-        let d = half::f16::from_bits(u16::from_le_bytes([data[bp + 208], data[bp + 209]]))
-            .to_f32();
+        let d = half::f16::from_bits(u16::from_le_bytes([data[bp + 208], data[bp + 209]])).to_f32();
 
         // Process two 128-element chunks (n=0, n=128)
         for chunk in 0..2 {
@@ -265,16 +260,12 @@ fn dequantize_q6_k_to_f32(data: &[u8], n_elements: usize) -> Vec<f32> {
                 let is = l / 16; // 0 or 1
 
                 // Reconstruct 6-bit values: 4 low bits from ql + 2 high bits from qh
-                let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32
-                    - 32;
-                let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4))
-                    as i32
-                    - 32;
-                let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32
-                    - 32;
-                let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4))
-                    as i32
-                    - 32;
+                let q1 = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i32 - 32;
+                let q2 =
+                    ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 =
+                    ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
 
                 let sc0 = scales[sc_off + is] as i8 as f32;
                 let sc1 = scales[sc_off + is + 2] as i8 as f32;
@@ -533,7 +524,12 @@ impl GpuWeightStore {
                 GgufType::Q8_0 => (
                     make_weight_buffer(device, lm_data, "output.weight", page_size),
                     false,
-                    Some(make_weight_buffer(device, lm_data, "output.weight(q8)", page_size)),
+                    Some(make_weight_buffer(
+                        device,
+                        lm_data,
+                        "output.weight(q8)",
+                        page_size,
+                    )),
                     None,
                 ),
                 GgufType::F32 => (
@@ -544,7 +540,8 @@ impl GpuWeightStore {
                 ),
                 GgufType::Q6_K => {
                     // Native Q6_K kernel: store raw Q6_K buffer (108 MB vs 512 MB F32)
-                    let q6k_buf = make_weight_buffer(device, lm_data, "output.weight(q6k)", page_size);
+                    let q6k_buf =
+                        make_weight_buffer(device, lm_data, "output.weight(q6k)", page_size);
                     // Also dequantize to F32 as fallback
                     let n_elements = lm_info.shape.iter().product::<u64>() as usize;
                     let f32_vec = dequantize_q6_k_to_f32(lm_data, n_elements);
@@ -556,7 +553,12 @@ impl GpuWeightStore {
                         lm_data.len() as f64 / 1_048_576.0,
                         byte_len as f64 / 1_048_576.0
                     );
-                    (WeightBuffer::zero_offset(alloc_buffer_with_data(device, bytes)), true, None, Some(q6k_buf))
+                    (
+                        WeightBuffer::zero_offset(alloc_buffer_with_data(device, bytes)),
+                        true,
+                        None,
+                        Some(q6k_buf),
+                    )
                 }
                 _ => {
                     // Unsupported quant type — dequantize to F32
@@ -577,7 +579,12 @@ impl GpuWeightStore {
                     let byte_len = f32_vec.len() * std::mem::size_of::<f32>();
                     let ptr = f32_vec.as_ptr() as *const u8;
                     let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
-                    (WeightBuffer::zero_offset(alloc_buffer_with_data(device, bytes)), true, None, None)
+                    (
+                        WeightBuffer::zero_offset(alloc_buffer_with_data(device, bytes)),
+                        true,
+                        None,
+                        None,
+                    )
                 }
             }
         } else {

@@ -183,7 +183,7 @@ pub fn dispatch_matvec_q4_0_v5(
     // 8 rows per threadgroup, 256 threads (8 simdgroups × 32 threads)
     const ROWS_PER_TG: usize = 8;
     let threadgroups_per_grid = MTLSize {
-        width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+        width: out_dim.div_ceil(ROWS_PER_TG),
         height: 1,
         depth: 1,
     };

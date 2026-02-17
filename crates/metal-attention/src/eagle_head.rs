@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! EAGLE-3 draft head: lightweight prediction network for speculative decoding.
 //!
 //! `EagleHead` implements the EAGLE-3 draft head that fuses multi-layer hidden
@@ -133,8 +134,7 @@ impl LcgRng {
             .state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        let val = ((self.state >> 33) as f32) / (u32::MAX as f32) * 0.02 - 0.01;
-        val
+        ((self.state >> 33) as f32) / (u32::MAX as f32) * 0.02 - 0.01
     }
 
     /// Fill a shared Metal buffer with random F32 data.
@@ -291,7 +291,7 @@ impl EagleHead {
         let logits_buf = alloc_buffer_private(dev, vocab_size * f32_size);
 
         // Argmax buffers
-        let num_argmax_groups = (vocab_size + 255) / 256;
+        let num_argmax_groups = vocab_size.div_ceil(256);
         let argmax_partial_vals =
             alloc_buffer_private(dev, num_argmax_groups * f32_size);
         let argmax_partial_idxs =
@@ -705,7 +705,7 @@ impl EagleHead {
 
         const ROWS_PER_TG: usize = 8;
         let grid = MTLSize {
-            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            width: out_dim.div_ceil(ROWS_PER_TG),
             height: 1,
             depth: 1,
         };
@@ -742,7 +742,7 @@ impl EagleHead {
 
         const ROWS_PER_TG: usize = 8;
         let grid = MTLSize {
-            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            width: out_dim.div_ceil(ROWS_PER_TG),
             height: 1,
             depth: 1,
         };
@@ -779,7 +779,7 @@ impl EagleHead {
 
         const ROWS_PER_TG: usize = 8;
         let grid = MTLSize {
-            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            width: out_dim.div_ceil(ROWS_PER_TG),
             height: 1,
             depth: 1,
         };
