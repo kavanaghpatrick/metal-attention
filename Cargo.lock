@@ -528,6 +528,7 @@ dependencies = [
  "clap",
  "half",
  "libc",
+ "memmap2",
  "metal-attention-gguf",
  "metal-attention-kernels",
  "metal-attention-models",
