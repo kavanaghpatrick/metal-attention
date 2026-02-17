@@ -267,11 +267,66 @@ fn bench_prefill_mistral(c: &mut Criterion) {
     eprintln!("Mistral-7B prefill benchmark complete");
 }
 
+/// Benchmark Mistral-7B decode throughput (single-token autoregressive).
+///
+/// Loads Mistral-7B Q4_0, prefills with 3 tokens, then measures 100 decode
+/// tokens. Reports tok/s. Baseline: 42 tok/s. Target with Q6_K: >= 47 tok/s.
+fn bench_decode_mistral(c: &mut Criterion) {
+    let path = mistral_model_path();
+    if !path.exists() {
+        eprintln!(
+            "SKIP bench_decode_mistral: model not found at {}",
+            path.display()
+        );
+        return;
+    }
+
+    let mut gpu = GpuForwardPass::from_gguf(&path).expect("Failed to load Mistral-7B");
+
+    // Warmup: prefill + a few decode tokens
+    for &tok in PREFILL_TOKENS {
+        let _ = gpu.forward_token(tok).expect("warmup prefill failed");
+    }
+    for _ in 0..3 {
+        let logits = gpu.forward_token(1).expect("warmup decode failed");
+        let _ = argmax(&logits);
+    }
+
+    let mut group = c.benchmark_group("mistral_decode");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(60));
+    group.throughput(criterion::Throughput::Elements(DECODE_TOKENS as u64));
+
+    group.bench_function("mistral_decode_100tok", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                gpu.reset();
+                let mut logits = Vec::new();
+                for &tok in PREFILL_TOKENS {
+                    logits = gpu.forward_token(tok).expect("prefill failed");
+                }
+                let start = std::time::Instant::now();
+                for _ in 0..DECODE_TOKENS {
+                    let next = argmax(&logits);
+                    logits = gpu.forward_token(next).expect("decode failed");
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    group.finish();
+    eprintln!("Mistral-7B decode benchmark complete ({DECODE_TOKENS} tokens/iteration)");
+}
+
 criterion_group!(
     benches,
     bench_gpu_decode,
     bench_cpu_decode,
     bench_gpu_prefill,
-    bench_prefill_mistral
+    bench_prefill_mistral,
+    bench_decode_mistral
 );
 criterion_main!(benches);
