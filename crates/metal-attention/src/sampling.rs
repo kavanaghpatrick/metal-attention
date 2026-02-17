@@ -133,7 +133,7 @@ pub fn apply_repetition_penalty(logits: &mut [f32], previous_tokens: &[u32], pen
 }
 
 /// Compute softmax probabilities from logits.
-fn softmax(logits: &[f32]) -> Vec<f32> {
+pub(crate) fn softmax(logits: &[f32]) -> Vec<f32> {
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
     let sum: f32 = exps.iter().sum();
@@ -141,7 +141,7 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
 }
 
 /// Sample an index from a probability distribution.
-fn sample_from_probs(probs: &[f32], rng: &mut SimpleRng) -> u32 {
+pub(crate) fn sample_from_probs(probs: &[f32], rng: &mut SimpleRng) -> u32 {
     let r = rng.next_f32();
     let mut acc = 0.0f32;
     for (i, &p) in probs.iter().enumerate() {
