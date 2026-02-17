@@ -110,6 +110,29 @@ pub struct GpuForwardPass {
 
     /// Cached batch buffers for forward_prompt (reused across calls).
     batch_bufs: Option<BatchBuffers>,
+
+    /// EAGLE-3 hidden state capture buffers (None when EAGLE is disabled).
+    eagle_capture: Option<EagleCaptureBuffers>,
+}
+
+/// Capture buffers for EAGLE-3 hidden state extraction.
+///
+/// Snapshots intermediate hidden states from configurable transformer layers
+/// during forward_token(). Used by the EAGLE draft head for multi-layer
+/// feature fusion. Only allocated when EAGLE mode is enabled.
+pub struct EagleCaptureBuffers {
+    /// Hidden state after the low-level layer (early features).
+    pub feat_low: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Hidden state after the mid-level layer (semantic features).
+    pub feat_mid: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Hidden state after the high-level layer (near-output representations).
+    pub feat_high: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Layer index for low-level features (e.g., 0).
+    pub layer_low: usize,
+    /// Layer index for mid-level features (e.g., num_layers / 2).
+    pub layer_mid: usize,
+    /// Layer index for high-level features (e.g., num_layers - 1).
+    pub layer_high: usize,
 }
 
 impl GpuForwardPass {
@@ -339,6 +362,7 @@ impl GpuForwardPass {
             rms_norm_eps,
             position: 0,
             batch_bufs: None,
+            eagle_capture: None,
         })
     }
 
@@ -401,9 +425,12 @@ impl GpuForwardPass {
             // Single dispatch: 576+192+192 = 960 rows (was 3 separate dispatches)
             self.encode_batched_matvec_q4_0(
                 &encoder,
-                &attn.q.buffer, attn.q.offset,
-                &attn.k.buffer, attn.k.offset,
-                &attn.v.buffer, attn.v.offset,
+                &attn.q.buffer,
+                attn.q.offset,
+                &attn.k.buffer,
+                attn.k.offset,
+                &attn.v.buffer,
+                attn.v.offset,
                 &self.hidden_b,
                 &self.scratch_q,
                 &self.scratch_k,
@@ -447,7 +474,8 @@ impl GpuForwardPass {
             // O projection + residual (fused): hidden_a += O_proj(attn_out)
             self.encode_matvec_q4_0_accumulate(
                 &encoder,
-                &attn.o.buffer, attn.o.offset,
+                &attn.o.buffer,
+                attn.o.offset,
                 &self.scratch_attn_out,
                 &self.hidden_a,
                 self.hidden_size,
@@ -464,8 +492,10 @@ impl GpuForwardPass {
             // Batched gate/up projection: hidden_b -> scratch_gate, scratch_up
             self.encode_batched_matvec_q4_0_2(
                 &encoder,
-                &ffn.gate.buffer, ffn.gate.offset,
-                &ffn.up.buffer, ffn.up.offset,
+                &ffn.gate.buffer,
+                ffn.gate.offset,
+                &ffn.up.buffer,
+                ffn.up.offset,
                 &self.hidden_b,
                 &self.scratch_gate,
                 &self.scratch_up,
@@ -480,12 +510,39 @@ impl GpuForwardPass {
             // Down projection + residual (fused): hidden_a += down(scratch_silu)
             self.encode_matvec_q4_0_accumulate(
                 &encoder,
-                &ffn.down.buffer, ffn.down.offset,
+                &ffn.down.buffer,
+                ffn.down.offset,
                 &self.scratch_silu,
                 &self.hidden_a,
                 self.hidden_size,
                 self.intermediate_size,
             );
+
+            // EAGLE: capture hidden state after this layer if requested
+            if let Some(ref eagle) = self.eagle_capture {
+                if layer_idx == eagle.layer_low {
+                    self.encode_buffer_copy(
+                        &encoder,
+                        &self.hidden_a,
+                        &eagle.feat_low,
+                        self.hidden_size,
+                    );
+                } else if layer_idx == eagle.layer_mid {
+                    self.encode_buffer_copy(
+                        &encoder,
+                        &self.hidden_a,
+                        &eagle.feat_mid,
+                        self.hidden_size,
+                    );
+                } else if layer_idx == eagle.layer_high {
+                    self.encode_buffer_copy(
+                        &encoder,
+                        &self.hidden_a,
+                        &eagle.feat_high,
+                        self.hidden_size,
+                    );
+                }
+            }
         }
 
         // 4. Final norm + lm_head
@@ -500,7 +557,8 @@ impl GpuForwardPass {
         if let Some(wb) = self.weight_store.lm_head_q6k() {
             self.encode_matvec_q6_k(
                 &encoder,
-                &wb.buffer, wb.offset,
+                &wb.buffer,
+                wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
@@ -509,7 +567,8 @@ impl GpuForwardPass {
         } else if let Some(wb) = self.weight_store.lm_head_q8() {
             self.encode_matvec_q8_0(
                 &encoder,
-                &wb.buffer, wb.offset,
+                &wb.buffer,
+                wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
@@ -519,7 +578,8 @@ impl GpuForwardPass {
             let wb = self.weight_store.lm_head();
             self.encode_matvec_f32(
                 &encoder,
-                &wb.buffer, wb.offset,
+                &wb.buffer,
+                wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
@@ -529,7 +589,8 @@ impl GpuForwardPass {
             let wb = self.weight_store.lm_head();
             self.encode_matvec_q4_0(
                 &encoder,
-                &wb.buffer, wb.offset,
+                &wb.buffer,
+                wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
@@ -691,7 +752,8 @@ impl GpuForwardPass {
             // ---- Batched QKV matvec (weight cache reuse) ----
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
-                &attn.q.buffer, attn.q.offset,
+                &attn.q.buffer,
+                attn.q.offset,
                 &bb.hidden_b,
                 &bb.q,
                 q_dim,
@@ -700,7 +762,8 @@ impl GpuForwardPass {
             );
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
-                &attn.k.buffer, attn.k.offset,
+                &attn.k.buffer,
+                attn.k.offset,
                 &bb.hidden_b,
                 &bb.k,
                 kv_dim,
@@ -709,7 +772,8 @@ impl GpuForwardPass {
             );
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
-                &attn.v.buffer, attn.v.offset,
+                &attn.v.buffer,
+                attn.v.offset,
                 &bb.hidden_b,
                 &bb.v,
                 kv_dim,
@@ -799,7 +863,8 @@ impl GpuForwardPass {
             let attn = self.weight_store.attn_proj(layer_idx);
             self.encode_multi_token_matvec_q4_0_accumulate(
                 &encoder,
-                &attn.o.buffer, attn.o.offset,
+                &attn.o.buffer,
+                attn.o.offset,
                 &bb.attn_out,
                 &bb.hidden_a,
                 h,
@@ -823,7 +888,8 @@ impl GpuForwardPass {
             // ---- Batched gate/up matvec ----
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
-                &ffn.gate.buffer, ffn.gate.offset,
+                &ffn.gate.buffer,
+                ffn.gate.offset,
                 &bb.hidden_b,
                 &bb.gate,
                 ffn_dim,
@@ -832,7 +898,8 @@ impl GpuForwardPass {
             );
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
-                &ffn.up.buffer, ffn.up.offset,
+                &ffn.up.buffer,
+                ffn.up.offset,
                 &bb.hidden_b,
                 &bb.up,
                 ffn_dim,
@@ -848,7 +915,8 @@ impl GpuForwardPass {
             // ---- Batched down-projection + residual accumulate ----
             self.encode_multi_token_matvec_q4_0_accumulate(
                 &encoder,
-                &ffn.down.buffer, ffn.down.offset,
+                &ffn.down.buffer,
+                ffn.down.offset,
                 &bb.silu,
                 &bb.hidden_a,
                 h,
@@ -874,7 +942,8 @@ impl GpuForwardPass {
         if let Some(wb) = self.weight_store.lm_head_q6k() {
             self.encode_multi_token_matvec_q6_k(
                 &encoder,
-                &wb.buffer, wb.offset,
+                &wb.buffer,
+                wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
@@ -884,7 +953,8 @@ impl GpuForwardPass {
         } else if let Some(wb) = self.weight_store.lm_head_q8() {
             self.encode_matvec_q8_0(
                 &encoder,
-                &wb.buffer, wb.offset,
+                &wb.buffer,
+                wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
@@ -894,7 +964,8 @@ impl GpuForwardPass {
             let wb = self.weight_store.lm_head();
             self.encode_matvec_f32(
                 &encoder,
-                &wb.buffer, wb.offset,
+                &wb.buffer,
+                wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
@@ -904,7 +975,8 @@ impl GpuForwardPass {
             let wb = self.weight_store.lm_head();
             self.encode_matvec_q4_0(
                 &encoder,
-                &wb.buffer, wb.offset,
+                &wb.buffer,
+                wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
@@ -936,10 +1008,7 @@ impl GpuForwardPass {
     /// Used by speculative decoding to verify N draft tokens in a single pass:
     /// the target model produces logits at each position, enabling per-position
     /// accept/reject decisions.
-    pub fn forward_prompt_logits(
-        &mut self,
-        token_ids: &[u32],
-    ) -> Result<Vec<Vec<f32>>, String> {
+    pub fn forward_prompt_logits(&mut self, token_ids: &[u32]) -> Result<Vec<Vec<f32>>, String> {
         let batch_size = token_ids.len();
         if batch_size == 0 {
             return Err("forward_prompt_logits: empty token_ids".to_string());
@@ -1070,7 +1139,8 @@ impl GpuForwardPass {
 
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
-                &attn.q.buffer, attn.q.offset,
+                &attn.q.buffer,
+                attn.q.offset,
                 &bb.hidden_b,
                 &bb.q,
                 q_dim,
@@ -1079,7 +1149,8 @@ impl GpuForwardPass {
             );
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
-                &attn.k.buffer, attn.k.offset,
+                &attn.k.buffer,
+                attn.k.offset,
                 &bb.hidden_b,
                 &bb.k,
                 kv_dim,
@@ -1088,7 +1159,8 @@ impl GpuForwardPass {
             );
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
-                &attn.v.buffer, attn.v.offset,
+                &attn.v.buffer,
+                attn.v.offset,
                 &bb.hidden_b,
                 &bb.v,
                 kv_dim,
@@ -1171,7 +1243,8 @@ impl GpuForwardPass {
             let attn = self.weight_store.attn_proj(layer_idx);
             self.encode_multi_token_matvec_q4_0_accumulate(
                 &encoder,
-                &attn.o.buffer, attn.o.offset,
+                &attn.o.buffer,
+                attn.o.offset,
                 &bb.attn_out,
                 &bb.hidden_a,
                 h,
@@ -1193,7 +1266,8 @@ impl GpuForwardPass {
 
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
-                &ffn.gate.buffer, ffn.gate.offset,
+                &ffn.gate.buffer,
+                ffn.gate.offset,
                 &bb.hidden_b,
                 &bb.gate,
                 ffn_dim,
@@ -1202,7 +1276,8 @@ impl GpuForwardPass {
             );
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
-                &ffn.up.buffer, ffn.up.offset,
+                &ffn.up.buffer,
+                ffn.up.offset,
                 &bb.hidden_b,
                 &bb.up,
                 ffn_dim,
@@ -1216,7 +1291,8 @@ impl GpuForwardPass {
 
             self.encode_multi_token_matvec_q4_0_accumulate(
                 &encoder,
-                &ffn.down.buffer, ffn.down.offset,
+                &ffn.down.buffer,
+                ffn.down.offset,
                 &bb.silu,
                 &bb.hidden_a,
                 h,
@@ -1238,17 +1314,16 @@ impl GpuForwardPass {
         );
 
         // Allocate logits buffer for all positions
-        let all_logits_buf = alloc_buffer(
-            &self.device.device,
-            batch_size * self.vocab_size * f32_sz,
-        );
+        let all_logits_buf =
+            alloc_buffer(&self.device.device, batch_size * self.vocab_size * f32_sz);
 
         // lm_head: hidden_b[batch] -> all_logits[batch, vocab_size]
         // Prefer Q6_K > Q8_0 > F32 > Q4_0 (must match forward_token chain)
         if let Some(wb) = self.weight_store.lm_head_q6k() {
             self.encode_multi_token_matvec_q6_k(
                 &encoder,
-                &wb.buffer, wb.offset,
+                &wb.buffer,
+                wb.offset,
                 &bb.hidden_b,
                 &all_logits_buf,
                 self.vocab_size,
@@ -1258,7 +1333,9 @@ impl GpuForwardPass {
         } else if let Some(wb) = self.weight_store.lm_head_q8() {
             // No multi-token Q8_0 kernel; dispatch per token with offsets
             for tok in 0..batch_size {
-                let pso = self.pso_cache.get(&PsoKey::simple("matvec_q8_0"))
+                let pso = self
+                    .pso_cache
+                    .get(&PsoKey::simple("matvec_q8_0"))
                     .expect("matvec_q8_0 PSO not prewarmed");
                 encoder.setComputePipelineState(pso);
                 set_buffer(&encoder, &wb.buffer, wb.offset, 0);
@@ -1269,15 +1346,25 @@ impl GpuForwardPass {
                 set_bytes(&encoder, &out_dim_u32, 3);
                 set_bytes(&encoder, &in_dim_u32, 4);
                 const ROWS_PER_TG: usize = 8;
-                let grid = MTLSize { width: (self.vocab_size + ROWS_PER_TG - 1) / ROWS_PER_TG, height: 1, depth: 1 };
-                let tg = MTLSize { width: 256, height: 1, depth: 1 };
+                let grid = MTLSize {
+                    width: (self.vocab_size + ROWS_PER_TG - 1) / ROWS_PER_TG,
+                    height: 1,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                };
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
             }
         } else if self.weight_store.lm_head_is_f32() {
             // No multi-token F32 kernel; dispatch per token with offsets
             let wb = self.weight_store.lm_head();
             for tok in 0..batch_size {
-                let pso = self.pso_cache.get(&PsoKey::simple("matvec_f32_v2"))
+                let pso = self
+                    .pso_cache
+                    .get(&PsoKey::simple("matvec_f32_v2"))
                     .expect("matvec_f32_v2 PSO not prewarmed");
                 encoder.setComputePipelineState(pso);
                 set_buffer(&encoder, &wb.buffer, wb.offset, 0);
@@ -1288,15 +1375,24 @@ impl GpuForwardPass {
                 set_bytes(&encoder, &out_dim_u32, 3);
                 set_bytes(&encoder, &in_dim_u32, 4);
                 const ROWS_PER_TG: usize = 8;
-                let grid = MTLSize { width: (self.vocab_size + ROWS_PER_TG - 1) / ROWS_PER_TG, height: 1, depth: 1 };
-                let tg = MTLSize { width: 256, height: 1, depth: 1 };
+                let grid = MTLSize {
+                    width: (self.vocab_size + ROWS_PER_TG - 1) / ROWS_PER_TG,
+                    height: 1,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                };
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
             }
         } else {
             let wb = self.weight_store.lm_head();
             self.encode_multi_token_matvec_q4_0(
                 &encoder,
-                &wb.buffer, wb.offset,
+                &wb.buffer,
+                wb.offset,
                 &bb.hidden_b,
                 &all_logits_buf,
                 self.vocab_size,
@@ -1360,7 +1456,9 @@ impl GpuForwardPass {
                 let h = unsafe { read_buffer_slice(&self.hidden_a, self.hidden_size) };
                 let (hn, hmin, hmax) = buf_stats(&h);
                 if hn || hmin.is_nan() || hmax.is_nan() || hmin.abs() > 1e6 || hmax.abs() > 1e6 {
-                    eprintln!("  [L{layer_idx} attn_out] PROBLEM: nan={hn} min={hmin:.4} max={hmax:.4}");
+                    eprintln!(
+                        "  [L{layer_idx} attn_out] PROBLEM: nan={hn} min={hmin:.4} max={hmax:.4}"
+                    );
                 }
             }
 
@@ -1425,7 +1523,8 @@ impl GpuForwardPass {
         // Q projection: hidden_b -> scratch_q
         self.encode_matvec_q4_0(
             &encoder,
-            &attn.q.buffer, attn.q.offset,
+            &attn.q.buffer,
+            attn.q.offset,
             &self.hidden_b,
             &self.scratch_q,
             self.num_heads * self.head_dim,
@@ -1435,7 +1534,8 @@ impl GpuForwardPass {
         // K projection: hidden_b -> scratch_k
         self.encode_matvec_q4_0(
             &encoder,
-            &attn.k.buffer, attn.k.offset,
+            &attn.k.buffer,
+            attn.k.offset,
             &self.hidden_b,
             &self.scratch_k,
             self.num_kv_heads * self.head_dim,
@@ -1445,7 +1545,8 @@ impl GpuForwardPass {
         // V projection: hidden_b -> scratch_v
         self.encode_matvec_q4_0(
             &encoder,
-            &attn.v.buffer, attn.v.offset,
+            &attn.v.buffer,
+            attn.v.offset,
             &self.hidden_b,
             &self.scratch_v,
             self.num_kv_heads * self.head_dim,
@@ -1492,7 +1593,8 @@ impl GpuForwardPass {
         // O projection: scratch_attn_out -> scratch_o
         self.encode_matvec_q4_0(
             &encoder,
-            &attn.o.buffer, attn.o.offset,
+            &attn.o.buffer,
+            attn.o.offset,
             &self.scratch_attn_out,
             &self.scratch_o,
             self.hidden_size,
@@ -1537,7 +1639,8 @@ impl GpuForwardPass {
         // Gate projection: hidden_b -> scratch_gate
         self.encode_matvec_q4_0(
             &encoder,
-            &ffn.gate.buffer, ffn.gate.offset,
+            &ffn.gate.buffer,
+            ffn.gate.offset,
             &self.hidden_b,
             &self.scratch_gate,
             self.intermediate_size,
@@ -1547,7 +1650,8 @@ impl GpuForwardPass {
         // Up projection: hidden_b -> scratch_up
         self.encode_matvec_q4_0(
             &encoder,
-            &ffn.up.buffer, ffn.up.offset,
+            &ffn.up.buffer,
+            ffn.up.offset,
             &self.hidden_b,
             &self.scratch_up,
             self.intermediate_size,
@@ -1560,7 +1664,8 @@ impl GpuForwardPass {
         // Down projection: scratch_silu -> scratch_ffn
         self.encode_matvec_q4_0(
             &encoder,
-            &ffn.down.buffer, ffn.down.offset,
+            &ffn.down.buffer,
+            ffn.down.offset,
             &self.scratch_silu,
             &self.scratch_ffn,
             self.hidden_size,
@@ -1641,7 +1746,8 @@ impl GpuForwardPass {
         if let Some(wb) = self.weight_store.lm_head_q6k() {
             self.encode_matvec_q6_k(
                 &encoder2,
-                &wb.buffer, wb.offset,
+                &wb.buffer,
+                wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
@@ -1651,7 +1757,8 @@ impl GpuForwardPass {
             let wb = self.weight_store.lm_head();
             self.encode_matvec_f32(
                 &encoder2,
-                &wb.buffer, wb.offset,
+                &wb.buffer,
+                wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
@@ -1661,7 +1768,8 @@ impl GpuForwardPass {
             let wb = self.weight_store.lm_head();
             self.encode_matvec_q4_0(
                 &encoder2,
-                &wb.buffer, wb.offset,
+                &wb.buffer,
+                wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
@@ -1830,10 +1938,8 @@ impl GpuForwardPass {
         // Use the same batched kernel with weight_c=weight_a (ignored since dim_c=0)
         // and output_c=output_a (ignored since dim_c=0)
         self.encode_batched_matvec_q4_0(
-            encoder,
-            weight_a, offset_a,
-            weight_b, offset_b,
-            weight_a, offset_a, // dummy, unused (dim_c=0)
+            encoder, weight_a, offset_a, weight_b, offset_b, weight_a,
+            offset_a, // dummy, unused (dim_c=0)
             input_buf, output_a, output_b, output_a, // dummy, unused (dim_c=0)
             dim_a, dim_b, 0, in_dim,
         );
@@ -2779,9 +2885,12 @@ impl GpuForwardPass {
             // Batched Q/K/V projection: hidden_b -> scratch_q, scratch_k, scratch_v
             self.encode_batched_matvec_q4_0(
                 &encoder,
-                &attn.q.buffer, attn.q.offset,
-                &attn.k.buffer, attn.k.offset,
-                &attn.v.buffer, attn.v.offset,
+                &attn.q.buffer,
+                attn.q.offset,
+                &attn.k.buffer,
+                attn.k.offset,
+                &attn.v.buffer,
+                attn.v.offset,
                 &self.hidden_b,
                 &self.scratch_q,
                 &self.scratch_k,
@@ -2818,7 +2927,8 @@ impl GpuForwardPass {
 
             self.encode_matvec_q4_0_accumulate(
                 &encoder,
-                &attn.o.buffer, attn.o.offset,
+                &attn.o.buffer,
+                attn.o.offset,
                 &self.scratch_attn_out,
                 &self.hidden_a,
                 self.hidden_size,
@@ -2835,8 +2945,10 @@ impl GpuForwardPass {
             // Batched gate/up projection: hidden_b -> scratch_gate, scratch_up
             self.encode_batched_matvec_q4_0_2(
                 &encoder,
-                &ffn.gate.buffer, ffn.gate.offset,
-                &ffn.up.buffer, ffn.up.offset,
+                &ffn.gate.buffer,
+                ffn.gate.offset,
+                &ffn.up.buffer,
+                ffn.up.offset,
                 &self.hidden_b,
                 &self.scratch_gate,
                 &self.scratch_up,
@@ -2851,12 +2963,39 @@ impl GpuForwardPass {
             // Down projection + residual (fused): hidden_a += down(scratch_silu)
             self.encode_matvec_q4_0_accumulate(
                 &encoder,
-                &ffn.down.buffer, ffn.down.offset,
+                &ffn.down.buffer,
+                ffn.down.offset,
                 &self.scratch_silu,
                 &self.hidden_a,
                 self.hidden_size,
                 self.intermediate_size,
             );
+
+            // EAGLE: capture hidden state after this layer if requested
+            if let Some(ref eagle) = self.eagle_capture {
+                if layer_idx == eagle.layer_low {
+                    self.encode_buffer_copy(
+                        &encoder,
+                        &self.hidden_a,
+                        &eagle.feat_low,
+                        self.hidden_size,
+                    );
+                } else if layer_idx == eagle.layer_mid {
+                    self.encode_buffer_copy(
+                        &encoder,
+                        &self.hidden_a,
+                        &eagle.feat_mid,
+                        self.hidden_size,
+                    );
+                } else if layer_idx == eagle.layer_high {
+                    self.encode_buffer_copy(
+                        &encoder,
+                        &self.hidden_a,
+                        &eagle.feat_high,
+                        self.hidden_size,
+                    );
+                }
+            }
         }
 
         // 4. Final norm + lm_head
@@ -2871,7 +3010,8 @@ impl GpuForwardPass {
         if let Some(wb) = self.weight_store.lm_head_q8() {
             self.encode_matvec_q8_0(
                 &encoder,
-                &wb.buffer, wb.offset,
+                &wb.buffer,
+                wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
@@ -2881,7 +3021,8 @@ impl GpuForwardPass {
             let wb = self.weight_store.lm_head();
             self.encode_matvec_f32(
                 &encoder,
-                &wb.buffer, wb.offset,
+                &wb.buffer,
+                wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
@@ -2891,7 +3032,8 @@ impl GpuForwardPass {
             let wb = self.weight_store.lm_head();
             self.encode_matvec_q4_0(
                 &encoder,
-                &wb.buffer, wb.offset,
+                &wb.buffer,
+                wb.offset,
                 &self.hidden_b,
                 &self.logits_buf,
                 self.vocab_size,
@@ -2925,6 +3067,64 @@ impl GpuForwardPass {
     /// Get the current decode position.
     pub fn position(&self) -> usize {
         self.position
+    }
+
+    /// Enable EAGLE hidden state capture at specified layers.
+    /// Creates GPU buffers for capturing hidden_a snapshots after each specified layer.
+    pub fn enable_eagle_capture(&mut self, layer_low: usize, layer_mid: usize, layer_high: usize) {
+        let buf_size = self.hidden_size * std::mem::size_of::<f32>();
+        self.eagle_capture = Some(EagleCaptureBuffers {
+            feat_low: alloc_buffer(&self.device.device, buf_size),
+            feat_mid: alloc_buffer(&self.device.device, buf_size),
+            feat_high: alloc_buffer(&self.device.device, buf_size),
+            layer_low,
+            layer_mid,
+            layer_high,
+        });
+    }
+
+    /// Get EAGLE capture buffer for the low layer (layer 0).
+    pub fn eagle_capture_low(&self) -> Option<&Retained<ProtocolObject<dyn MTLBuffer>>> {
+        self.eagle_capture.as_ref().map(|e| &e.feat_low)
+    }
+
+    /// Get EAGLE capture buffer for the mid layer (layer N/2).
+    pub fn eagle_capture_mid(&self) -> Option<&Retained<ProtocolObject<dyn MTLBuffer>>> {
+        self.eagle_capture.as_ref().map(|e| &e.feat_mid)
+    }
+
+    /// Get EAGLE capture buffer for the high layer (layer N-1).
+    pub fn eagle_capture_high(&self) -> Option<&Retained<ProtocolObject<dyn MTLBuffer>>> {
+        self.eagle_capture.as_ref().map(|e| &e.feat_high)
+    }
+
+    /// Model dimension accessors for EAGLE head construction.
+    pub fn num_kv_heads(&self) -> usize {
+        self.num_kv_heads
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    pub fn num_heads(&self) -> usize {
+        self.num_heads
+    }
+
+    pub fn intermediate_size(&self) -> usize {
+        self.intermediate_size
+    }
+
+    pub fn rope_theta(&self) -> f32 {
+        self.rope_theta
+    }
+
+    pub fn rms_norm_eps(&self) -> f32 {
+        self.rms_norm_eps
+    }
+
+    pub fn num_layers(&self) -> usize {
+        self.num_layers
     }
 
     /// Roll back to a previous position, discarding KV cache entries and
