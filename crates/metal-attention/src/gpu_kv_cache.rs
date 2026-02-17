@@ -250,6 +250,20 @@ impl GpuKVCache {
     pub fn reset(&mut self) {
         self.len = 0;
     }
+
+    /// Truncate the cache to a given length, discarding entries beyond `new_len`.
+    ///
+    /// Used by speculative decoding to roll back rejected draft tokens.
+    /// The underlying buffer data is not zeroed — `new_len` simply moves the
+    /// write cursor back so subsequent appends overwrite the discarded entries.
+    pub fn truncate(&mut self, new_len: usize) {
+        assert!(
+            new_len <= self.len,
+            "truncate: new_len {new_len} exceeds current len {}",
+            self.len
+        );
+        self.len = new_len;
+    }
 }
 
 /// Set of KV caches, one per transformer layer.
@@ -297,6 +311,16 @@ impl GpuKVCacheSet {
     pub fn reset(&mut self) {
         for cache in &mut self.caches {
             cache.reset();
+        }
+    }
+
+    /// Truncate all layer caches to a given length.
+    ///
+    /// Used by speculative decoding rollback to discard rejected tokens
+    /// across all layers simultaneously.
+    pub fn truncate_all(&mut self, new_len: usize) {
+        for cache in &mut self.caches {
+            cache.truncate(new_len);
         }
     }
 }

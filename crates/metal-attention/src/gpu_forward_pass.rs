@@ -2527,6 +2527,25 @@ impl GpuForwardPass {
         self.position
     }
 
+    /// Roll back to a previous position, discarding KV cache entries and
+    /// token history beyond `position`.
+    ///
+    /// Used by speculative decoding to undo rejected draft tokens.
+    /// After rollback, the next forward_token call will process at `position`.
+    pub fn rollback_to(&mut self, position: usize) {
+        assert!(
+            position <= self.position,
+            "rollback_to: target {position} exceeds current position {}",
+            self.position
+        );
+        self.position = position;
+        self.kv_caches.truncate_all(position);
+        // Truncate token history to match
+        if self.token_history_len > position {
+            self.token_history_len = position;
+        }
+    }
+
     /// Reset position and KV caches (for new generation).
     pub fn reset(&mut self) {
         self.position = 0;
