@@ -3199,6 +3199,31 @@ impl GpuForwardPass {
     pub fn hidden_size(&self) -> usize {
         self.hidden_size
     }
+
+    /// Get the token embedding buffer (delegates to weight_store).
+    pub fn embed(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        self.weight_store.embed()
+    }
+
+    /// Get the LM head weight buffer (delegates to weight_store).
+    pub fn lm_head(&self) -> &crate::gpu_weight_store::WeightBuffer {
+        self.weight_store.lm_head()
+    }
+
+    /// Whether the lm_head is F32 (tied embeddings).
+    pub fn lm_head_is_f32(&self) -> bool {
+        self.weight_store.lm_head_is_f32()
+    }
+
+    /// Get the Q6_K lm_head buffer (if available).
+    pub fn lm_head_q6k(&self) -> Option<&crate::gpu_weight_store::WeightBuffer> {
+        self.weight_store.lm_head_q6k()
+    }
+
+    /// Get the Q8_0 lm_head buffer (if available).
+    pub fn lm_head_q8(&self) -> Option<&crate::gpu_weight_store::WeightBuffer> {
+        self.weight_store.lm_head_q8()
+    }
 }
 
 /// Debug helper: compute NaN presence, min, max for a buffer.
