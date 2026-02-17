@@ -212,10 +212,66 @@ fn bench_gpu_prefill(c: &mut Criterion) {
     eprintln!("GPU prefill benchmark complete");
 }
 
+const MISTRAL_MODEL_RELPATH: &str = "models/mistral-7b-v0.1.Q4_0.gguf";
+
+fn mistral_model_path() -> PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    Path::new(manifest_dir).join(MISTRAL_MODEL_RELPATH)
+}
+
+/// Benchmark Mistral-7B batch prefill throughput with forward_prompt.
+///
+/// Measures tok/s for 128-token batched prefill on Mistral-7B Q4_0.
+/// Target: >= 100 tok/s. Tests GQA (32Q/8KV), Q6_K lm_head, and
+/// multi_token_matvec_q4_0 kernels at large dimensions.
+fn bench_prefill_mistral(c: &mut Criterion) {
+    let path = mistral_model_path();
+    if !path.exists() {
+        eprintln!(
+            "SKIP bench_prefill_mistral: model not found at {}",
+            path.display()
+        );
+        return;
+    }
+
+    let mut gpu = GpuForwardPass::from_gguf(&path).expect("Failed to load Mistral-7B");
+
+    // Warmup: one prefill pass
+    let warmup_prompt: Vec<u32> = (1..=16).collect();
+    let _ = gpu.forward_prompt(&warmup_prompt).expect("warmup failed");
+    gpu.reset();
+
+    let mut group = c.benchmark_group("mistral_prefill");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(30));
+
+    for &prompt_len in &[32u64, 64, 128] {
+        let prompt: Vec<u32> = (1..=prompt_len as u32).collect();
+
+        group.throughput(criterion::Throughput::Elements(prompt_len));
+        group.bench_function(format!("mistral_prefill_{prompt_len}tok"), |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    gpu.reset();
+                    let start = std::time::Instant::now();
+                    let _ = gpu.forward_prompt(&prompt).expect("Mistral prefill failed");
+                    total += start.elapsed();
+                }
+                total
+            })
+        });
+    }
+
+    group.finish();
+    eprintln!("Mistral-7B prefill benchmark complete");
+}
+
 criterion_group!(
     benches,
     bench_gpu_decode,
     bench_cpu_decode,
-    bench_gpu_prefill
+    bench_gpu_prefill,
+    bench_prefill_mistral
 );
 criterion_main!(benches);
