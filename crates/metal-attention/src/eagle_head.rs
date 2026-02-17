@@ -27,6 +27,8 @@ use metal_attention_kernels::pipeline::{PsoCache, PsoKey};
 use metal_attention_kernels::types::LayerParams;
 use objc2_metal::MTLSize;
 
+use crate::eagle_weights::EagleWeightStore;
+use crate::gpu_forward_pass::GpuForwardPass;
 use crate::gpu_kv_cache::GpuKVCache;
 use crate::gpu_weight_store::{AttnProjBuffers, FfnBuffers, WeightBuffer};
 
@@ -356,6 +358,142 @@ impl EagleHead {
             rms_norm_eps: 1e-5,
             position: 0,
         }
+    }
+
+    /// Construct an EagleHead from real EAGLE weights loaded via `EagleWeightStore`.
+    ///
+    /// Moves weight buffers from the store into EagleHead fields. Scratch buffers
+    /// and KV cache are freshly allocated using dimensions from the target model.
+    /// Model parameters (rope_theta, rms_norm_eps) are inherited from the target.
+    ///
+    /// # Arguments
+    /// - `weight_store`: Loaded EAGLE weights from SafeTensors.
+    /// - `device`: Static reference to the shared GPU device.
+    /// - `target`: Target model to derive dimensions and model params from.
+    pub fn from_weights(
+        weight_store: EagleWeightStore,
+        device: &'static GpuDevice,
+        target: &GpuForwardPass,
+    ) -> Result<Self, String> {
+        let dev = &*device.device;
+
+        let hidden_size = target.hidden_size();
+        let num_heads = target.num_heads();
+        let num_kv_heads = target.num_kv_heads();
+        let head_dim = target.head_dim();
+        let intermediate_size = target.intermediate_size();
+        let vocab_size = target.vocab_size();
+        let kv_dim = num_kv_heads * head_dim;
+
+        // --- Move weights from store ---
+        let fc_fuse_weight = weight_store.fc_fuse_weight;
+        let fc_concat_weight = weight_store.fc_concat_weight;
+        let decoder_attn_norm = weight_store.decoder_attn_norm;
+        let decoder_attn = weight_store.decoder_attn;
+        let decoder_ffn_norm = weight_store.decoder_ffn_norm;
+        let decoder_ffn = weight_store.decoder_ffn;
+
+        // --- Eagle KV cache (1 layer, small capacity) ---
+        let eagle_kv_cache = GpuKVCache::new(dev, 64, kv_dim);
+
+        // --- Scratch buffers (private storage for GPU-only intermediates) ---
+        let f32_size = std::mem::size_of::<f32>();
+        let hidden_a = alloc_buffer_private(dev, hidden_size * f32_size);
+        let hidden_b = alloc_buffer_private(dev, hidden_size * f32_size);
+        let scratch_q = alloc_buffer_private(dev, num_heads * head_dim * f32_size);
+        let scratch_k = alloc_buffer_private(dev, kv_dim * f32_size);
+        let scratch_v = alloc_buffer_private(dev, kv_dim * f32_size);
+        let scratch_attn_out = alloc_buffer_private(dev, num_heads * head_dim * f32_size);
+        let scratch_gate = alloc_buffer_private(dev, intermediate_size * f32_size);
+        let scratch_up = alloc_buffer_private(dev, intermediate_size * f32_size);
+        let scratch_silu = alloc_buffer_private(dev, intermediate_size * f32_size);
+
+        // Fusion/concat buffers (private, GPU-only)
+        let fused_buf = alloc_buffer_private(dev, 3 * hidden_size * f32_size);
+        let combined_buf = alloc_buffer_private(dev, 2 * hidden_size * f32_size);
+
+        // Embedding scratch buffer (shared, CPU-writable for embed lookup)
+        let embed_scratch = alloc_buffer(dev, hidden_size * f32_size);
+
+        // Final norm weight: initialize to 1.0 (identity RMSNorm)
+        // Real EAGLE models may not ship a separate final_norm -- use identity until proven otherwise.
+        let final_norm = alloc_buffer(dev, hidden_size * f32_size);
+        {
+            let ptr = final_norm.contents().as_ptr() as *mut f32;
+            unsafe {
+                for i in 0..hidden_size {
+                    *ptr.add(i) = 1.0;
+                }
+            }
+        }
+
+        // Logits buffer (private for GPU argmax)
+        let logits_buf = alloc_buffer_private(dev, vocab_size * f32_size);
+
+        // Argmax buffers
+        let num_argmax_groups = vocab_size.div_ceil(256);
+        let argmax_partial_vals = alloc_buffer_private(dev, num_argmax_groups * f32_size);
+        let argmax_partial_idxs =
+            alloc_buffer_private(dev, num_argmax_groups * std::mem::size_of::<u32>());
+        let argmax_result = alloc_buffer(dev, std::mem::size_of::<u32>());
+
+        // --- PSO cache: prewarm all kernels needed by the eagle head ---
+        let mut pso_cache = PsoCache::new(device.library.clone());
+        let pso_keys = vec![
+            PsoKey::simple("rmsnorm_optimized"),
+            PsoKey::simple("matvec_f32_v2"),
+            PsoKey::simple("rope_apply_dual"),
+            PsoKey::simple("decode_attention_v2"),
+            PsoKey::simple("ffn_silu"),
+            PsoKey::simple("buffer_copy"),
+            PsoKey::simple("concat_buffers_3"),
+            PsoKey::simple("concat_buffers_2"),
+            PsoKey::simple("argmax_reduce"),
+            PsoKey::simple("argmax_final"),
+            PsoKey::simple("kv_cache_copy"),
+            PsoKey::simple("residual_add_inplace"),
+            PsoKey::simple("matvec_q6_k"),
+            PsoKey::simple("matvec_q8_0"),
+        ];
+        pso_cache.prewarm(&pso_keys);
+
+        Ok(Self {
+            device,
+            fc_fuse_weight,
+            fc_concat_weight,
+            decoder_attn_norm,
+            decoder_attn,
+            decoder_ffn_norm,
+            decoder_ffn,
+            eagle_kv_cache,
+            hidden_a,
+            hidden_b,
+            scratch_q,
+            scratch_k,
+            scratch_v,
+            scratch_attn_out,
+            scratch_gate,
+            scratch_up,
+            scratch_silu,
+            fused_buf,
+            combined_buf,
+            embed_scratch,
+            final_norm,
+            logits_buf,
+            argmax_partial_vals,
+            argmax_partial_idxs,
+            argmax_result,
+            pso_cache,
+            hidden_size,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            intermediate_size,
+            vocab_size,
+            rope_theta: target.rope_theta(),
+            rms_norm_eps: target.rms_norm_eps(),
+            position: 0,
+        })
     }
 
     /// Reset the eagle KV cache (call at the start of each speculation round).

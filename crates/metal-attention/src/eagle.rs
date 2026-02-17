@@ -19,6 +19,8 @@ use crate::gpu_forward_pass::GpuForwardPass;
 use crate::sampling::sample_greedy;
 use crate::speculative::SpecStats;
 
+use crate::eagle_weights::EagleWeightStore;
+
 use metal_attention_kernels::device::GpuDevice;
 
 /// EAGLE-3 speculative decoder managing a target model and draft head.
@@ -61,6 +63,43 @@ impl EagleDecoder {
             target.intermediate_size(),
             target.vocab_size(),
         );
+
+        Ok(Self {
+            target,
+            eagle_head,
+            n_draft,
+        })
+    }
+
+    /// Create an EagleDecoder with real EAGLE weights from SafeTensors.
+    ///
+    /// Loads the target model from GGUF, enables hidden state capture,
+    /// loads EAGLE weights from a SafeTensors file, and creates an EagleHead
+    /// with the real trained weights.
+    ///
+    /// # Arguments
+    /// - `target_path`: Path to the target model GGUF file.
+    /// - `eagle_weights_path`: Path to the EAGLE head `.safetensors` file.
+    /// - `n_draft`: Number of draft tokens per speculation round (default: 6).
+    pub fn new(
+        target_path: &Path,
+        eagle_weights_path: &Path,
+        n_draft: usize,
+    ) -> Result<Self, String> {
+        let mut target = GpuForwardPass::from_gguf(target_path)?;
+
+        // Enable hidden state capture at layers 0, N/2, N-1
+        let num_layers = target.num_layers();
+        let mid_layer = num_layers / 2;
+        let high_layer = num_layers - 1;
+        target.enable_eagle_capture(0, mid_layer, high_layer);
+
+        let device = GpuDevice::shared();
+        let hidden_size = target.hidden_size();
+
+        let weight_store =
+            EagleWeightStore::from_safetensors(eagle_weights_path, device, hidden_size)?;
+        let eagle_head = EagleHead::from_weights(weight_store, device, &target)?;
 
         Ok(Self {
             target,
