@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use metal_attention::config::InferenceConfig;
 use metal_attention::generate_streaming;
 use metal_attention::model::HybridModel;
+use metal_attention::speculative::SpeculativeDecoder;
 use metal_attention::GpuForwardPass;
 
 use metal_attention_gguf::parser::{GgufError, GgufFile};
@@ -69,6 +70,14 @@ enum Commands {
         /// Use GPU forward pass (Metal compute kernels)
         #[arg(long)]
         gpu: bool,
+
+        /// Path to draft model GGUF file for speculative decoding (requires --gpu)
+        #[arg(long)]
+        draft: Option<PathBuf>,
+
+        /// Number of draft tokens per speculation round (default: 8)
+        #[arg(long, default_value = "8")]
+        draft_tokens: usize,
     },
     /// Benchmark model performance
     Bench {
@@ -131,8 +140,21 @@ fn main() {
             repeat_penalty,
             gpu_repeat_penalty,
             gpu,
+            draft,
+            draft_tokens,
         } => {
-            if gpu {
+            if gpu && draft.is_some() {
+                if let Err(e) = run_inference_speculative(
+                    model,
+                    draft.unwrap(),
+                    prompt,
+                    max_tokens,
+                    draft_tokens,
+                ) {
+                    eprintln!("{e}");
+                    process::exit(1);
+                }
+            } else if gpu {
                 if let Err(e) = run_inference_gpu(model, prompt, max_tokens, gpu_repeat_penalty) {
                     eprintln!("{e}");
                     process::exit(1);
@@ -745,6 +767,97 @@ fn run_inference_gpu(
         token_count,
         decode_tok_s,
         total_elapsed.as_secs_f64(),
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GPU speculative decoding run subcommand
+// ---------------------------------------------------------------------------
+
+fn run_inference_speculative(
+    target_path: PathBuf,
+    draft_path: PathBuf,
+    prompt: String,
+    max_tokens: usize,
+    n_draft: usize,
+) -> Result<(), String> {
+    if !target_path.exists() {
+        return Err(format!(
+            "Error: Target model file not found: {}",
+            target_path.display()
+        ));
+    }
+    if !draft_path.exists() {
+        return Err(format!(
+            "Error: Draft model file not found: {}",
+            draft_path.display()
+        ));
+    }
+
+    // Parse GGUF for tokenizer (use target model's tokenizer)
+    let gguf = GgufFile::open(&target_path).map_err(|e| format!("Error: {e}"))?;
+    let tokenizer = GgufTokenizer::from_metadata(&gguf.metadata)
+        .map_err(|e| format!("Error: Failed to build tokenizer: {e}"))?;
+    let eos_id = tokenizer.eos_token_id();
+    drop(gguf);
+
+    // Tokenize prompt
+    let prompt_tokens = tokenizer.encode(&prompt);
+    if prompt_tokens.is_empty() {
+        return Err("Error: Prompt produced no tokens".to_string());
+    }
+
+    eprintln!("Loading speculative decoder (draft + target)...");
+    let mut decoder = SpeculativeDecoder::new(&draft_path, &target_path, n_draft)?;
+
+    eprintln!(
+        "Prompt: {} tokens | Generating up to {} tokens (speculative, n_draft={})",
+        prompt_tokens.len(),
+        max_tokens,
+        n_draft
+    );
+
+    let start = Instant::now();
+    let mut stdout = std::io::stdout();
+    let mut token_count: usize = 0;
+
+    let (tokens, stats) = decoder.generate(&prompt_tokens, max_tokens, |token_id| {
+        if token_id == eos_id {
+            return;
+        }
+        token_count += 1;
+        let text = tokenizer.decode(&[token_id]);
+        print!("{text}");
+        let _ = stdout.flush();
+    })?;
+
+    println!();
+
+    let total_elapsed = start.elapsed();
+    let tok_per_sec = if total_elapsed.as_secs_f64() > 0.0 {
+        tokens.len() as f64 / total_elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+
+    eprintln!(
+        "\n--- Speculative Decoding complete ---\n\
+         Tokens generated: {}\n\
+         Speculation rounds: {}\n\
+         Draft tokens proposed: {}\n\
+         Draft tokens accepted: {}\n\
+         Acceptance rate: {:.1}%\n\
+         Total time: {:.2}s\n\
+         Effective speed: {:.1} tok/s",
+        tokens.len(),
+        stats.rounds,
+        stats.tokens_drafted,
+        stats.draft_accepted,
+        stats.acceptance_rate() * 100.0,
+        total_elapsed.as_secs_f64(),
+        tok_per_sec,
     );
 
     Ok(())
