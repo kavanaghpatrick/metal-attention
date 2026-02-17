@@ -321,12 +321,97 @@ fn bench_decode_mistral(c: &mut Criterion) {
     eprintln!("Mistral-7B decode benchmark complete ({DECODE_TOKENS} tokens/iteration)");
 }
 
+/// Benchmark EAGLE decode throughput with random draft head weights.
+///
+/// Uses EagleDecoder with random weights on Mistral-7B. Random weights yield
+/// ~0% acceptance rate (overhead-only), but validates benchmark infrastructure.
+/// Reports effective tok/s.
+fn bench_eagle_decode(c: &mut Criterion) {
+    let path = mistral_model_path();
+    if !path.exists() {
+        eprintln!(
+            "SKIP bench_eagle_decode: model not found at {}",
+            path.display()
+        );
+        return;
+    }
+
+    const EAGLE_PROMPT: &[u32] = &[1, 2, 3, 4, 5];
+    const EAGLE_TOKENS: usize = 100;
+    const N_DRAFT: usize = 6;
+
+    // Load EagleDecoder with random weights (one-time cost)
+    let mut decoder =
+        metal_attention::EagleDecoder::new_random(&path, N_DRAFT).expect("Failed to load EagleDecoder");
+
+    // Warmup: one short generation
+    let _ = decoder.generate(EAGLE_PROMPT, 5, |_| {});
+
+    let mut group = c.benchmark_group("eagle_decode");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(30));
+    group.throughput(criterion::Throughput::Elements(EAGLE_TOKENS as u64));
+
+    group.bench_function("eagle_random_decode_100tok", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let start = std::time::Instant::now();
+                let _ = decoder
+                    .generate(EAGLE_PROMPT, EAGLE_TOKENS, |_| {})
+                    .expect("EAGLE decode failed");
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    group.bench_function("baseline_decode_100tok", |b| {
+        // Use a plain GpuForwardPass for target-only baseline
+        let mut gpu =
+            metal_attention::GpuForwardPass::from_gguf(&path).expect("Failed to load baseline model");
+
+        // Warmup baseline
+        for &tok in EAGLE_PROMPT {
+            let _ = gpu.forward_token(tok).expect("baseline warmup failed");
+        }
+        gpu.reset();
+
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                gpu.reset();
+                // Prefill (not timed)
+                let mut logits = Vec::new();
+                for &tok in EAGLE_PROMPT {
+                    logits = gpu.forward_token(tok).expect("baseline prefill failed");
+                }
+                // Decode 100 tokens (timed)
+                let start = std::time::Instant::now();
+                for _ in 0..EAGLE_TOKENS {
+                    let next = argmax(&logits);
+                    logits = gpu.forward_token(next).expect("baseline decode failed");
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    group.finish();
+
+    eprintln!(
+        "EAGLE decode benchmark complete ({EAGLE_TOKENS} tokens/iteration, n_draft={N_DRAFT})"
+    );
+}
+
 criterion_group!(
     benches,
     bench_gpu_decode,
     bench_cpu_decode,
     bench_gpu_prefill,
     bench_prefill_mistral,
-    bench_decode_mistral
+    bench_decode_mistral,
+    bench_eagle_decode
 );
 criterion_main!(benches);
