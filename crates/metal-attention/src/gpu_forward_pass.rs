@@ -927,6 +927,368 @@ impl GpuForwardPass {
         Ok(result[0])
     }
 
+    /// Batched prefill that returns logits for ALL token positions.
+    ///
+    /// Same layer-by-layer processing as `forward_prompt()`, but computes
+    /// final RMSNorm + lm_head for every token position, not just the last.
+    /// Returns a Vec of logit vectors, one per input token.
+    ///
+    /// Used by speculative decoding to verify N draft tokens in a single pass:
+    /// the target model produces logits at each position, enabling per-position
+    /// accept/reject decisions.
+    pub fn forward_prompt_logits(
+        &mut self,
+        token_ids: &[u32],
+    ) -> Result<Vec<Vec<f32>>, String> {
+        let batch_size = token_ids.len();
+        if batch_size == 0 {
+            return Err("forward_prompt_logits: empty token_ids".to_string());
+        }
+        if batch_size == 1 {
+            // Single token: use forward_token which returns logits
+            let logits = self.forward_token(token_ids[0])?;
+            return Ok(vec![logits]);
+        }
+
+        // Validate all tokens
+        for &tid in token_ids {
+            if tid as usize >= self.vocab_size {
+                return Err(format!(
+                    "token_id {} out of range (vocab_size={})",
+                    tid, self.vocab_size
+                ));
+            }
+        }
+
+        let h = self.hidden_size;
+        let q_dim = self.num_heads * self.head_dim;
+        let kv_dim = self.num_kv_heads * self.head_dim;
+        let ffn_dim = self.intermediate_size;
+        let f32_sz = std::mem::size_of::<f32>();
+
+        // Allocate or reuse batch buffers
+        let need_alloc = match &self.batch_bufs {
+            Some(bufs) => bufs.max_batch_size < batch_size,
+            None => true,
+        };
+        if need_alloc {
+            self.batch_bufs = Some(BatchBuffers {
+                hidden_a: alloc_buffer(&self.device.device, batch_size * h * f32_sz),
+                hidden_b: alloc_buffer_private(&self.device.device, batch_size * h * f32_sz),
+                q: alloc_buffer_private(&self.device.device, batch_size * q_dim * f32_sz),
+                k: alloc_buffer_private(&self.device.device, batch_size * kv_dim * f32_sz),
+                v: alloc_buffer_private(&self.device.device, batch_size * kv_dim * f32_sz),
+                attn_out: alloc_buffer_private(&self.device.device, batch_size * q_dim * f32_sz),
+                gate: alloc_buffer_private(&self.device.device, batch_size * ffn_dim * f32_sz),
+                up: alloc_buffer_private(&self.device.device, batch_size * ffn_dim * f32_sz),
+                silu: alloc_buffer_private(&self.device.device, batch_size * ffn_dim * f32_sz),
+                max_batch_size: batch_size,
+            });
+        }
+        let bb = self.batch_bufs.as_ref().unwrap();
+
+        // CPU embedding lookup
+        let embed_buf = self.weight_store.embed();
+        for (tok, &tid) in token_ids.iter().enumerate() {
+            let embed_offset = (tid as usize) * h * f32_sz;
+            let dst_offset = tok * h * f32_sz;
+            unsafe {
+                let src = (embed_buf.contents().as_ptr() as *const u8).add(embed_offset);
+                let dst = (bb.hidden_a.contents().as_ptr() as *mut u8).add(dst_offset);
+                std::ptr::copy_nonoverlapping(src, dst, h * f32_sz);
+            }
+        }
+
+        // Pre-lookup PSOs
+        let kv_copy_pso = self
+            .pso_cache
+            .get(&PsoKey::simple("kv_cache_copy"))
+            .expect("kv_cache_copy PSO not prewarmed");
+        let rmsnorm_pso = self
+            .pso_cache
+            .get(&PsoKey::simple("rmsnorm_optimized"))
+            .expect("rmsnorm_optimized PSO not prewarmed");
+        let rope_pso = self
+            .pso_cache
+            .get(&PsoKey::simple("rope_apply"))
+            .expect("rope_apply PSO not prewarmed");
+        let attn_pso = self
+            .pso_cache
+            .get(&PsoKey::simple("decode_attention_v2"))
+            .expect("decode_attention_v2 PSO not prewarmed");
+        let silu_pso = self
+            .pso_cache
+            .get(&PsoKey::simple("ffn_silu"))
+            .expect("ffn_silu PSO not prewarmed");
+
+        let cmd_buf = self
+            .device
+            .command_queue
+            .commandBuffer()
+            .expect("Failed to create command buffer");
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("Failed to create compute encoder");
+
+        let initial_pos = self.position;
+        let hidden_dim_u32 = h as u32;
+        let num_heads_u32 = self.num_heads as u32;
+        let num_kv_heads_u32 = self.num_kv_heads as u32;
+        let head_dim_u32 = self.head_dim as u32;
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+
+        let grid_1 = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        let tg_32 = MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
+        let tg_256 = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+
+        // Layer-by-layer forward (same as forward_prompt)
+        for layer_idx in 0..self.num_layers {
+            let norms = self.weight_store.norm(layer_idx);
+            let attn = self.weight_store.attn_proj(layer_idx);
+
+            self.encode_rmsnorm_batched(
+                &encoder,
+                &bb.hidden_a,
+                &norms.attn_norm,
+                &bb.hidden_b,
+                h,
+                batch_size,
+                rmsnorm_pso,
+            );
+
+            self.encode_multi_token_matvec_q4_0(
+                &encoder,
+                &attn.q.buffer, attn.q.offset,
+                &bb.hidden_b,
+                &bb.q,
+                q_dim,
+                h,
+                batch_size,
+            );
+            self.encode_multi_token_matvec_q4_0(
+                &encoder,
+                &attn.k.buffer, attn.k.offset,
+                &bb.hidden_b,
+                &bb.k,
+                kv_dim,
+                h,
+                batch_size,
+            );
+            self.encode_multi_token_matvec_q4_0(
+                &encoder,
+                &attn.v.buffer, attn.v.offset,
+                &bb.hidden_b,
+                &bb.v,
+                kv_dim,
+                h,
+                batch_size,
+            );
+
+            let q_pairs = self.num_heads * self.head_dim / 2;
+            let k_pairs = self.num_kv_heads * self.head_dim / 2;
+            for tok in 0..batch_size {
+                let pos = (initial_pos + tok) as u32;
+
+                encoder.setComputePipelineState(rope_pso);
+                set_buffer(&encoder, &bb.q, tok * q_dim * f32_sz, 0);
+                set_bytes(&encoder, &num_heads_u32, 1);
+                set_bytes(&encoder, &head_dim_u32, 2);
+                set_bytes(&encoder, &pos, 3);
+                set_bytes(&encoder, &self.rope_theta, 4);
+                encoder.dispatchThreads_threadsPerThreadgroup(
+                    MTLSize {
+                        width: q_pairs,
+                        height: 1,
+                        depth: 1,
+                    },
+                    tg_32,
+                );
+
+                encoder.setComputePipelineState(rope_pso);
+                set_buffer(&encoder, &bb.k, tok * kv_dim * f32_sz, 0);
+                set_bytes(&encoder, &num_kv_heads_u32, 1);
+                set_bytes(&encoder, &head_dim_u32, 2);
+                set_bytes(&encoder, &pos, 3);
+                set_bytes(&encoder, &self.rope_theta, 4);
+                encoder.dispatchThreads_threadsPerThreadgroup(
+                    MTLSize {
+                        width: k_pairs,
+                        height: 1,
+                        depth: 1,
+                    },
+                    tg_32,
+                );
+            }
+
+            for tok in 0..batch_size {
+                let kv_offset = tok * kv_dim * f32_sz;
+                let q_offset = tok * q_dim * f32_sz;
+                let attn_offset = tok * q_dim * f32_sz;
+
+                self.kv_caches.cache_mut(layer_idx).encode_kv_append_offset(
+                    &encoder,
+                    kv_copy_pso,
+                    &bb.k,
+                    &bb.v,
+                    kv_offset,
+                );
+
+                let kv_cache = self.kv_caches.cache(layer_idx);
+                let kv_len = kv_cache.current_len() as u32;
+
+                encoder.setComputePipelineState(attn_pso);
+                set_buffer(&encoder, &bb.q, q_offset, 0);
+                set_buffer(&encoder, kv_cache.k_buffer(), 0, 1);
+                set_buffer(&encoder, kv_cache.v_buffer(), 0, 2);
+                set_buffer(&encoder, &bb.attn_out, attn_offset, 3);
+                set_bytes(&encoder, &num_heads_u32, 4);
+                set_bytes(&encoder, &num_kv_heads_u32, 5);
+                set_bytes(&encoder, &head_dim_u32, 6);
+                set_bytes(&encoder, &kv_len, 7);
+                set_bytes(&encoder, &scale, 8);
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: self.num_heads,
+                        height: 1,
+                        depth: 1,
+                    },
+                    tg_256,
+                );
+            }
+
+            let attn = self.weight_store.attn_proj(layer_idx);
+            self.encode_multi_token_matvec_q4_0_accumulate(
+                &encoder,
+                &attn.o.buffer, attn.o.offset,
+                &bb.attn_out,
+                &bb.hidden_a,
+                h,
+                q_dim,
+                batch_size,
+            );
+
+            let norms = self.weight_store.norm(layer_idx);
+            let ffn = self.weight_store.ffn(layer_idx);
+            self.encode_rmsnorm_batched(
+                &encoder,
+                &bb.hidden_a,
+                &norms.ffn_norm,
+                &bb.hidden_b,
+                h,
+                batch_size,
+                rmsnorm_pso,
+            );
+
+            self.encode_multi_token_matvec_q4_0(
+                &encoder,
+                &ffn.gate.buffer, ffn.gate.offset,
+                &bb.hidden_b,
+                &bb.gate,
+                ffn_dim,
+                h,
+                batch_size,
+            );
+            self.encode_multi_token_matvec_q4_0(
+                &encoder,
+                &ffn.up.buffer, ffn.up.offset,
+                &bb.hidden_b,
+                &bb.up,
+                ffn_dim,
+                h,
+                batch_size,
+            );
+
+            self.encode_silu_batched(
+                &encoder, &bb.gate, &bb.up, &bb.silu, ffn_dim, batch_size, silu_pso,
+            );
+
+            self.encode_multi_token_matvec_q4_0_accumulate(
+                &encoder,
+                &ffn.down.buffer, ffn.down.offset,
+                &bb.silu,
+                &bb.hidden_a,
+                h,
+                ffn_dim,
+                batch_size,
+            );
+        }
+
+        // ---- Final: RMSNorm + lm_head for ALL token positions ----
+        // RMSNorm on all positions: hidden_a[batch] -> hidden_b[batch]
+        self.encode_rmsnorm_batched(
+            &encoder,
+            &bb.hidden_a,
+            self.weight_store.final_norm(),
+            &bb.hidden_b,
+            h,
+            batch_size,
+            rmsnorm_pso,
+        );
+
+        // Allocate logits buffer for all positions
+        let all_logits_buf = alloc_buffer(
+            &self.device.device,
+            batch_size * self.vocab_size * f32_sz,
+        );
+
+        // lm_head: hidden_b[batch] -> all_logits[batch, vocab_size]
+        if let Some(wb) = self.weight_store.lm_head_q6k() {
+            self.encode_multi_token_matvec_q6_k(
+                &encoder,
+                &wb.buffer, wb.offset,
+                &bb.hidden_b,
+                &all_logits_buf,
+                self.vocab_size,
+                h,
+                batch_size,
+            );
+        } else {
+            let wb = self.weight_store.lm_head();
+            self.encode_multi_token_matvec_q4_0(
+                &encoder,
+                &wb.buffer, wb.offset,
+                &bb.hidden_b,
+                &all_logits_buf,
+                self.vocab_size,
+                h,
+                batch_size,
+            );
+        }
+
+        // Submit
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        validate_command_buffer(&cmd_buf, "forward_prompt_logits", 0)?;
+
+        // Read back all logits (Shared buffer, CPU-readable)
+        let all_logits: Vec<f32> =
+            unsafe { read_buffer_slice(&all_logits_buf, batch_size * self.vocab_size) };
+
+        // Split into per-position logit vectors
+        let result: Vec<Vec<f32>> = (0..batch_size)
+            .map(|tok| {
+                let start = tok * self.vocab_size;
+                all_logits[start..start + self.vocab_size].to_vec()
+            })
+            .collect();
+
+        self.position += batch_size;
+        Ok(result)
+    }
+
     /// Debug forward pass: multi-command-buffer path with per-layer readback.
     ///
     /// Uses the original encode_attention_projections / encode_attention_output /
