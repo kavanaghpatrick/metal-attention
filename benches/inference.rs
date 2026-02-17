@@ -341,8 +341,8 @@ fn bench_eagle_decode(c: &mut Criterion) {
     const N_DRAFT: usize = 6;
 
     // Load EagleDecoder with random weights (one-time cost)
-    let mut decoder =
-        metal_attention::EagleDecoder::new_random(&path, N_DRAFT).expect("Failed to load EagleDecoder");
+    let mut decoder = metal_attention::EagleDecoder::new_random(&path, N_DRAFT)
+        .expect("Failed to load EagleDecoder");
 
     // Warmup: one short generation
     let _ = decoder.generate(EAGLE_PROMPT, 5, |_| {});
@@ -368,8 +368,8 @@ fn bench_eagle_decode(c: &mut Criterion) {
 
     group.bench_function("baseline_decode_100tok", |b| {
         // Use a plain GpuForwardPass for target-only baseline
-        let mut gpu =
-            metal_attention::GpuForwardPass::from_gguf(&path).expect("Failed to load baseline model");
+        let mut gpu = metal_attention::GpuForwardPass::from_gguf(&path)
+            .expect("Failed to load baseline model");
 
         // Warmup baseline
         for &tok in EAGLE_PROMPT {

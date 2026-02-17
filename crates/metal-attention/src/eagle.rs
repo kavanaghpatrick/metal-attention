@@ -109,11 +109,7 @@ impl EagleDecoder {
     }
 
     /// Create from pre-loaded components (useful for tests).
-    pub fn from_parts(
-        target: GpuForwardPass,
-        eagle_head: EagleHead,
-        n_draft: usize,
-    ) -> Self {
+    pub fn from_parts(target: GpuForwardPass, eagle_head: EagleHead, n_draft: usize) -> Self {
         Self {
             target,
             eagle_head,
@@ -164,8 +160,7 @@ impl EagleDecoder {
         stats.tokens_accepted += 1;
 
         while generated.len() < max_tokens {
-            let accepted =
-                self.speculation_round(last_token, &mut stats, &mut callback)?;
+            let accepted = self.speculation_round(last_token, &mut stats, &mut callback)?;
             generated.extend_from_slice(&accepted);
 
             if accepted.is_empty() {

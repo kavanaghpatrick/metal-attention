@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use metal_attention::gpu_forward_pass::GpuForwardPass;
 use metal_attention::eagle_head::EagleHead;
+use metal_attention::gpu_forward_pass::GpuForwardPass;
 use metal_attention::EagleDecoder;
 
 use metal_attention_kernels::buffer::{alloc_buffer_with_data, read_buffer_slice};
@@ -44,8 +44,8 @@ fn test_eagle_random_weights_runs() {
     );
 
     eprintln!("Loading EagleDecoder with random weights...");
-    let mut decoder = EagleDecoder::new_random(path.as_path(), 6)
-        .expect("Failed to create EagleDecoder");
+    let mut decoder =
+        EagleDecoder::new_random(path.as_path(), 6).expect("Failed to create EagleDecoder");
 
     // Mistral tokenizer: approximate "Hello world" prompt
     let prompt: &[u32] = &[1, 733, 16044, 28747];
@@ -80,10 +80,7 @@ fn test_eagle_random_weights_runs() {
     );
 
     // Callback should have received the same tokens
-    assert!(
-        !collected.is_empty(),
-        "Callback received no tokens"
-    );
+    assert!(!collected.is_empty(), "Callback received no tokens");
 
     // With random weights, acceptance rate should be very low (near 0%)
     // but we don't enforce this strictly -- just print it
@@ -120,12 +117,20 @@ fn test_hidden_state_capture() {
     eprintln!("Prompt produced first token: {first_token}");
 
     // Now run forward_token which captures hidden states at layers 0/16/31.
-    let _logits = model.forward_token(first_token).expect("forward_token failed");
+    let _logits = model
+        .forward_token(first_token)
+        .expect("forward_token failed");
 
     // Read back capture buffers.
-    let feat_low_buf = model.eagle_capture_low().expect("eagle_capture_low not set");
-    let feat_mid_buf = model.eagle_capture_mid().expect("eagle_capture_mid not set");
-    let feat_high_buf = model.eagle_capture_high().expect("eagle_capture_high not set");
+    let feat_low_buf = model
+        .eagle_capture_low()
+        .expect("eagle_capture_low not set");
+    let feat_mid_buf = model
+        .eagle_capture_mid()
+        .expect("eagle_capture_mid not set");
+    let feat_high_buf = model
+        .eagle_capture_high()
+        .expect("eagle_capture_high not set");
 
     let feat_low: Vec<f32> = unsafe { read_buffer_slice(feat_low_buf, hidden_size) };
     let feat_mid: Vec<f32> = unsafe { read_buffer_slice(feat_mid_buf, hidden_size) };
@@ -137,7 +142,11 @@ fn test_hidden_state_capture() {
     assert_eq!(feat_high.len(), hidden_size, "feat_high wrong size");
 
     // Assert no NaN/Inf.
-    for (name, buf) in [("feat_low", &feat_low), ("feat_mid", &feat_mid), ("feat_high", &feat_high)] {
+    for (name, buf) in [
+        ("feat_low", &feat_low),
+        ("feat_mid", &feat_mid),
+        ("feat_high", &feat_high),
+    ] {
         let has_nan = buf.iter().any(|v| v.is_nan());
         let has_inf = buf.iter().any(|v| v.is_infinite());
         assert!(!has_nan, "{name} contains NaN values");
@@ -145,7 +154,11 @@ fn test_hidden_state_capture() {
     }
 
     // Assert non-zero (at least some elements must be non-zero).
-    for (name, buf) in [("feat_low", &feat_low), ("feat_mid", &feat_mid), ("feat_high", &feat_high)] {
+    for (name, buf) in [
+        ("feat_low", &feat_low),
+        ("feat_mid", &feat_mid),
+        ("feat_high", &feat_high),
+    ] {
         let non_zero_count = buf.iter().filter(|&&v| v != 0.0).count();
         assert!(
             non_zero_count > 0,
@@ -175,19 +188,25 @@ fn test_hidden_state_capture_zero_overhead() {
     let mut model_no_capture = GpuForwardPass::from_gguf(&path).expect("Failed to load model");
 
     let prompt: &[u32] = &[1, 733, 16044, 28747];
-    let first_token = model_no_capture.forward_prompt(prompt).expect("forward_prompt failed");
+    let first_token = model_no_capture
+        .forward_prompt(prompt)
+        .expect("forward_prompt failed");
 
     // Warmup
     let mut token = first_token;
     for _ in 0..5 {
-        let logits = model_no_capture.forward_token(token).expect("forward_token failed");
+        let logits = model_no_capture
+            .forward_token(token)
+            .expect("forward_token failed");
         token = argmax(&logits);
     }
 
     let n_iters = 100;
     let start_no_capture = Instant::now();
     for _ in 0..n_iters {
-        let logits = model_no_capture.forward_token(token).expect("forward_token failed");
+        let logits = model_no_capture
+            .forward_token(token)
+            .expect("forward_token failed");
         token = argmax(&logits);
     }
     let elapsed_no_capture = start_no_capture.elapsed();
@@ -203,18 +222,24 @@ fn test_hidden_state_capture_zero_overhead() {
     let mut model_with_capture = GpuForwardPass::from_gguf(&path).expect("Failed to load model");
     model_with_capture.enable_eagle_capture(0, 16, 31);
 
-    let first_token2 = model_with_capture.forward_prompt(prompt).expect("forward_prompt failed");
+    let first_token2 = model_with_capture
+        .forward_prompt(prompt)
+        .expect("forward_prompt failed");
 
     // Warmup
     let mut token2 = first_token2;
     for _ in 0..5 {
-        let logits = model_with_capture.forward_token(token2).expect("forward_token failed");
+        let logits = model_with_capture
+            .forward_token(token2)
+            .expect("forward_token failed");
         token2 = argmax(&logits);
     }
 
     let start_with_capture = Instant::now();
     for _ in 0..n_iters {
-        let logits = model_with_capture.forward_token(token2).expect("forward_token failed");
+        let logits = model_with_capture
+            .forward_token(token2)
+            .expect("forward_token failed");
         token2 = argmax(&logits);
     }
     let elapsed_with_capture = start_with_capture.elapsed();
@@ -269,9 +294,15 @@ fn test_eagle_head_produces_valid_tokens() {
 
     // Allocate 3 fake feature buffers with small sinusoidal F32 data (hidden_size elements each).
     let dev = &*device.device;
-    let data_low: Vec<f32> = (0..hidden_size).map(|j| (j as f32 * 0.001).sin() * 0.01).collect();
-    let data_mid: Vec<f32> = (0..hidden_size).map(|j| ((hidden_size + j) as f32 * 0.001).sin() * 0.01).collect();
-    let data_high: Vec<f32> = (0..hidden_size).map(|j| ((2 * hidden_size + j) as f32 * 0.001).sin() * 0.01).collect();
+    let data_low: Vec<f32> = (0..hidden_size)
+        .map(|j| (j as f32 * 0.001).sin() * 0.01)
+        .collect();
+    let data_mid: Vec<f32> = (0..hidden_size)
+        .map(|j| ((hidden_size + j) as f32 * 0.001).sin() * 0.01)
+        .collect();
+    let data_high: Vec<f32> = (0..hidden_size)
+        .map(|j| ((2 * hidden_size + j) as f32 * 0.001).sin() * 0.01)
+        .collect();
     let feat_low = alloc_buffer_with_data(dev, &data_low);
     let feat_mid = alloc_buffer_with_data(dev, &data_mid);
     let feat_high = alloc_buffer_with_data(dev, &data_high);
@@ -344,9 +375,15 @@ fn test_eagle_head_kv_cache_reset() {
     for _ in 0..6 {
         let tok = eagle_head
             .forward_draft_token(
-                &feat_low, &feat_mid, &feat_high,
-                prev_token, model.embed(), model.lm_head(),
-                model.lm_head_is_f32(), model.lm_head_q6k(), model.lm_head_q8(),
+                &feat_low,
+                &feat_mid,
+                &feat_high,
+                prev_token,
+                model.embed(),
+                model.lm_head(),
+                model.lm_head_is_f32(),
+                model.lm_head_q6k(),
+                model.lm_head_q8(),
             )
             .expect("Round 1 forward_draft_token failed");
         prev_token = tok;
@@ -362,9 +399,15 @@ fn test_eagle_head_kv_cache_reset() {
     for _ in 0..6 {
         let tok = eagle_head
             .forward_draft_token(
-                &feat_low, &feat_mid, &feat_high,
-                prev_token, model.embed(), model.lm_head(),
-                model.lm_head_is_f32(), model.lm_head_q6k(), model.lm_head_q8(),
+                &feat_low,
+                &feat_mid,
+                &feat_high,
+                prev_token,
+                model.embed(),
+                model.lm_head(),
+                model.lm_head_is_f32(),
+                model.lm_head_q6k(),
+                model.lm_head_q8(),
             )
             .expect("Round 2 forward_draft_token failed");
         prev_token = tok;
@@ -397,13 +440,17 @@ fn test_eagle_greedy_matches_target_only() {
     eprintln!("=== Target-only greedy decode ({max_tokens} tokens) ===");
     let mut target_model = GpuForwardPass::from_gguf(&path).expect("Failed to load target model");
 
-    let first_token = target_model.forward_prompt(prompt).expect("forward_prompt failed");
+    let first_token = target_model
+        .forward_prompt(prompt)
+        .expect("forward_prompt failed");
     let mut target_tokens = vec![first_token];
     eprint!("{first_token} ");
 
     let mut current_token = first_token;
     for _ in 1..max_tokens {
-        let logits = target_model.forward_token(current_token).expect("forward_token failed");
+        let logits = target_model
+            .forward_token(current_token)
+            .expect("forward_token failed");
         let next_token = argmax(&logits);
         target_tokens.push(next_token);
         eprint!("{next_token} ");

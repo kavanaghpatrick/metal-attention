@@ -342,16 +342,12 @@ fn cpu_dequantize_q6_k_row(block_data: &[u8], n_elements: usize) -> Vec<f32> {
             for l in 0..32 {
                 let is = l / 16;
 
-                let q1 =
-                    ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
-                let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4))
-                    as i32
-                    - 32;
-                let q3 =
-                    ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
-                let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4))
-                    as i32
-                    - 32;
+                let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
+                let q2 =
+                    ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 =
+                    ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
 
                 let sc0 = scales[sc_off + is] as i8 as f32;
                 let sc1 = scales[sc_off + is + 2] as i8 as f32;
@@ -370,12 +366,7 @@ fn cpu_dequantize_q6_k_row(block_data: &[u8], n_elements: usize) -> Vec<f32> {
 }
 
 /// CPU reference: Q6_K matvec = dequantize each row + dot product with input.
-fn cpu_matvec_q6_k(
-    weight_bytes: &[u8],
-    input: &[f32],
-    out_dim: usize,
-    in_dim: usize,
-) -> Vec<f32> {
+fn cpu_matvec_q6_k(weight_bytes: &[u8], input: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
     let n_blocks_per_row = in_dim / Q6K_BLOCK_SIZE;
     let row_bytes = n_blocks_per_row * Q6K_BLOCK_BYTES;
 
@@ -395,12 +386,7 @@ fn cpu_matvec_q6_k(
 }
 
 /// Run matvec_q6_k on GPU: weight[out_dim, in_dim/256 * 210] * input[in_dim] -> output[out_dim].
-fn gpu_matvec_q6_k(
-    weight_bytes: &[u8],
-    input: &[f32],
-    out_dim: usize,
-    in_dim: usize,
-) -> Vec<f32> {
+fn gpu_matvec_q6_k(weight_bytes: &[u8], input: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
     let device = GpuDevice::new();
     let mut pso_cache = PsoCache::new(device.library.clone());
     pso_cache.prewarm(&[PsoKey::simple("matvec_q6_k")]);
@@ -578,8 +564,16 @@ fn test_mistral_q6k_end_to_end() {
     eprintln!("Model loaded in {:.2}s", load_time.as_secs_f64());
 
     // Verify model dimensions match Mistral-7B
-    assert_eq!(gpu.vocab_size(), 32000, "Mistral-7B vocab_size should be 32000");
-    assert_eq!(gpu.hidden_size(), 4096, "Mistral-7B hidden_size should be 4096");
+    assert_eq!(
+        gpu.vocab_size(),
+        32000,
+        "Mistral-7B vocab_size should be 32000"
+    );
+    assert_eq!(
+        gpu.hidden_size(),
+        4096,
+        "Mistral-7B hidden_size should be 4096"
+    );
 
     // --- Prefill with a short prompt ---
     // Tokens for "The capital of France is" (approximate; exact tokenization varies)
@@ -588,7 +582,9 @@ fn test_mistral_q6k_end_to_end() {
 
     let mut logits = Vec::new();
     for &tok in prompt_tokens {
-        logits = gpu.forward_token(tok).expect("Mistral forward_token failed during prefill");
+        logits = gpu
+            .forward_token(tok)
+            .expect("Mistral forward_token failed during prefill");
     }
 
     // Verify logits are valid
@@ -615,7 +611,9 @@ fn test_mistral_q6k_end_to_end() {
 
     let decode_start = std::time::Instant::now();
     for _ in 1..decode_count {
-        logits = gpu.forward_token(next_token).expect("Mistral forward_token failed during decode");
+        logits = gpu
+            .forward_token(next_token)
+            .expect("Mistral forward_token failed during decode");
 
         // Verify no NaN/Inf on every step
         assert!(
@@ -715,16 +713,18 @@ fn test_mistral_forward_prompt() {
     let logits = gpu
         .forward_token(result_token)
         .expect("forward_token after forward_prompt failed");
-    assert_eq!(logits.len(), 32000, "Expected 32000 logits after decode step");
+    assert_eq!(
+        logits.len(),
+        32000,
+        "Expected 32000 logits after decode step"
+    );
     assert!(
         !logits.iter().any(|v| v.is_nan() || v.is_infinite()),
         "Logits contain NaN or Inf after decode step following forward_prompt"
     );
 
     let next_token = sample_greedy(&logits);
-    eprintln!(
-        "Continued generation: token after forward_prompt={result_token}, next={next_token}"
-    );
+    eprintln!("Continued generation: token after forward_prompt={result_token}, next={next_token}");
 
     eprintln!("test_mistral_forward_prompt: PASS ({tok_per_sec:.1} tok/s prefill)");
 }
@@ -815,7 +815,9 @@ fn test_kv_cache_rollback() {
     // --- Re-process tokens [4, 5] ---
     let mut logits_after_rollback = Vec::new();
     for &tok in &tokens[3..] {
-        logits_after_rollback = gpu.forward_token(tok).expect("forward_token after rollback failed");
+        logits_after_rollback = gpu
+            .forward_token(tok)
+            .expect("forward_token after rollback failed");
     }
     assert_eq!(gpu.position(), 5);
 
@@ -834,9 +836,7 @@ fn test_kv_cache_rollback() {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
 
-    eprintln!(
-        "KV cache rollback: max logit diff = {max_diff:.6} (expect 0.0)"
-    );
+    eprintln!("KV cache rollback: max logit diff = {max_diff:.6} (expect 0.0)");
 
     // Must be bit-identical (same GPU ops, same data)
     assert!(

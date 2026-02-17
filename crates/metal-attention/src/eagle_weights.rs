@@ -57,8 +57,13 @@ impl SafeTensorsFile {
     /// memory-maps the entire file for zero-copy tensor data access.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
-        let file = File::open(path)
-            .map_err(|e| format!("Failed to open SafeTensors file '{}': {}", path.display(), e))?;
+        let file = File::open(path).map_err(|e| {
+            format!(
+                "Failed to open SafeTensors file '{}': {}",
+                path.display(),
+                e
+            )
+        })?;
 
         // Safety: we only read from the mmap; the file stays open for lifetime of Mmap.
         let mmap = unsafe { Mmap::map(&file) }
@@ -599,8 +604,7 @@ impl EagleWeightStore {
             down: load_weight_buffer(&st, "layers.0.mlp.down_proj.weight", device)?,
         };
 
-        let decoder_attn_norm =
-            load_norm_buffer(&st, "layers.0.input_layernorm.weight", device)?;
+        let decoder_attn_norm = load_norm_buffer(&st, "layers.0.input_layernorm.weight", device)?;
         let decoder_ffn_norm =
             load_norm_buffer(&st, "layers.0.post_attention_layernorm.weight", device)?;
 

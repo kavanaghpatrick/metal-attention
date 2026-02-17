@@ -140,11 +140,7 @@ impl LcgRng {
     }
 
     /// Fill a shared Metal buffer with random F32 data.
-    fn fill_buffer(
-        &mut self,
-        buf: &Retained<ProtocolObject<dyn MTLBuffer>>,
-        num_elements: usize,
-    ) {
+    fn fill_buffer(&mut self, buf: &Retained<ProtocolObject<dyn MTLBuffer>>, num_elements: usize) {
         let ptr = buf.contents().as_ptr() as *mut f32;
         unsafe {
             for i in 0..num_elements {
@@ -294,8 +290,7 @@ impl EagleHead {
 
         // Argmax buffers
         let num_argmax_groups = vocab_size.div_ceil(256);
-        let argmax_partial_vals =
-            alloc_buffer_private(dev, num_argmax_groups * f32_size);
+        let argmax_partial_vals = alloc_buffer_private(dev, num_argmax_groups * f32_size);
         let argmax_partial_idxs =
             alloc_buffer_private(dev, num_argmax_groups * std::mem::size_of::<u32>());
         // Result buffer is Shared so CPU can read back the token id
@@ -564,8 +559,14 @@ impl EagleHead {
 
         // --- Step 1: concat_buffers_3: feat_low + feat_mid + feat_high -> fused_buf ---
         self.encode_concat_3(
-            &encoder, feat_low, feat_mid, feat_high, &self.fused_buf,
-            self.hidden_size, self.hidden_size, self.hidden_size,
+            &encoder,
+            feat_low,
+            feat_mid,
+            feat_high,
+            &self.fused_buf,
+            self.hidden_size,
+            self.hidden_size,
+            self.hidden_size,
         );
 
         // --- Step 2: matvec_f32_v2: fc_fuse_weight * fused_buf -> hidden_a ---
@@ -608,7 +609,12 @@ impl EagleHead {
         // --- Attention: rmsnorm -> Q/K/V matvec -> RoPE -> KV append -> attention -> O proj + residual ---
 
         // RMSNorm: hidden_a -> hidden_b
-        self.encode_rmsnorm(&encoder, &self.hidden_a, &self.decoder_attn_norm, &self.hidden_b);
+        self.encode_rmsnorm(
+            &encoder,
+            &self.hidden_a,
+            &self.decoder_attn_norm,
+            &self.hidden_b,
+        );
 
         // Q projection: hidden_b -> scratch_q [hidden_size -> hidden_size]
         self.encode_matvec_f32(
@@ -648,8 +654,12 @@ impl EagleHead {
         self.encode_rope_dual(&encoder, &self.scratch_q, &self.scratch_k);
 
         // KV cache append (GPU-side)
-        self.eagle_kv_cache
-            .encode_kv_append(&encoder, kv_copy_pso, &self.scratch_k, &self.scratch_v);
+        self.eagle_kv_cache.encode_kv_append(
+            &encoder,
+            kv_copy_pso,
+            &self.scratch_k,
+            &self.scratch_v,
+        );
 
         // Decode attention: Q + KV cache -> scratch_attn_out
         let kv_len = self.eagle_kv_cache.current_len() as u32;
@@ -679,7 +689,12 @@ impl EagleHead {
         // --- FFN: rmsnorm -> gate/up matvec -> silu -> down + residual ---
 
         // RMSNorm: hidden_a -> hidden_b
-        self.encode_rmsnorm(&encoder, &self.hidden_a, &self.decoder_ffn_norm, &self.hidden_b);
+        self.encode_rmsnorm(
+            &encoder,
+            &self.hidden_a,
+            &self.decoder_ffn_norm,
+            &self.hidden_b,
+        );
 
         // Gate projection: hidden_b -> scratch_gate [hidden_size -> intermediate_size]
         self.encode_matvec_f32(
@@ -809,8 +824,16 @@ impl EagleHead {
         set_bytes(encoder, &hidden_dim_u32, 3);
         set_bytes(encoder, &self.rms_norm_eps, 4);
 
-        let grid = MTLSize { width: 1, height: 1, depth: 1 };
-        let tg = MTLSize { width: 32, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 
@@ -847,7 +870,11 @@ impl EagleHead {
             height: 1,
             depth: 1,
         };
-        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 
@@ -884,7 +911,11 @@ impl EagleHead {
             height: 1,
             depth: 1,
         };
-        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 
@@ -921,7 +952,11 @@ impl EagleHead {
             height: 1,
             depth: 1,
         };
-        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 
@@ -952,8 +987,16 @@ impl EagleHead {
         set_bytes(encoder, &self.rope_theta, 6);
 
         let total_pairs = (self.num_heads + self.num_kv_heads) * self.head_dim / 2;
-        let grid = MTLSize { width: total_pairs, height: 1, depth: 1 };
-        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: total_pairs,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
         encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
     }
 
@@ -988,8 +1031,16 @@ impl EagleHead {
         set_bytes(encoder, &kv_len, 7);
         set_bytes(encoder, &scale, 8);
 
-        let grid = MTLSize { width: self.num_heads, height: 1, depth: 1 };
-        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: self.num_heads,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 
@@ -1012,8 +1063,16 @@ impl EagleHead {
         let dim_u32 = self.hidden_size as u32;
         set_bytes(encoder, &dim_u32, 2);
 
-        let grid = MTLSize { width: self.hidden_size, height: 1, depth: 1 };
-        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: self.hidden_size,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
         encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
     }
 
@@ -1040,8 +1099,16 @@ impl EagleHead {
         };
         set_bytes(encoder, &params, 4);
 
-        let grid = MTLSize { width: self.intermediate_size, height: 1, depth: 1 };
-        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: self.intermediate_size,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
         encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
     }
 
@@ -1065,8 +1132,16 @@ impl EagleHead {
         let count_u32 = count as u32;
         set_bytes(encoder, &count_u32, 2);
 
-        let grid = MTLSize { width: count, height: 1, depth: 1 };
-        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: count,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
         encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
     }
 
@@ -1102,8 +1177,16 @@ impl EagleHead {
         set_bytes(encoder, &dim_c_u32, 6);
 
         let total = dim_a + dim_b + dim_c;
-        let grid = MTLSize { width: total, height: 1, depth: 1 };
-        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: total,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
         encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
     }
 
@@ -1133,8 +1216,16 @@ impl EagleHead {
         set_bytes(encoder, &dim_b_u32, 4);
 
         let total = dim_a + dim_b;
-        let grid = MTLSize { width: total, height: 1, depth: 1 };
-        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: total,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
         encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
     }
 
@@ -1160,8 +1251,16 @@ impl EagleHead {
         set_buffer(encoder, &self.argmax_partial_vals, 0, 2);
         set_buffer(encoder, &self.argmax_partial_idxs, 0, 3);
 
-        let grid = MTLSize { width: num_groups, height: 1, depth: 1 };
-        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: num_groups,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
 
         // Stage 2: argmax_final
@@ -1176,7 +1275,11 @@ impl EagleHead {
         set_bytes(encoder, &num_groups_u32, 2);
         set_buffer(encoder, &self.argmax_result, 0, 3);
 
-        let grid_final = MTLSize { width: 1, height: 1, depth: 1 };
+        let grid_final = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_final, tg);
     }
 }
