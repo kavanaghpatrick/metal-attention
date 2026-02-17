@@ -1,0 +1,1597 @@
+//! GPU vs CPU reference correctness tests for all Metal kernels.
+//!
+//! Runs GPU kernels and compares output against FP64 CPU reference implementations.
+//! Must be run with --test-threads=1 since Metal tests can't safely run in parallel.
+//!
+//! Run: MTL_SHADER_VALIDATION=1 cargo test --test correctness -- --test-threads=1
+
+use metal_attention_kernels::dequant::{dispatch_dequantize_q4_0, dispatch_dequantize_q8_0};
+use metal_attention_kernels::device::GpuDevice;
+use metal_attention_kernels::embed::dispatch_embedding_lookup;
+use metal_attention_kernels::ffn::dispatch_ffn_silu;
+use metal_attention_kernels::flash::dispatch_flash_attention;
+use metal_attention_kernels::linear::dispatch_linear_attention;
+use metal_attention_kernels::matmul::dispatch_matmul;
+use metal_attention_kernels::norm::dispatch_rmsnorm;
+use metal_attention_kernels::pipeline::PsoCache;
+
+// Imports for low-level Metal dispatch (kv_cache_copy / buffer_copy tests)
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+};
+
+// ---------------------------------------------------------------------------
+// QA tolerance constants (from QA.md specification)
+// ---------------------------------------------------------------------------
+
+/// Absolute tolerance for flash (softmax) attention GPU vs CPU.
+const FLASH_ATOL: f64 = 5e-3;
+/// Absolute tolerance for linear (chunk-based) attention GPU vs CPU.
+const LINEAR_ATOL: f64 = 1e-3;
+/// Absolute tolerance for RoPE positional encoding GPU vs CPU.
+const ROPE_ATOL: f64 = 1e-4;
+/// Absolute tolerance for grouped-query attention GPU vs CPU.
+const GQA_ATOL: f64 = 1e-6;
+
+// ---------------------------------------------------------------------------
+// CPU reference implementations (ported from proto)
+// ---------------------------------------------------------------------------
+
+/// Naive scaled dot-product attention computed entirely in FP64.
+///
+/// Computes: softmax(Q * K^T / sqrt(head_dim)) * V
+///
+/// All intermediate values use FP64 for maximum precision.
+/// The final output is truncated to FP32.
+fn cpu_attention_f64(q: &[f32], k: &[f32], v: &[f32], seq_len: usize, head_dim: usize) -> Vec<f32> {
+    assert_eq!(q.len(), seq_len * head_dim, "Q length mismatch");
+    assert_eq!(k.len(), seq_len * head_dim, "K length mismatch");
+    assert_eq!(v.len(), seq_len * head_dim, "V length mismatch");
+
+    let scale = 1.0 / (head_dim as f64).sqrt();
+    let mut output = vec![0.0f64; seq_len * head_dim];
+
+    for i in 0..seq_len {
+        // Compute attention scores: q_i * k_j^T * scale
+        let mut scores = vec![0.0f64; seq_len];
+        let mut max_score = f64::NEG_INFINITY;
+
+        for j in 0..seq_len {
+            let mut dot = 0.0f64;
+            for d in 0..head_dim {
+                dot += q[i * head_dim + d] as f64 * k[j * head_dim + d] as f64;
+            }
+            scores[j] = dot * scale;
+            max_score = max_score.max(scores[j]);
+        }
+
+        // Safe softmax: subtract max for numerical stability, then exp and normalize
+        let mut sum_exp = 0.0f64;
+        for j in 0..seq_len {
+            scores[j] = (scores[j] - max_score).exp();
+            sum_exp += scores[j];
+        }
+
+        // Weighted sum of values
+        for j in 0..seq_len {
+            let weight = scores[j] / sum_exp;
+            for d in 0..head_dim {
+                output[i * head_dim + d] += weight * v[j * head_dim + d] as f64;
+            }
+        }
+    }
+
+    // Truncate FP64 accumulation to FP32 output
+    output.iter().map(|&x| x as f32).collect()
+}
+
+/// Chunk-based linear attention computed entirely in FP64.
+///
+/// Implements the recurrence:
+///   H_0 = 0 (D x D zero matrix)
+///   For each chunk c of chunk_size tokens:
+///     H_c = H_{c-1} + sum_{t in chunk} K[t]^T * V[t]  (outer product accumulation)
+///     O_chunk = Q_chunk * H_c                          (matrix-vector products)
+fn cpu_linear_attention_f64(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    head_dim: usize,
+    chunk_size: usize,
+) -> Vec<f32> {
+    assert_eq!(q.len(), seq_len * head_dim, "Q length mismatch");
+    assert_eq!(k.len(), seq_len * head_dim, "K length mismatch");
+    assert_eq!(v.len(), seq_len * head_dim, "V length mismatch");
+    assert!(
+        seq_len % chunk_size == 0,
+        "seq_len ({seq_len}) must be divisible by chunk_size ({chunk_size})"
+    );
+
+    let num_chunks = seq_len / chunk_size;
+
+    // H: D x D hidden state matrix, accumulated across chunks
+    let mut h = vec![0.0f64; head_dim * head_dim];
+
+    // Output: seq_len x head_dim
+    let mut output = vec![0.0f64; seq_len * head_dim];
+
+    for c in 0..num_chunks {
+        let start = c * chunk_size;
+
+        // Update H: H += sum_{t in chunk} K[t]^T * V[t] (outer product accumulation)
+        for t in 0..chunk_size {
+            let token_idx = start + t;
+            for i in 0..head_dim {
+                let k_val = k[token_idx * head_dim + i] as f64;
+                for j in 0..head_dim {
+                    let v_val = v[token_idx * head_dim + j] as f64;
+                    h[i * head_dim + j] += k_val * v_val;
+                }
+            }
+        }
+
+        // Compute output: O_chunk = Q_chunk * H
+        for t in 0..chunk_size {
+            let token_idx = start + t;
+            for j in 0..head_dim {
+                let mut sum = 0.0f64;
+                for i in 0..head_dim {
+                    sum += q[token_idx * head_dim + i] as f64 * h[i * head_dim + j];
+                }
+                output[token_idx * head_dim + j] = sum;
+            }
+        }
+    }
+
+    // Truncate FP64 accumulation to FP32 output
+    output.iter().map(|&x| x as f32).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Test helper
+// ---------------------------------------------------------------------------
+
+/// Assert that two slices are element-wise close within absolute and relative tolerance.
+///
+/// An element passes if: |gpu - cpu| <= atol  OR  |gpu - cpu| / |cpu| <= rtol
+fn assert_allclose(gpu: &[f32], cpu: &[f32], atol: f32, rtol: f32, context: &str) {
+    assert_eq!(gpu.len(), cpu.len(), "{context}: length mismatch");
+
+    let mut max_abs_err = 0.0f32;
+    let mut max_rel_err = 0.0f32;
+    let mut fail_count = 0;
+
+    for (i, (&g, &c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+        let abs_err = (g - c).abs();
+        let rel_err = if c.abs() > 1e-8 {
+            abs_err / c.abs()
+        } else {
+            abs_err
+        };
+        max_abs_err = max_abs_err.max(abs_err);
+        max_rel_err = max_rel_err.max(rel_err);
+
+        if abs_err > atol && rel_err > rtol {
+            fail_count += 1;
+            if fail_count <= 5 {
+                eprintln!(
+                    "{context}[{i}]: gpu={g:.6}, cpu={c:.6}, abs_err={abs_err:.2e}, rel_err={rel_err:.2e}"
+                );
+            }
+        }
+    }
+
+    if fail_count > 0 {
+        panic!(
+            "{context}: {fail_count}/{} elements exceed tolerance (max_abs={max_abs_err:.2e}, max_rel={max_rel_err:.2e})",
+            gpu.len()
+        );
+    }
+
+    eprintln!("{context}: PASS (max_abs={max_abs_err:.2e}, max_rel={max_rel_err:.2e})");
+}
+
+/// Generate deterministic test data using simple trig formula.
+fn gen_data(len: usize, seed: f32) -> Vec<f32> {
+    (0..len)
+        .map(|i| (i as f32 * 0.1 + seed).sin() * 0.5)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// GPU correctness tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_flash_attention_gpu_vs_cpu_small() {
+    let seq_len = 64;
+    let head_dim = 64;
+    let num_heads = 1;
+
+    let q = gen_data(seq_len * head_dim, 0.0);
+    let k = gen_data(seq_len * head_dim, 1.0);
+    let v = gen_data(seq_len * head_dim, 2.0);
+
+    let cpu_out = cpu_attention_f64(&q, &k, &v, seq_len, head_dim);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_flash_attention(
+        &device,
+        &mut pso_cache,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        head_dim,
+        num_heads,
+    );
+
+    assert_allclose(&gpu_out, &cpu_out, 5e-3, 1e-2, "flash_attention N=64 D=64");
+}
+
+#[test]
+fn test_flash_attention_gpu_vs_cpu_medium() {
+    let seq_len = 256;
+    let head_dim = 64;
+    let num_heads = 1;
+
+    let q = gen_data(seq_len * head_dim, 3.0);
+    let k = gen_data(seq_len * head_dim, 4.0);
+    let v = gen_data(seq_len * head_dim, 5.0);
+
+    let cpu_out = cpu_attention_f64(&q, &k, &v, seq_len, head_dim);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_flash_attention(
+        &device,
+        &mut pso_cache,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        head_dim,
+        num_heads,
+    );
+
+    assert_allclose(&gpu_out, &cpu_out, 5e-3, 1e-2, "flash_attention N=256 D=64");
+}
+
+#[test]
+fn test_linear_attention_gpu_vs_cpu_small() {
+    let seq_len = 64;
+    let head_dim = 64;
+    let chunk_size = 32;
+
+    let q = gen_data(seq_len * head_dim, 0.0);
+    let k = gen_data(seq_len * head_dim, 1.0);
+    let v = gen_data(seq_len * head_dim, 2.0);
+
+    let cpu_out = cpu_linear_attention_f64(&q, &k, &v, seq_len, head_dim, chunk_size);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_linear_attention(
+        &device,
+        &mut pso_cache,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        head_dim,
+        chunk_size,
+    );
+
+    assert_allclose(
+        &gpu_out,
+        &cpu_out,
+        1e-3,
+        1e-2,
+        "linear_attention N=64 D=64 C=32",
+    );
+}
+
+#[test]
+fn test_linear_attention_gpu_vs_cpu_medium() {
+    let seq_len = 256;
+    let head_dim = 64;
+    let chunk_size = 32;
+
+    let q = gen_data(seq_len * head_dim, 3.0);
+    let k = gen_data(seq_len * head_dim, 4.0);
+    let v = gen_data(seq_len * head_dim, 5.0);
+
+    let cpu_out = cpu_linear_attention_f64(&q, &k, &v, seq_len, head_dim, chunk_size);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_linear_attention(
+        &device,
+        &mut pso_cache,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        head_dim,
+        chunk_size,
+    );
+
+    assert_allclose(
+        &gpu_out,
+        &cpu_out,
+        1e-3,
+        1e-2,
+        "linear_attention N=256 D=64 C=32",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CPU reference unit tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cpu_attention_single_token() {
+    let q = vec![1.0f32, 0.0, 0.0, 0.0];
+    let k = vec![0.5f32, 0.5, 0.5, 0.5];
+    let v = vec![3.0f32, 7.0, 11.0, 13.0];
+
+    let output = cpu_attention_f64(&q, &k, &v, 1, 4);
+    // With seq_len=1, softmax of a single score is always 1.0, so output = v
+    assert_allclose(&output, &v, 1e-6, 1e-5, "single token");
+}
+
+#[test]
+fn test_cpu_linear_attention_identity() {
+    let head_dim = 4;
+    let chunk_size = 4;
+    let seq_len = 4;
+
+    // Q = K = identity rows
+    let mut q = vec![0.0f32; seq_len * head_dim];
+    let mut k = vec![0.0f32; seq_len * head_dim];
+    for i in 0..seq_len {
+        q[i * head_dim + i] = 1.0;
+        k[i * head_dim + i] = 1.0;
+    }
+
+    let v: Vec<f32> = vec![
+        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+    ];
+
+    let output = cpu_linear_attention_f64(&q, &k, &v, seq_len, head_dim, chunk_size);
+    // With Q=I, K=I, single chunk: output = V
+    assert_allclose(&output, &v, 1e-6, 1e-5, "linear identity");
+}
+
+#[test]
+fn test_assert_allclose_passes() {
+    let a = vec![1.0f32, 2.0, 3.0, 4.0];
+    let b = vec![1.0f32, 2.0, 3.0, 4.0];
+    assert_allclose(&a, &b, 1e-6, 1e-5, "exact match");
+}
+
+#[test]
+#[should_panic(expected = "elements exceed tolerance")]
+fn test_assert_allclose_fails() {
+    let a = vec![1.0f32, 2.0, 3.0, 4.0];
+    let b = vec![1.0f32, 2.0, 3.0, 5.0];
+    assert_allclose(&a, &b, 1e-6, 1e-5, "mismatch");
+}
+
+// ---------------------------------------------------------------------------
+// CPU references for new kernels
+// ---------------------------------------------------------------------------
+
+/// CPU reference for RMSNorm.
+///
+/// output[i] = (input[i] / rms) * weight[i]
+/// where rms = sqrt(mean(input^2) + eps)
+fn cpu_rmsnorm(
+    input: &[f32],
+    weight: &[f32],
+    num_tokens: usize,
+    hidden_dim: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let mut output = vec![0.0f32; num_tokens * hidden_dim];
+    for t in 0..num_tokens {
+        let offset = t * hidden_dim;
+        // Compute sum of squares
+        let mut ss = 0.0f64;
+        for d in 0..hidden_dim {
+            let v = input[offset + d] as f64;
+            ss += v * v;
+        }
+        let rms = ((ss / hidden_dim as f64) + eps as f64).sqrt();
+        for d in 0..hidden_dim {
+            output[offset + d] = ((input[offset + d] as f64 / rms) * weight[d] as f64) as f32;
+        }
+    }
+    output
+}
+
+/// CPU reference for SwiGLU activation: silu(gate) * up.
+fn cpu_ffn_silu(gate: &[f32], up: &[f32]) -> Vec<f32> {
+    gate.iter()
+        .zip(up.iter())
+        .map(|(&g, &u)| {
+            let silu_g = g / (1.0 + (-g).exp()); // silu(x) = x * sigmoid(x)
+            silu_g * u
+        })
+        .collect()
+}
+
+/// CPU reference for embedding lookup.
+fn cpu_embedding_lookup(table: &[f32], token_ids: &[u32], hidden_dim: usize) -> Vec<f32> {
+    let mut output = Vec::with_capacity(token_ids.len() * hidden_dim);
+    for &tid in token_ids {
+        let start = tid as usize * hidden_dim;
+        output.extend_from_slice(&table[start..start + hidden_dim]);
+    }
+    output
+}
+
+/// CPU reference for matrix multiplication: C = A * B.
+fn cpu_matmul(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let mut acc = 0.0f64;
+            for i in 0..k {
+                acc += a[row * k + i] as f64 * b[i * n + col] as f64;
+            }
+            c[row * n + col] = acc as f32;
+        }
+    }
+    c
+}
+
+/// CPU reference for Q4_0 dequantization.
+fn cpu_dequantize_q4_0(input: &[u8], num_blocks: usize) -> Vec<f32> {
+    let mut output = vec![0.0f32; num_blocks * 32];
+    for block in 0..num_blocks {
+        let block_offset = block * 18;
+        let out_offset = block * 32;
+        // Read scale as f16 (stored as 2 little-endian bytes)
+        let scale_bits = u16::from_le_bytes([input[block_offset], input[block_offset + 1]]);
+        let scale = half::f16::from_bits(scale_bits).to_f32();
+        let quants = &input[block_offset + 2..block_offset + 18];
+        // GGUF Q4_0 layout: low nibbles first [0..15], high nibbles second [16..31]
+        for i in 0..16 {
+            let byte_val = quants[i];
+            let lo = ((byte_val & 0x0F) as i32 - 8) as f32 * scale;
+            let hi = (((byte_val >> 4) & 0x0F) as i32 - 8) as f32 * scale;
+            output[out_offset + i] = lo;
+            output[out_offset + i + 16] = hi;
+        }
+    }
+    output
+}
+
+// ---------------------------------------------------------------------------
+// GPU correctness tests: RMSNorm
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rmsnorm_gpu_vs_cpu() {
+    let num_tokens = 4;
+    let hidden_dim = 64;
+    let eps = 1e-5f32;
+
+    let input = gen_data(num_tokens * hidden_dim, 0.0);
+    let weight: Vec<f32> = (0..hidden_dim)
+        .map(|i| 0.5 + (i as f32 * 0.01).sin() * 0.3)
+        .collect();
+
+    let cpu_out = cpu_rmsnorm(&input, &weight, num_tokens, hidden_dim, eps);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_rmsnorm(
+        &device,
+        &mut pso_cache,
+        &input,
+        &weight,
+        num_tokens,
+        hidden_dim,
+        eps,
+    );
+
+    assert_allclose(&gpu_out, &cpu_out, 1e-4, 1e-3, "rmsnorm 4x64");
+}
+
+#[test]
+fn test_rmsnorm_gpu_vs_cpu_single_token() {
+    let num_tokens = 1;
+    let hidden_dim = 16;
+    let eps = 1e-5f32;
+
+    let input = vec![1.0f32; hidden_dim];
+    let weight = vec![2.0f32; hidden_dim];
+
+    let cpu_out = cpu_rmsnorm(&input, &weight, num_tokens, hidden_dim, eps);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_rmsnorm(
+        &device,
+        &mut pso_cache,
+        &input,
+        &weight,
+        num_tokens,
+        hidden_dim,
+        eps,
+    );
+
+    // RMS of all-1s vector with dim=16 is sqrt(1 + eps) ~= 1.0
+    // So output should be ~2.0 for each element
+    assert_allclose(&gpu_out, &cpu_out, 1e-5, 1e-4, "rmsnorm 1x16 all-ones");
+}
+
+// ---------------------------------------------------------------------------
+// GPU correctness tests: FFN SwiGLU
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_ffn_silu_gpu_vs_cpu() {
+    let num_tokens = 4;
+    let intermediate_dim = 64;
+    let total = num_tokens * intermediate_dim;
+
+    let gate = gen_data(total, 0.0);
+    let up = gen_data(total, 1.0);
+
+    let cpu_out = cpu_ffn_silu(&gate, &up);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_ffn_silu(
+        &device,
+        &mut pso_cache,
+        &gate,
+        &up,
+        num_tokens,
+        intermediate_dim,
+    );
+
+    assert_allclose(&gpu_out, &cpu_out, 1e-5, 1e-4, "ffn_silu 4x64");
+}
+
+#[test]
+fn test_ffn_silu_zeros() {
+    let num_tokens = 1;
+    let intermediate_dim = 8;
+
+    let gate = vec![0.0f32; 8]; // silu(0) = 0
+    let up = vec![1.0f32; 8];
+
+    let cpu_out = cpu_ffn_silu(&gate, &up);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_ffn_silu(
+        &device,
+        &mut pso_cache,
+        &gate,
+        &up,
+        num_tokens,
+        intermediate_dim,
+    );
+
+    // silu(0) * 1.0 = 0.0
+    assert_allclose(&gpu_out, &cpu_out, 1e-6, 1e-5, "ffn_silu zeros");
+}
+
+// ---------------------------------------------------------------------------
+// GPU correctness tests: Embedding lookup
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_embedding_lookup_gpu_vs_cpu() {
+    let vocab_size = 10;
+    let hidden_dim = 8;
+    let seq_len = 4;
+
+    // Build a small embedding table
+    let table: Vec<f32> = (0..vocab_size * hidden_dim)
+        .map(|i| (i as f32 * 0.1).sin())
+        .collect();
+    let token_ids = vec![0u32, 3, 7, 1];
+
+    let cpu_out = cpu_embedding_lookup(&table, &token_ids, hidden_dim);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_embedding_lookup(
+        &device,
+        &mut pso_cache,
+        &table,
+        &token_ids,
+        seq_len,
+        hidden_dim,
+    );
+
+    assert_allclose(&gpu_out, &cpu_out, 1e-6, 1e-5, "embedding_lookup 4 tokens");
+}
+
+#[test]
+fn test_embedding_lookup_single_token() {
+    let vocab_size = 5;
+    let hidden_dim = 4;
+
+    let table: Vec<f32> = (0..vocab_size * hidden_dim).map(|i| i as f32).collect();
+    let token_ids = vec![2u32];
+
+    let cpu_out = cpu_embedding_lookup(&table, &token_ids, hidden_dim);
+    // Token 2 -> elements [8, 9, 10, 11]
+    assert_eq!(cpu_out, vec![8.0, 9.0, 10.0, 11.0]);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out =
+        dispatch_embedding_lookup(&device, &mut pso_cache, &table, &token_ids, 1, hidden_dim);
+
+    assert_allclose(
+        &gpu_out,
+        &cpu_out,
+        1e-6,
+        1e-5,
+        "embedding_lookup single token",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GPU correctness tests: Matrix multiplication
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_matmul_gpu_vs_cpu() {
+    let m = 8;
+    let n = 8;
+    let k = 16;
+
+    let a = gen_data(m * k, 0.0);
+    let b = gen_data(k * n, 1.0);
+
+    let cpu_out = cpu_matmul(&a, &b, m, n, k);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_matmul(&device, &mut pso_cache, &a, &b, m, n, k);
+
+    assert_allclose(&gpu_out, &cpu_out, 1e-4, 1e-3, "matmul 8x16 * 16x8");
+}
+
+#[test]
+fn test_matmul_identity() {
+    let n = 4;
+
+    // A = I (4x4 identity)
+    let mut a = vec![0.0f32; n * n];
+    for i in 0..n {
+        a[i * n + i] = 1.0;
+    }
+    // B = arbitrary
+    let b = vec![
+        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+    ];
+
+    let cpu_out = cpu_matmul(&a, &b, n, n, n);
+    // I * B = B
+    assert_allclose(&cpu_out, &b, 1e-6, 1e-5, "cpu matmul identity");
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_matmul(&device, &mut pso_cache, &a, &b, n, n, n);
+
+    assert_allclose(&gpu_out, &b, 1e-5, 1e-4, "gpu matmul identity");
+}
+
+#[test]
+fn test_matmul_non_square() {
+    let m = 3;
+    let n = 5;
+    let k = 4;
+
+    let a = gen_data(m * k, 2.0);
+    let b = gen_data(k * n, 3.0);
+
+    let cpu_out = cpu_matmul(&a, &b, m, n, k);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_matmul(&device, &mut pso_cache, &a, &b, m, n, k);
+
+    assert_allclose(&gpu_out, &cpu_out, 1e-4, 1e-3, "matmul 3x4 * 4x5");
+}
+
+// ---------------------------------------------------------------------------
+// GPU correctness tests: Q4_0 Dequantization
+// ---------------------------------------------------------------------------
+
+/// Pack a Q4_0 block from a scale and 32 quantized values (pre-offset by +8).
+fn pack_q4_0_block(scale: f32, values: &[i8; 32]) -> [u8; 18] {
+    let mut block = [0u8; 18];
+    // Write scale as f16
+    let scale_f16 = half::f16::from_f32(scale);
+    let scale_bytes = scale_f16.to_bits().to_le_bytes();
+    block[0] = scale_bytes[0];
+    block[1] = scale_bytes[1];
+    // Pack nibbles (values are already in 0..15 range, representing val-8 = -8..+7)
+    for i in 0..16 {
+        let lo = (values[i * 2] + 8) as u8 & 0x0F;
+        let hi = (values[i * 2 + 1] + 8) as u8 & 0x0F;
+        block[2 + i] = lo | (hi << 4);
+    }
+    block
+}
+
+#[test]
+fn test_dequantize_q4_0_gpu_vs_cpu() {
+    // Create 2 blocks of Q4_0 data
+    let scale1 = 0.5f32;
+    let vals1: [i8; 32] = [
+        -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1, 0,
+        1, 2, 3, 4, 5, 6, 7,
+    ];
+    let block1 = pack_q4_0_block(scale1, &vals1);
+
+    let scale2 = 1.0f32;
+    let vals2: [i8; 32] = [
+        0, 0, 0, 0, 1, 1, 1, 1, -1, -1, -1, -1, 7, 7, 7, 7, -8, -8, -8, -8, 3, 3, 3, 3, -5, -5, -5,
+        -5, 2, 2, 2, 2,
+    ];
+    let block2 = pack_q4_0_block(scale2, &vals2);
+
+    let mut input = Vec::with_capacity(36);
+    input.extend_from_slice(&block1);
+    input.extend_from_slice(&block2);
+
+    let num_blocks = 2;
+    let cpu_out = cpu_dequantize_q4_0(&input, num_blocks);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_dequantize_q4_0(&device, &mut pso_cache, &input, num_blocks);
+
+    assert_allclose(&gpu_out, &cpu_out, 1e-3, 1e-2, "dequantize_q4_0 2 blocks");
+}
+
+#[test]
+fn test_dequantize_q4_0_zero_scale() {
+    // Zero scale should produce all zeros
+    let vals: [i8; 32] = [
+        -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1, 0,
+        1, 2, 3, 4, 5, 6, 7,
+    ];
+    let block = pack_q4_0_block(0.0, &vals);
+    let input = block.to_vec();
+
+    let cpu_out = cpu_dequantize_q4_0(&input, 1);
+    // All should be 0.0 since scale is 0
+    assert!(
+        cpu_out.iter().all(|&v| v == 0.0),
+        "CPU: zero scale should give zeros"
+    );
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_dequantize_q4_0(&device, &mut pso_cache, &input, 1);
+
+    assert_allclose(&gpu_out, &cpu_out, 1e-6, 1e-5, "dequantize_q4_0 zero scale");
+}
+
+// ---------------------------------------------------------------------------
+// GPU correctness tests: Q8_0 Dequantization
+// ---------------------------------------------------------------------------
+
+/// Pack a Q8_0 block from a scale and 32 int8 quantized values.
+fn pack_q8_0_block(scale: f32, values: &[i8; 32]) -> [u8; 34] {
+    let mut block = [0u8; 34];
+    // Write scale as f16
+    let scale_f16 = half::f16::from_f32(scale);
+    let scale_bytes = scale_f16.to_bits().to_le_bytes();
+    block[0] = scale_bytes[0];
+    block[1] = scale_bytes[1];
+    // Write 32 int8 values
+    for i in 0..32 {
+        block[2 + i] = values[i] as u8;
+    }
+    block
+}
+
+/// CPU reference for Q8_0 dequantization.
+fn cpu_dequantize_q8_0(input: &[u8], num_blocks: usize) -> Vec<f32> {
+    let mut output = Vec::with_capacity(num_blocks * 32);
+    for block in 0..num_blocks {
+        let block_offset = block * 34;
+        // Read scale as f16 (stored as 2 little-endian bytes)
+        let scale_bits = u16::from_le_bytes([input[block_offset], input[block_offset + 1]]);
+        let scale = half::f16::from_bits(scale_bits).to_f32();
+        let quants = &input[block_offset + 2..block_offset + 34];
+        for i in 0..32 {
+            let q = quants[i] as i8;
+            output.push(q as f32 * scale);
+        }
+    }
+    output
+}
+
+#[test]
+fn test_dequantize_q8_0_gpu_vs_cpu() {
+    // Create 2 blocks of Q8_0 data
+    let scale1 = 0.25f32;
+    let vals1: [i8; 32] = [
+        -128, -100, -80, -60, -40, -20, -10, -5, -1, 0, 1, 5, 10, 20, 40, 60, 80, 100, 127, -127,
+        -64, -32, -16, -8, -4, -2, 2, 4, 8, 16, 32, 64,
+    ];
+    let block1 = pack_q8_0_block(scale1, &vals1);
+
+    let scale2 = 1.0f32;
+    let vals2: [i8; 32] = [
+        0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8, -8, 16, -16, 32, -32, 64, -64, 127,
+        -127, -128, 100, -100, 50, -50, 25, -25,
+    ];
+    let block2 = pack_q8_0_block(scale2, &vals2);
+
+    let mut input = Vec::with_capacity(68);
+    input.extend_from_slice(&block1);
+    input.extend_from_slice(&block2);
+
+    let num_blocks = 2;
+    let cpu_out = cpu_dequantize_q8_0(&input, num_blocks);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_dequantize_q8_0(&device, &mut pso_cache, &input, num_blocks);
+
+    assert_allclose(&gpu_out, &cpu_out, 1e-3, 1e-2, "dequantize_q8_0 2 blocks");
+}
+
+#[test]
+fn test_dequantize_q8_0_zero_scale() {
+    // Zero scale should produce all zeros
+    let vals: [i8; 32] = [
+        -128, -100, -80, -60, -40, -20, -10, -5, -1, 0, 1, 5, 10, 20, 40, 60, 80, 100, 127, -127,
+        -64, -32, -16, -8, -4, -2, 2, 4, 8, 16, 32, 64,
+    ];
+    let block = pack_q8_0_block(0.0, &vals);
+    let input = block.to_vec();
+
+    let cpu_out = cpu_dequantize_q8_0(&input, 1);
+    assert!(
+        cpu_out.iter().all(|&v| v == 0.0),
+        "CPU: zero scale should give zeros"
+    );
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_dequantize_q8_0(&device, &mut pso_cache, &input, 1);
+
+    assert_allclose(&gpu_out, &cpu_out, 1e-6, 1e-5, "dequantize_q8_0 zero scale");
+}
+
+// ===========================================================================
+// Parameterized flash attention sweep
+// ===========================================================================
+
+/// Helper: run flash attention GPU vs CPU at given (N, D, heads) configuration.
+fn run_flash_attention_check(seq_len: usize, head_dim: usize, num_heads: usize) {
+    let q = gen_data(seq_len * head_dim, 0.0);
+    let k = gen_data(seq_len * head_dim, 1.0);
+    let v = gen_data(seq_len * head_dim, 2.0);
+
+    let cpu_out = cpu_attention_f64(&q, &k, &v, seq_len, head_dim);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_flash_attention(
+        &device,
+        &mut pso_cache,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        head_dim,
+        num_heads,
+    );
+
+    assert_allclose(
+        &gpu_out,
+        &cpu_out,
+        FLASH_ATOL as f32,
+        1e-2,
+        &format!("flash_attn_sweep N={seq_len} D={head_dim} H={num_heads}"),
+    );
+}
+
+#[test]
+fn test_flash_attention_sweep_n64_d64() {
+    run_flash_attention_check(64, 64, 1);
+}
+
+#[test]
+fn test_flash_attention_sweep_n128_d64() {
+    run_flash_attention_check(128, 64, 1);
+}
+
+#[test]
+fn test_flash_attention_sweep_n256_d64() {
+    run_flash_attention_check(256, 64, 1);
+}
+
+#[test]
+fn test_flash_attention_sweep_n512_d64() {
+    run_flash_attention_check(512, 64, 1);
+}
+
+// ===========================================================================
+// Parameterized linear attention sweep
+// ===========================================================================
+
+/// Helper: run linear attention GPU vs CPU at given (N, D, chunk_size) configuration.
+fn run_linear_attention_check(seq_len: usize, head_dim: usize, chunk_size: usize) {
+    let q = gen_data(seq_len * head_dim, 3.0);
+    let k = gen_data(seq_len * head_dim, 4.0);
+    let v = gen_data(seq_len * head_dim, 5.0);
+
+    let cpu_out = cpu_linear_attention_f64(&q, &k, &v, seq_len, head_dim, chunk_size);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_linear_attention(
+        &device,
+        &mut pso_cache,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        head_dim,
+        chunk_size,
+    );
+
+    assert_allclose(
+        &gpu_out,
+        &cpu_out,
+        LINEAR_ATOL as f32,
+        1e-2,
+        &format!("linear_attn_sweep N={seq_len} D={head_dim} C={chunk_size}"),
+    );
+}
+
+#[test]
+fn test_linear_attention_sweep_n64_d64() {
+    run_linear_attention_check(64, 64, 32);
+}
+
+#[test]
+fn test_linear_attention_sweep_n128_d64() {
+    run_linear_attention_check(128, 64, 32);
+}
+
+#[test]
+fn test_linear_attention_sweep_n256_d64() {
+    run_linear_attention_check(256, 64, 32);
+}
+
+// ===========================================================================
+// Edge case tests
+// ===========================================================================
+
+/// Uniform Q=K=V=1.0: all attention weights should be equal (1/N),
+/// so each output row should be close to V (which is all 1.0).
+#[test]
+fn test_flash_attention_uniform_input() {
+    let seq_len = 64;
+    let head_dim = 64;
+    let num_heads = 1;
+
+    let q = vec![1.0f32; seq_len * head_dim];
+    let k = vec![1.0f32; seq_len * head_dim];
+    let v = vec![1.0f32; seq_len * head_dim];
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_flash_attention(
+        &device,
+        &mut pso_cache,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        head_dim,
+        num_heads,
+    );
+
+    // With uniform input, all attention weights are 1/N for each query.
+    // The weighted sum of V (all 1.0) is 1.0 for every position.
+    let expected = vec![1.0f32; seq_len * head_dim];
+    assert_allclose(
+        &gpu_out,
+        &expected,
+        FLASH_ATOL as f32,
+        1e-2,
+        "flash_attention uniform Q=K=V=1.0",
+    );
+}
+
+/// One-hot query: a single non-zero element in Q at position 0.
+/// Verify correct attention behavior (scores dominated by matching K positions).
+#[test]
+fn test_flash_attention_one_hot_query() {
+    let seq_len = 64;
+    let head_dim = 64;
+    let num_heads = 1;
+
+    // Q: only first token, first dimension is 10.0 (rest zero)
+    let mut q = vec![0.0f32; seq_len * head_dim];
+    q[0] = 10.0; // token 0, dim 0
+
+    // K: first token has 10.0 at dim 0 (matching Q), rest have 0.0 at dim 0
+    let mut k = vec![0.0f32; seq_len * head_dim];
+    k[0] = 10.0; // token 0, dim 0 -- matches Q[0]
+
+    // V: each token has a distinct first-dim value for easy verification
+    let mut v = vec![0.0f32; seq_len * head_dim];
+    for i in 0..seq_len {
+        v[i * head_dim] = i as f32;
+    }
+
+    let cpu_out = cpu_attention_f64(&q, &k, &v, seq_len, head_dim);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_flash_attention(
+        &device,
+        &mut pso_cache,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        head_dim,
+        num_heads,
+    );
+
+    assert_allclose(
+        &gpu_out,
+        &cpu_out,
+        FLASH_ATOL as f32,
+        1e-2,
+        "flash_attention one_hot_query",
+    );
+}
+
+/// Linear attention with K = identity (one-hot rows):
+/// First chunk of 32 tokens accumulates partial identity in H,
+/// second chunk sees the full state. GPU vs CPU reference comparison.
+#[test]
+fn test_linear_attention_identity_key() {
+    let head_dim = 64;
+    let seq_len = 64;
+    let chunk_size = 32;
+
+    // K: identity-like -- each of the first head_dim tokens gets a 1.0 at its dimension
+    let mut k = vec![0.0f32; seq_len * head_dim];
+    for i in 0..head_dim.min(seq_len) {
+        k[i * head_dim + i] = 1.0;
+    }
+
+    // Q: identity-like (same as K)
+    let mut q = vec![0.0f32; seq_len * head_dim];
+    for i in 0..head_dim.min(seq_len) {
+        q[i * head_dim + i] = 1.0;
+    }
+
+    // V: each token i has value (i+1) in its own dimension
+    let mut v = vec![0.0f32; seq_len * head_dim];
+    for i in 0..seq_len {
+        v[i * head_dim + (i % head_dim)] = (i + 1) as f32;
+    }
+
+    let cpu_out = cpu_linear_attention_f64(&q, &k, &v, seq_len, head_dim, chunk_size);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_linear_attention(
+        &device,
+        &mut pso_cache,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        head_dim,
+        chunk_size,
+    );
+
+    assert_allclose(
+        &gpu_out,
+        &cpu_out,
+        LINEAR_ATOL as f32,
+        1e-2,
+        "linear_attention identity_key",
+    );
+}
+
+/// RMSNorm of all-zero input should produce all-zero (or near-zero) output.
+/// rms = sqrt(mean(0^2) + eps) = sqrt(eps), output = (0 / sqrt(eps)) * weight = 0.
+#[test]
+fn test_rmsnorm_zero_input() {
+    let num_tokens = 2;
+    let hidden_dim = 64;
+    let eps = 1e-5f32;
+
+    let input = vec![0.0f32; num_tokens * hidden_dim];
+    let weight = vec![1.0f32; hidden_dim];
+
+    let cpu_out = cpu_rmsnorm(&input, &weight, num_tokens, hidden_dim, eps);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_rmsnorm(
+        &device,
+        &mut pso_cache,
+        &input,
+        &weight,
+        num_tokens,
+        hidden_dim,
+        eps,
+    );
+
+    // All outputs should be zero (0 / sqrt(eps)) * w = 0
+    let expected = vec![0.0f32; num_tokens * hidden_dim];
+    assert_allclose(
+        &gpu_out,
+        &expected,
+        ROPE_ATOL as f32, // tighter tolerance for this trivial case
+        1e-5,
+        "rmsnorm zero_input",
+    );
+    assert_allclose(
+        &gpu_out,
+        &cpu_out,
+        ROPE_ATOL as f32,
+        1e-5,
+        "rmsnorm zero_input gpu_vs_cpu",
+    );
+}
+
+/// Matmul A * I = A: multiplying by identity should return A unchanged.
+#[test]
+fn test_matmul_identity_sweep() {
+    let n = 8;
+
+    // Build identity matrix
+    let mut identity = vec![0.0f32; n * n];
+    for i in 0..n {
+        identity[i * n + i] = 1.0;
+    }
+
+    // A = arbitrary matrix
+    let a = gen_data(n * n, 7.0);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_matmul(&device, &mut pso_cache, &a, &identity, n, n, n);
+
+    assert_allclose(&gpu_out, &a, 1e-5, 1e-4, "matmul A*I=A sweep");
+}
+
+// ===========================================================================
+// Finiteness and dimensional correctness checks
+// ===========================================================================
+
+/// Verify all flash attention outputs are finite (no NaN/Inf).
+#[test]
+fn test_flash_attention_output_finiteness() {
+    let seq_len = 128;
+    let head_dim = 64;
+    let num_heads = 1;
+
+    let q = gen_data(seq_len * head_dim, 10.0);
+    let k = gen_data(seq_len * head_dim, 20.0);
+    let v = gen_data(seq_len * head_dim, 30.0);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_flash_attention(
+        &device,
+        &mut pso_cache,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        head_dim,
+        num_heads,
+    );
+
+    assert_eq!(
+        gpu_out.len(),
+        seq_len * head_dim,
+        "output dimension mismatch"
+    );
+    for (i, &val) in gpu_out.iter().enumerate() {
+        assert!(
+            val.is_finite(),
+            "flash_attention output[{i}] is not finite: {val}"
+        );
+    }
+}
+
+/// Verify all linear attention outputs are finite (no NaN/Inf).
+#[test]
+fn test_linear_attention_output_finiteness() {
+    let seq_len = 128;
+    let head_dim = 64;
+    let chunk_size = 64;
+
+    let q = gen_data(seq_len * head_dim, 10.0);
+    let k = gen_data(seq_len * head_dim, 20.0);
+    let v = gen_data(seq_len * head_dim, 30.0);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let gpu_out = dispatch_linear_attention(
+        &device,
+        &mut pso_cache,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        head_dim,
+        chunk_size,
+    );
+
+    assert_eq!(
+        gpu_out.len(),
+        seq_len * head_dim,
+        "output dimension mismatch"
+    );
+    for (i, &val) in gpu_out.iter().enumerate() {
+        assert!(
+            val.is_finite(),
+            "linear_attention output[{i}] is not finite: {val}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GPU correctness tests: kv_cache_copy and buffer_copy kernels
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_kv_cache_copy_gpu_vs_cpu() {
+    use metal_attention_kernels::buffer::{
+        alloc_buffer, alloc_buffer_with_data, read_buffer_slice,
+    };
+    use metal_attention_kernels::dispatch::{set_buffer, set_bytes};
+
+    let kv_dim: u32 = 192;
+    let max_rows: usize = 4;
+    let kv_dim_usize = kv_dim as usize;
+
+    // Generate known source data for K and V
+    let scratch_k = gen_data(kv_dim_usize, 0.0);
+    let scratch_v = gen_data(kv_dim_usize, 1.0);
+
+    // Allocate GPU buffers
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let pso_key = metal_attention_kernels::pipeline::PsoKey::simple("kv_cache_copy");
+    let pso = pso_cache.get_or_compile(&pso_key);
+    // Hold a reference to the PSO for use across dispatches
+    let pso_ptr = pso;
+
+    let k_src_buf = alloc_buffer_with_data(&device.device, &scratch_k);
+    let v_src_buf = alloc_buffer_with_data(&device.device, &scratch_v);
+    let cache_size = max_rows * kv_dim_usize * std::mem::size_of::<f32>();
+    let k_dst_buf = alloc_buffer(&device.device, cache_size);
+    let v_dst_buf = alloc_buffer(&device.device, cache_size);
+
+    // Zero-init the cache buffers
+    unsafe {
+        std::ptr::write_bytes(k_dst_buf.contents().as_ptr() as *mut u8, 0, cache_size);
+        std::ptr::write_bytes(v_dst_buf.contents().as_ptr() as *mut u8, 0, cache_size);
+    }
+
+    // Dispatch kv_cache_copy at row_idx=0
+    let row_idx_0: u32 = 0;
+    {
+        let cmd_buf = device
+            .command_queue
+            .commandBuffer()
+            .expect("Failed to create command buffer");
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("Failed to create compute encoder");
+        encoder.setComputePipelineState(pso_ptr);
+        set_buffer(&encoder, &k_src_buf, 0, 0);
+        set_buffer(&encoder, &v_src_buf, 0, 1);
+        set_buffer(&encoder, &k_dst_buf, 0, 2);
+        set_buffer(&encoder, &v_dst_buf, 0, 3);
+        set_bytes(&encoder, &kv_dim, 4);
+        set_bytes(&encoder, &row_idx_0, 5);
+        let grid = objc2_metal::MTLSize {
+            width: kv_dim_usize,
+            height: 1,
+            depth: 1,
+        };
+        let tg = objc2_metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+    }
+
+    // Read back and verify row 0
+    let k_cache: Vec<f32> = unsafe { read_buffer_slice(&k_dst_buf, max_rows * kv_dim_usize) };
+    let v_cache: Vec<f32> = unsafe { read_buffer_slice(&v_dst_buf, max_rows * kv_dim_usize) };
+
+    // Row 0 should match scratch data exactly (bit-for-bit copy)
+    assert_eq!(
+        &k_cache[..kv_dim_usize],
+        &scratch_k[..],
+        "kv_cache_copy: K row 0 mismatch"
+    );
+    assert_eq!(
+        &v_cache[..kv_dim_usize],
+        &scratch_v[..],
+        "kv_cache_copy: V row 0 mismatch"
+    );
+
+    // Rows 1+ should still be zero
+    for i in kv_dim_usize..max_rows * kv_dim_usize {
+        assert_eq!(
+            k_cache[i], 0.0,
+            "kv_cache_copy: K cache row >0 should be zero at idx {i}"
+        );
+        assert_eq!(
+            v_cache[i], 0.0,
+            "kv_cache_copy: V cache row >0 should be zero at idx {i}"
+        );
+    }
+
+    // Now dispatch at row_idx=1 with different data
+    let scratch_k2 = gen_data(kv_dim_usize, 2.0);
+    let scratch_v2 = gen_data(kv_dim_usize, 3.0);
+    let k_src_buf2 = alloc_buffer_with_data(&device.device, &scratch_k2);
+    let v_src_buf2 = alloc_buffer_with_data(&device.device, &scratch_v2);
+    let row_idx_1: u32 = 1;
+    {
+        let cmd_buf = device
+            .command_queue
+            .commandBuffer()
+            .expect("Failed to create command buffer");
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("Failed to create compute encoder");
+        encoder.setComputePipelineState(pso_ptr);
+        set_buffer(&encoder, &k_src_buf2, 0, 0);
+        set_buffer(&encoder, &v_src_buf2, 0, 1);
+        set_buffer(&encoder, &k_dst_buf, 0, 2);
+        set_buffer(&encoder, &v_dst_buf, 0, 3);
+        set_bytes(&encoder, &kv_dim, 4);
+        set_bytes(&encoder, &row_idx_1, 5);
+        let grid = objc2_metal::MTLSize {
+            width: kv_dim_usize,
+            height: 1,
+            depth: 1,
+        };
+        let tg = objc2_metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+    }
+
+    // Read back again
+    let k_cache2: Vec<f32> = unsafe { read_buffer_slice(&k_dst_buf, max_rows * kv_dim_usize) };
+    let v_cache2: Vec<f32> = unsafe { read_buffer_slice(&v_dst_buf, max_rows * kv_dim_usize) };
+
+    // Row 0 should be UNCHANGED (still matches scratch_k/scratch_v)
+    assert_eq!(
+        &k_cache2[..kv_dim_usize],
+        &scratch_k[..],
+        "kv_cache_copy: K row 0 should be unchanged after row 1 write"
+    );
+    assert_eq!(
+        &v_cache2[..kv_dim_usize],
+        &scratch_v[..],
+        "kv_cache_copy: V row 0 should be unchanged after row 1 write"
+    );
+
+    // Row 1 should match scratch_k2/scratch_v2
+    assert_eq!(
+        &k_cache2[kv_dim_usize..2 * kv_dim_usize],
+        &scratch_k2[..],
+        "kv_cache_copy: K row 1 mismatch"
+    );
+    assert_eq!(
+        &v_cache2[kv_dim_usize..2 * kv_dim_usize],
+        &scratch_v2[..],
+        "kv_cache_copy: V row 1 mismatch"
+    );
+
+    // Rows 2+ should still be zero
+    for i in 2 * kv_dim_usize..max_rows * kv_dim_usize {
+        assert_eq!(
+            k_cache2[i], 0.0,
+            "kv_cache_copy: K row >=2 should be zero at idx {i}"
+        );
+        assert_eq!(
+            v_cache2[i], 0.0,
+            "kv_cache_copy: V row >=2 should be zero at idx {i}"
+        );
+    }
+
+    eprintln!("kv_cache_copy: PASS (2 rows verified bit-for-bit, kv_dim={kv_dim})");
+}
+
+#[test]
+fn test_buffer_copy_gpu_vs_cpu() {
+    use metal_attention_kernels::buffer::{
+        alloc_buffer, alloc_buffer_with_data, read_buffer_slice,
+    };
+    use metal_attention_kernels::dispatch::{set_buffer, set_bytes};
+
+    let count: u32 = 576;
+    let count_usize = count as usize;
+
+    // Generate known source data
+    let src_data = gen_data(count_usize, 5.0);
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let pso_key = metal_attention_kernels::pipeline::PsoKey::simple("buffer_copy");
+    let pso = pso_cache.get_or_compile(&pso_key);
+
+    let src_buf = alloc_buffer_with_data(&device.device, &src_data);
+    let dst_buf = alloc_buffer(&device.device, count_usize * std::mem::size_of::<f32>());
+
+    // Zero-init dst
+    unsafe {
+        std::ptr::write_bytes(
+            dst_buf.contents().as_ptr() as *mut u8,
+            0,
+            count_usize * std::mem::size_of::<f32>(),
+        );
+    }
+
+    // Dispatch buffer_copy
+    {
+        let cmd_buf = device
+            .command_queue
+            .commandBuffer()
+            .expect("Failed to create command buffer");
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("Failed to create compute encoder");
+        encoder.setComputePipelineState(pso);
+        set_buffer(&encoder, &src_buf, 0, 0);
+        set_buffer(&encoder, &dst_buf, 0, 1);
+        set_bytes(&encoder, &count, 2);
+        let grid = objc2_metal::MTLSize {
+            width: count_usize,
+            height: 1,
+            depth: 1,
+        };
+        let tg = objc2_metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+    }
+
+    // Read back and compare bit-for-bit
+    let dst_data: Vec<f32> = unsafe { read_buffer_slice(&dst_buf, count_usize) };
+    assert_eq!(
+        dst_data, src_data,
+        "buffer_copy: dst should match src bit-for-bit (count={count})"
+    );
+
+    eprintln!("buffer_copy: PASS (count={count}, bit-for-bit match)");
+}
+
+#[test]
+fn test_buffer_copy_small() {
+    use metal_attention_kernels::buffer::{
+        alloc_buffer, alloc_buffer_with_data, read_buffer_slice,
+    };
+    use metal_attention_kernels::dispatch::{set_buffer, set_bytes};
+
+    let count: u32 = 1;
+    let count_usize = count as usize;
+
+    let src_data = vec![42.0f32];
+
+    let device = GpuDevice::new();
+    let mut pso_cache = PsoCache::new(device.library.clone());
+    let pso_key = metal_attention_kernels::pipeline::PsoKey::simple("buffer_copy");
+    let pso = pso_cache.get_or_compile(&pso_key);
+
+    let src_buf = alloc_buffer_with_data(&device.device, &src_data);
+    let dst_buf = alloc_buffer(&device.device, std::mem::size_of::<f32>());
+
+    // Zero-init dst
+    unsafe {
+        std::ptr::write_bytes(
+            dst_buf.contents().as_ptr() as *mut u8,
+            0,
+            std::mem::size_of::<f32>(),
+        );
+    }
+
+    // Dispatch buffer_copy with count=1
+    {
+        let cmd_buf = device
+            .command_queue
+            .commandBuffer()
+            .expect("Failed to create command buffer");
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("Failed to create compute encoder");
+        encoder.setComputePipelineState(pso);
+        set_buffer(&encoder, &src_buf, 0, 0);
+        set_buffer(&encoder, &dst_buf, 0, 1);
+        set_bytes(&encoder, &count, 2);
+        let grid = objc2_metal::MTLSize {
+            width: count_usize,
+            height: 1,
+            depth: 1,
+        };
+        let tg = objc2_metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+    }
+
+    // Read back and compare
+    let dst_data: Vec<f32> = unsafe { read_buffer_slice(&dst_buf, count_usize) };
+    assert_eq!(
+        dst_data, src_data,
+        "buffer_copy_small: dst should match src (count=1)"
+    );
+
+    eprintln!("buffer_copy_small: PASS (count=1, edge case)");
+}
+
+/// Verify tolerance constants match QA spec requirements.
+#[test]
+fn test_tolerance_constants_consistency() {
+    // Flash attention: 5e-3 absolute tolerance
+    assert!((FLASH_ATOL - 5e-3).abs() < 1e-10, "FLASH_ATOL must be 5e-3");
+    // Linear attention: 1e-3 absolute tolerance
+    assert!(
+        (LINEAR_ATOL - 1e-3).abs() < 1e-10,
+        "LINEAR_ATOL must be 1e-3"
+    );
+    // RoPE: 1e-4 absolute tolerance
+    assert!((ROPE_ATOL - 1e-4).abs() < 1e-10, "ROPE_ATOL must be 1e-4");
+    // GQA: 1e-6 absolute tolerance
+    assert!((GQA_ATOL - 1e-6).abs() < 1e-10, "GQA_ATOL must be 1e-6");
+    // Verify ordering: tightest to loosest
+    assert!(GQA_ATOL < ROPE_ATOL, "GQA must be tighter than RoPE");
+    assert!(ROPE_ATOL < LINEAR_ATOL, "RoPE must be tighter than Linear");
+    assert!(
+        LINEAR_ATOL < FLASH_ATOL,
+        "Linear must be tighter than Flash"
+    );
+}

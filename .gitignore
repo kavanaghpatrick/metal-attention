@@ -1,6 +1,9 @@
 /target
 /proto/target
 **/*.metallib
+*.air
 *.o
 *.d
 .DS_Store
+/models/
+KB_VALIDATION.md

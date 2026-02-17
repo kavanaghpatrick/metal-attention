@@ -1,0 +1,7 @@
+{
+  "spec": "mistral-7b-perf",
+  "phase": "tasks",
+  "totalTasks": 24,
+  "taskIndex": 0,
+  "created": "2026-02-16"
+}
