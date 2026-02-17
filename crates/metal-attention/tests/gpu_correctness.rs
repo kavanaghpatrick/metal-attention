@@ -728,3 +728,53 @@ fn test_mistral_forward_prompt() {
 
     eprintln!("test_mistral_forward_prompt: PASS ({tok_per_sec:.1} tok/s prefill)");
 }
+
+/// Validate batch prefill (forward_prompt) matches sequential forward_token
+/// for Mistral-7B GQA architecture.
+///
+/// Runs a 32-token prompt through both paths and compares the final greedy
+/// output token. Tests that the batched matvec path with GQA (32Q/8KV heads)
+/// produces identical results to the sequential single-token path.
+#[test]
+#[ignore]
+fn test_mistral_batch_vs_sequential() {
+    let path = mistral_model_path();
+    assert!(
+        path.exists(),
+        "Mistral-7B model not found: {path:?}. Download mistral-7b-v0.1.Q4_0.gguf first."
+    );
+    let path = path.as_path();
+
+    // 32-token prompt
+    let prompt: Vec<u32> = (1..=32).collect();
+
+    // --- Sequential path: forward_token for each token, greedy on last ---
+    eprintln!("Sequential path: {} tokens...", prompt.len());
+    let mut gpu_seq = GpuForwardPass::from_gguf(path).expect("Failed to load Mistral-7B (seq)");
+    for &tok in &prompt[..prompt.len() - 1] {
+        let _ = gpu_seq
+            .forward_token(tok)
+            .expect("sequential forward_token failed");
+    }
+    let seq_token = gpu_seq
+        .forward_token_greedy(*prompt.last().unwrap())
+        .expect("sequential forward_token_greedy failed");
+    eprintln!("Sequential output token: {seq_token}");
+
+    // --- Batched path: forward_prompt ---
+    eprintln!("Batched path: {} tokens...", prompt.len());
+    let mut gpu_batch = GpuForwardPass::from_gguf(path).expect("Failed to load Mistral-7B (batch)");
+    let batch_token = gpu_batch
+        .forward_prompt(&prompt)
+        .expect("forward_prompt failed");
+    eprintln!("Batched output token: {batch_token}");
+
+    // Compare
+    assert_eq!(
+        seq_token, batch_token,
+        "Batch vs sequential mismatch for Mistral-7B 32-token prompt: \
+         sequential={seq_token}, batched={batch_token}"
+    );
+
+    eprintln!("test_mistral_batch_vs_sequential: PASS (both={seq_token})");
+}
