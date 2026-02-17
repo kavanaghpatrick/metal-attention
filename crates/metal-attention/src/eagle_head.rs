@@ -14,11 +14,17 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLBuffer;
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder,
+};
 
 use metal_attention_kernels::buffer::{alloc_buffer, alloc_buffer_private};
 use metal_attention_kernels::device::GpuDevice;
+use metal_attention_kernels::dispatch::{set_buffer, set_bytes};
 use metal_attention_kernels::pipeline::{PsoCache, PsoKey};
+use metal_attention_kernels::types::LayerParams;
+use objc2_metal::MTLSize;
 
 use crate::gpu_kv_cache::GpuKVCache;
 use crate::gpu_weight_store::{AttnProjBuffers, FfnBuffers, WeightBuffer};
@@ -29,6 +35,10 @@ use crate::gpu_weight_store::{AttnProjBuffers, FfnBuffers, WeightBuffer};
 /// an independent KV cache (small, reset per speculation round), and all
 /// scratch buffers needed for the forward pass.
 pub struct EagleHead {
+    // --- Device reference (for command buffer creation) ---
+    /// Static reference to the shared GPU device.
+    pub device: &'static GpuDevice,
+
     // --- FC layers (F32 for POC) ---
     /// FC fusion weight: projects 3*hidden_size -> hidden_size [hidden_size, 3*hidden_size].
     pub fc_fuse_weight: WeightBuffer,
@@ -72,6 +82,10 @@ pub struct EagleHead {
     pub fused_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Combined buffer: 2 * hidden_size floats (for concat_buffers_2 output).
     pub combined_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Embedding scratch buffer (shared, hidden_size * 4 bytes, CPU-writable for embed lookup).
+    pub embed_scratch: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Final norm weight (F32, hidden_size elements) for the output projection norm.
+    pub final_norm: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Logits buffer (vocab_size * 4 bytes).
     pub logits_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Argmax partial values buffer.
@@ -92,6 +106,12 @@ pub struct EagleHead {
     pub head_dim: usize,
     pub intermediate_size: usize,
     pub vocab_size: usize,
+
+    // --- Model parameters ---
+    /// RoPE base frequency (e.g. 10000.0).
+    pub rope_theta: f32,
+    /// RMSNorm epsilon (e.g. 1e-5).
+    pub rms_norm_eps: f32,
 
     /// Current RoPE position for the eagle decoder (increments per draft token).
     pub position: usize,
@@ -253,6 +273,20 @@ impl EagleHead {
         let fused_buf = alloc_buffer_private(dev, 3 * hidden_size * f32_size);
         let combined_buf = alloc_buffer_private(dev, 2 * hidden_size * f32_size);
 
+        // Embedding scratch buffer (shared, CPU-writable for embed lookup)
+        let embed_scratch = alloc_buffer(dev, hidden_size * f32_size);
+
+        // Final norm weight (F32, initialized to ~1.0 with small noise, same as attn/ffn norms)
+        let final_norm = alloc_buffer(dev, hidden_size * f32_size);
+        {
+            let ptr = final_norm.contents().as_ptr() as *mut f32;
+            unsafe {
+                for i in 0..hidden_size {
+                    *ptr.add(i) = 1.0 + rng.next_f32();
+                }
+            }
+        }
+
         // Logits buffer (shared for CPU readback if needed, but argmax is GPU-side)
         let logits_buf = alloc_buffer_private(dev, vocab_size * f32_size);
 
@@ -279,10 +313,14 @@ impl EagleHead {
             PsoKey::simple("argmax_reduce"),
             PsoKey::simple("argmax_final"),
             PsoKey::simple("kv_cache_copy"),
+            PsoKey::simple("residual_add_inplace"),
+            PsoKey::simple("matvec_q6_k"),
+            PsoKey::simple("matvec_q8_0"),
         ];
         pso_cache.prewarm(&pso_keys);
 
         Self {
+            device,
             fc_fuse_weight,
             fc_concat_weight,
             decoder_attn_norm,
@@ -301,6 +339,8 @@ impl EagleHead {
             scratch_silu,
             fused_buf,
             combined_buf,
+            embed_scratch,
+            final_norm,
             logits_buf,
             argmax_partial_vals,
             argmax_partial_idxs,
@@ -312,6 +352,8 @@ impl EagleHead {
             head_dim,
             intermediate_size,
             vocab_size,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-5,
             position: 0,
         }
     }
@@ -324,5 +366,698 @@ impl EagleHead {
     pub fn reset_kv_cache(&mut self) {
         self.eagle_kv_cache.truncate(0);
         self.position = 0;
+    }
+
+    /// Run the full EAGLE draft head forward pass and return the predicted token ID.
+    ///
+    /// Pipeline (all in a single command buffer + encoder):
+    ///   1. concat_buffers_3: feat_low + feat_mid + feat_high -> fused_buf (3*hidden)
+    ///   2. matvec_f32_v2: fc_fuse_weight * fused_buf -> hidden_a (hidden)
+    ///   3. CPU embed lookup: copy prev_token embedding -> embed_scratch
+    ///   4. concat_buffers_2: hidden_a + embed_scratch -> combined_buf (2*hidden)
+    ///   5. matvec_f32_v2: fc_concat_weight * combined_buf -> hidden_b (hidden)
+    ///   6. buffer_copy: hidden_b -> hidden_a (set up residual stream)
+    ///   7. Decoder layer: rmsnorm -> Q/K/V matvec -> RoPE -> KV append -> attention
+    ///      -> O proj + residual -> FFN rmsnorm -> gate/up -> silu -> down + residual
+    ///   8. Final norm -> lm_head matvec -> logits
+    ///   9. argmax_reduce + argmax_final -> token_id
+    ///
+    /// The eagle head maintains its own RoPE position, incrementing each call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_draft_token(
+        &mut self,
+        feat_low: &ProtocolObject<dyn MTLBuffer>,
+        feat_mid: &ProtocolObject<dyn MTLBuffer>,
+        feat_high: &ProtocolObject<dyn MTLBuffer>,
+        prev_token: u32,
+        target_embed_buf: &ProtocolObject<dyn MTLBuffer>,
+        target_lm_head: &WeightBuffer,
+        _target_lm_head_is_f32: bool,
+        target_lm_head_q6k: Option<&WeightBuffer>,
+        target_lm_head_q8: Option<&WeightBuffer>,
+    ) -> Result<u32, String> {
+        // --- CPU embed lookup: copy prev_token embedding to embed_scratch ---
+        {
+            let offset_bytes =
+                (prev_token as usize) * self.hidden_size * std::mem::size_of::<f32>();
+            let row_bytes = self.hidden_size * std::mem::size_of::<f32>();
+            unsafe {
+                let src = (target_embed_buf.contents().as_ptr() as *const u8).add(offset_bytes);
+                let dst = self.embed_scratch.contents().as_ptr() as *mut u8;
+                std::ptr::copy_nonoverlapping(src, dst, row_bytes);
+            }
+        }
+
+        // Pre-look up kv_cache_copy PSO before encoding (avoids borrow conflict).
+        let kv_copy_pso = self
+            .pso_cache
+            .get(&PsoKey::simple("kv_cache_copy"))
+            .expect("kv_cache_copy PSO not prewarmed");
+
+        // Create single command buffer + encoder for the entire pipeline.
+        let cmd_buf = self
+            .device
+            .command_queue
+            .commandBuffer()
+            .expect("Failed to create command buffer");
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("Failed to create compute encoder");
+
+        // --- Step 1: concat_buffers_3: feat_low + feat_mid + feat_high -> fused_buf ---
+        self.encode_concat_3(
+            &encoder, feat_low, feat_mid, feat_high, &self.fused_buf,
+            self.hidden_size, self.hidden_size, self.hidden_size,
+        );
+
+        // --- Step 2: matvec_f32_v2: fc_fuse_weight * fused_buf -> hidden_a ---
+        self.encode_matvec_f32(
+            &encoder,
+            &self.fc_fuse_weight.buffer,
+            self.fc_fuse_weight.offset,
+            &self.fused_buf,
+            &self.hidden_a,
+            self.hidden_size,
+            3 * self.hidden_size,
+        );
+
+        // --- Step 3: concat_buffers_2: hidden_a + embed_scratch -> combined_buf ---
+        self.encode_concat_2(
+            &encoder,
+            &self.hidden_a,
+            &self.embed_scratch,
+            &self.combined_buf,
+            self.hidden_size,
+            self.hidden_size,
+        );
+
+        // --- Step 4: matvec_f32_v2: fc_concat_weight * combined_buf -> hidden_b ---
+        self.encode_matvec_f32(
+            &encoder,
+            &self.fc_concat_weight.buffer,
+            self.fc_concat_weight.offset,
+            &self.combined_buf,
+            &self.hidden_b,
+            self.hidden_size,
+            2 * self.hidden_size,
+        );
+
+        // --- Step 5: Copy hidden_b -> hidden_a (set up residual stream) ---
+        self.encode_buffer_copy(&encoder, &self.hidden_b, &self.hidden_a, self.hidden_size);
+
+        // ==== Decoder layer ====
+
+        // --- Attention: rmsnorm -> Q/K/V matvec -> RoPE -> KV append -> attention -> O proj + residual ---
+
+        // RMSNorm: hidden_a -> hidden_b
+        self.encode_rmsnorm(&encoder, &self.hidden_a, &self.decoder_attn_norm, &self.hidden_b);
+
+        // Q projection: hidden_b -> scratch_q [hidden_size -> hidden_size]
+        self.encode_matvec_f32(
+            &encoder,
+            &self.decoder_attn.q.buffer,
+            self.decoder_attn.q.offset,
+            &self.hidden_b,
+            &self.scratch_q,
+            self.num_heads * self.head_dim,
+            self.hidden_size,
+        );
+
+        // K projection: hidden_b -> scratch_k [hidden_size -> kv_dim]
+        let kv_dim = self.num_kv_heads * self.head_dim;
+        self.encode_matvec_f32(
+            &encoder,
+            &self.decoder_attn.k.buffer,
+            self.decoder_attn.k.offset,
+            &self.hidden_b,
+            &self.scratch_k,
+            kv_dim,
+            self.hidden_size,
+        );
+
+        // V projection: hidden_b -> scratch_v [hidden_size -> kv_dim]
+        self.encode_matvec_f32(
+            &encoder,
+            &self.decoder_attn.v.buffer,
+            self.decoder_attn.v.offset,
+            &self.hidden_b,
+            &self.scratch_v,
+            kv_dim,
+            self.hidden_size,
+        );
+
+        // RoPE on Q and K (dual dispatch)
+        self.encode_rope_dual(&encoder, &self.scratch_q, &self.scratch_k);
+
+        // KV cache append (GPU-side)
+        self.eagle_kv_cache
+            .encode_kv_append(&encoder, kv_copy_pso, &self.scratch_k, &self.scratch_v);
+
+        // Decode attention: Q + KV cache -> scratch_attn_out
+        let kv_len = self.eagle_kv_cache.current_len() as u32;
+        self.encode_decode_attention(
+            &encoder,
+            &self.scratch_q,
+            self.eagle_kv_cache.k_buffer(),
+            self.eagle_kv_cache.v_buffer(),
+            &self.scratch_attn_out,
+            kv_len,
+        );
+
+        // O projection: scratch_attn_out -> hidden_b [hidden_size -> hidden_size]
+        self.encode_matvec_f32(
+            &encoder,
+            &self.decoder_attn.o.buffer,
+            self.decoder_attn.o.offset,
+            &self.scratch_attn_out,
+            &self.hidden_b,
+            self.hidden_size,
+            self.num_heads * self.head_dim,
+        );
+
+        // Residual: hidden_a += hidden_b
+        self.encode_residual_add_inplace(&encoder, &self.hidden_a, &self.hidden_b);
+
+        // --- FFN: rmsnorm -> gate/up matvec -> silu -> down + residual ---
+
+        // RMSNorm: hidden_a -> hidden_b
+        self.encode_rmsnorm(&encoder, &self.hidden_a, &self.decoder_ffn_norm, &self.hidden_b);
+
+        // Gate projection: hidden_b -> scratch_gate [hidden_size -> intermediate_size]
+        self.encode_matvec_f32(
+            &encoder,
+            &self.decoder_ffn.gate.buffer,
+            self.decoder_ffn.gate.offset,
+            &self.hidden_b,
+            &self.scratch_gate,
+            self.intermediate_size,
+            self.hidden_size,
+        );
+
+        // Up projection: hidden_b -> scratch_up [hidden_size -> intermediate_size]
+        self.encode_matvec_f32(
+            &encoder,
+            &self.decoder_ffn.up.buffer,
+            self.decoder_ffn.up.offset,
+            &self.hidden_b,
+            &self.scratch_up,
+            self.intermediate_size,
+            self.hidden_size,
+        );
+
+        // SwiGLU: silu(scratch_gate) * scratch_up -> scratch_silu
+        self.encode_ffn_silu(&encoder);
+
+        // Down projection: scratch_silu -> hidden_b [intermediate_size -> hidden_size]
+        self.encode_matvec_f32(
+            &encoder,
+            &self.decoder_ffn.down.buffer,
+            self.decoder_ffn.down.offset,
+            &self.scratch_silu,
+            &self.hidden_b,
+            self.hidden_size,
+            self.intermediate_size,
+        );
+
+        // Residual: hidden_a += hidden_b
+        self.encode_residual_add_inplace(&encoder, &self.hidden_a, &self.hidden_b);
+
+        // ==== Final projection ====
+
+        // Final norm: hidden_a -> hidden_b
+        self.encode_rmsnorm(&encoder, &self.hidden_a, &self.final_norm, &self.hidden_b);
+
+        // lm_head matvec: hidden_b -> logits_buf
+        // Prefer Q6_K > Q8_0 > F32 > fallback F32 for lm_head
+        if let Some(wb) = target_lm_head_q6k {
+            self.encode_matvec_q6_k(
+                &encoder,
+                &wb.buffer,
+                wb.offset,
+                &self.hidden_b,
+                &self.logits_buf,
+                self.vocab_size,
+                self.hidden_size,
+            );
+        } else if let Some(wb) = target_lm_head_q8 {
+            self.encode_matvec_q8_0(
+                &encoder,
+                &wb.buffer,
+                wb.offset,
+                &self.hidden_b,
+                &self.logits_buf,
+                self.vocab_size,
+                self.hidden_size,
+            );
+        } else {
+            // F32 lm_head (tied embeddings or explicit F32)
+            self.encode_matvec_f32(
+                &encoder,
+                &target_lm_head.buffer,
+                target_lm_head.offset,
+                &self.hidden_b,
+                &self.logits_buf,
+                self.vocab_size,
+                self.hidden_size,
+            );
+        }
+
+        // Argmax: logits_buf -> argmax_result
+        self.encode_argmax(&encoder, &self.logits_buf);
+
+        // Submit + wait
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        validate_eagle_cmd_buf(&cmd_buf, "forward_draft_token")?;
+
+        // Read back argmax result (single u32)
+        let token_id = unsafe {
+            let ptr = self.argmax_result.contents().as_ptr() as *const u32;
+            *ptr
+        };
+
+        // Increment RoPE position for next draft token
+        self.position += 1;
+
+        Ok(token_id)
+    }
+
+    // ========================================================================
+    // Encode helpers: dispatch Metal compute kernels.
+    // Same patterns as GpuForwardPass but operating on EagleHead's own PSO cache
+    // and scratch buffers.
+    // ========================================================================
+
+    /// Encode RMSNorm: input * weight -> output. Single threadgroup of 32 threads.
+    fn encode_rmsnorm(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        input_buf: &ProtocolObject<dyn MTLBuffer>,
+        weight_buf: &ProtocolObject<dyn MTLBuffer>,
+        output_buf: &ProtocolObject<dyn MTLBuffer>,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("rmsnorm_optimized"))
+            .expect("rmsnorm_optimized PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, input_buf, 0, 0);
+        set_buffer(encoder, weight_buf, 0, 1);
+        set_buffer(encoder, output_buf, 0, 2);
+
+        let hidden_dim_u32 = self.hidden_size as u32;
+        set_bytes(encoder, &hidden_dim_u32, 3);
+        set_bytes(encoder, &self.rms_norm_eps, 4);
+
+        let grid = MTLSize { width: 1, height: 1, depth: 1 };
+        let tg = MTLSize { width: 32, height: 1, depth: 1 };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode F32 matvec v2: weight * input -> output. 8 rows/TG, 256 threads.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_matvec_f32(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        weight_buf: &ProtocolObject<dyn MTLBuffer>,
+        weight_offset: usize,
+        input_buf: &ProtocolObject<dyn MTLBuffer>,
+        output_buf: &ProtocolObject<dyn MTLBuffer>,
+        out_dim: usize,
+        in_dim: usize,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("matvec_f32_v2"))
+            .expect("matvec_f32_v2 PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, weight_buf, weight_offset, 0);
+        set_buffer(encoder, input_buf, 0, 1);
+        set_buffer(encoder, output_buf, 0, 2);
+
+        let out_dim_u32 = out_dim as u32;
+        let in_dim_u32 = in_dim as u32;
+        set_bytes(encoder, &out_dim_u32, 3);
+        set_bytes(encoder, &in_dim_u32, 4);
+
+        const ROWS_PER_TG: usize = 8;
+        let grid = MTLSize {
+            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode Q6_K matvec: weight * input -> output. 256 threads, 8 rows/TG.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_matvec_q6_k(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        weight_buf: &ProtocolObject<dyn MTLBuffer>,
+        weight_offset: usize,
+        input_buf: &ProtocolObject<dyn MTLBuffer>,
+        output_buf: &ProtocolObject<dyn MTLBuffer>,
+        out_dim: usize,
+        in_dim: usize,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("matvec_q6_k"))
+            .expect("matvec_q6_k PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, weight_buf, weight_offset, 0);
+        set_buffer(encoder, input_buf, 0, 1);
+        set_buffer(encoder, output_buf, 0, 2);
+
+        let out_dim_u32 = out_dim as u32;
+        let in_dim_u32 = in_dim as u32;
+        set_bytes(encoder, &out_dim_u32, 3);
+        set_bytes(encoder, &in_dim_u32, 4);
+
+        const ROWS_PER_TG: usize = 8;
+        let grid = MTLSize {
+            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode Q8_0 matvec: weight * input -> output. 256 threads, 8 rows/TG.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_matvec_q8_0(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        weight_buf: &ProtocolObject<dyn MTLBuffer>,
+        weight_offset: usize,
+        input_buf: &ProtocolObject<dyn MTLBuffer>,
+        output_buf: &ProtocolObject<dyn MTLBuffer>,
+        out_dim: usize,
+        in_dim: usize,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("matvec_q8_0"))
+            .expect("matvec_q8_0 PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, weight_buf, weight_offset, 0);
+        set_buffer(encoder, input_buf, 0, 1);
+        set_buffer(encoder, output_buf, 0, 2);
+
+        let out_dim_u32 = out_dim as u32;
+        let in_dim_u32 = in_dim as u32;
+        set_bytes(encoder, &out_dim_u32, 3);
+        set_bytes(encoder, &in_dim_u32, 4);
+
+        const ROWS_PER_TG: usize = 8;
+        let grid = MTLSize {
+            width: (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode dual-buffer RoPE: apply RoPE to both Q and K in a single dispatch.
+    fn encode_rope_dual(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        q_buf: &ProtocolObject<dyn MTLBuffer>,
+        k_buf: &ProtocolObject<dyn MTLBuffer>,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("rope_apply_dual"))
+            .expect("rope_apply_dual PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, q_buf, 0, 0);
+        set_buffer(encoder, k_buf, 0, 1);
+
+        let num_q_heads_u32 = self.num_heads as u32;
+        let num_k_heads_u32 = self.num_kv_heads as u32;
+        let head_dim_u32 = self.head_dim as u32;
+        let position_u32 = self.position as u32;
+        set_bytes(encoder, &num_q_heads_u32, 2);
+        set_bytes(encoder, &num_k_heads_u32, 3);
+        set_bytes(encoder, &head_dim_u32, 4);
+        set_bytes(encoder, &position_u32, 5);
+        set_bytes(encoder, &self.rope_theta, 6);
+
+        let total_pairs = (self.num_heads + self.num_kv_heads) * self.head_dim / 2;
+        let grid = MTLSize { width: total_pairs, height: 1, depth: 1 };
+        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode decode attention v2: Q + KV cache -> output. 256 threads per head.
+    fn encode_decode_attention(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        q_buf: &ProtocolObject<dyn MTLBuffer>,
+        k_cache_buf: &ProtocolObject<dyn MTLBuffer>,
+        v_cache_buf: &ProtocolObject<dyn MTLBuffer>,
+        output_buf: &ProtocolObject<dyn MTLBuffer>,
+        kv_len: u32,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("decode_attention_v2"))
+            .expect("decode_attention_v2 PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, q_buf, 0, 0);
+        set_buffer(encoder, k_cache_buf, 0, 1);
+        set_buffer(encoder, v_cache_buf, 0, 2);
+        set_buffer(encoder, output_buf, 0, 3);
+
+        let num_heads_u32 = self.num_heads as u32;
+        let num_kv_heads_u32 = self.num_kv_heads as u32;
+        let head_dim_u32 = self.head_dim as u32;
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        set_bytes(encoder, &num_heads_u32, 4);
+        set_bytes(encoder, &num_kv_heads_u32, 5);
+        set_bytes(encoder, &head_dim_u32, 6);
+        set_bytes(encoder, &kv_len, 7);
+        set_bytes(encoder, &scale, 8);
+
+        let grid = MTLSize { width: self.num_heads, height: 1, depth: 1 };
+        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode in-place residual addition: a[i] += b[i].
+    fn encode_residual_add_inplace(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        a_buf: &ProtocolObject<dyn MTLBuffer>,
+        b_buf: &ProtocolObject<dyn MTLBuffer>,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("residual_add_inplace"))
+            .expect("residual_add_inplace PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, a_buf, 0, 0);
+        set_buffer(encoder, b_buf, 0, 1);
+
+        let dim_u32 = self.hidden_size as u32;
+        set_bytes(encoder, &dim_u32, 2);
+
+        let grid = MTLSize { width: self.hidden_size, height: 1, depth: 1 };
+        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode SwiGLU activation: silu(scratch_gate) * scratch_up -> scratch_silu.
+    fn encode_ffn_silu(&self, encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("ffn_silu"))
+            .expect("ffn_silu PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+
+        // ffn_silu kernel signature: input(0), gate(1), up(2), output(3), params(4)
+        // input(0) is unused but required in the binding
+        set_buffer(encoder, &self.hidden_b, 0, 0); // dummy, unused
+        set_buffer(encoder, &self.scratch_gate, 0, 1);
+        set_buffer(encoder, &self.scratch_up, 0, 2);
+        set_buffer(encoder, &self.scratch_silu, 0, 3);
+
+        let params = LayerParams {
+            intermediate_dim: self.intermediate_size as u32,
+            seq_len: 1,
+            ..Default::default()
+        };
+        set_bytes(encoder, &params, 4);
+
+        let grid = MTLSize { width: self.intermediate_size, height: 1, depth: 1 };
+        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode GPU-side buffer copy: src -> dst for `count` f32 elements.
+    fn encode_buffer_copy(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        src: &ProtocolObject<dyn MTLBuffer>,
+        dst: &ProtocolObject<dyn MTLBuffer>,
+        count: usize,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("buffer_copy"))
+            .expect("buffer_copy PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, src, 0, 0);
+        set_buffer(encoder, dst, 0, 1);
+
+        let count_u32 = count as u32;
+        set_bytes(encoder, &count_u32, 2);
+
+        let grid = MTLSize { width: count, height: 1, depth: 1 };
+        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode concat_buffers_3: a + b + c -> output.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_concat_3(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        a: &ProtocolObject<dyn MTLBuffer>,
+        b: &ProtocolObject<dyn MTLBuffer>,
+        c: &ProtocolObject<dyn MTLBuffer>,
+        output: &ProtocolObject<dyn MTLBuffer>,
+        dim_a: usize,
+        dim_b: usize,
+        dim_c: usize,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("concat_buffers_3"))
+            .expect("concat_buffers_3 PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, a, 0, 0);
+        set_buffer(encoder, b, 0, 1);
+        set_buffer(encoder, c, 0, 2);
+        set_buffer(encoder, output, 0, 3);
+
+        let dim_a_u32 = dim_a as u32;
+        let dim_b_u32 = dim_b as u32;
+        let dim_c_u32 = dim_c as u32;
+        set_bytes(encoder, &dim_a_u32, 4);
+        set_bytes(encoder, &dim_b_u32, 5);
+        set_bytes(encoder, &dim_c_u32, 6);
+
+        let total = dim_a + dim_b + dim_c;
+        let grid = MTLSize { width: total, height: 1, depth: 1 };
+        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode concat_buffers_2: a + b -> output.
+    fn encode_concat_2(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        a: &ProtocolObject<dyn MTLBuffer>,
+        b: &ProtocolObject<dyn MTLBuffer>,
+        output: &ProtocolObject<dyn MTLBuffer>,
+        dim_a: usize,
+        dim_b: usize,
+    ) {
+        let pso = self
+            .pso_cache
+            .get(&PsoKey::simple("concat_buffers_2"))
+            .expect("concat_buffers_2 PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso);
+        set_buffer(encoder, a, 0, 0);
+        set_buffer(encoder, b, 0, 1);
+        set_buffer(encoder, output, 0, 2);
+
+        let dim_a_u32 = dim_a as u32;
+        let dim_b_u32 = dim_b as u32;
+        set_bytes(encoder, &dim_a_u32, 3);
+        set_bytes(encoder, &dim_b_u32, 4);
+
+        let total = dim_a + dim_b;
+        let grid = MTLSize { width: total, height: 1, depth: 1 };
+        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Encode GPU-side argmax: two-stage parallel reduction on logits buffer.
+    fn encode_argmax(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        logits_buf: &ProtocolObject<dyn MTLBuffer>,
+    ) {
+        let num_groups = self.vocab_size.div_ceil(256 * 4);
+        let num_groups_u32 = num_groups as u32;
+        let vocab_size_u32 = self.vocab_size as u32;
+
+        // Stage 1: argmax_reduce
+        let pso_reduce = self
+            .pso_cache
+            .get(&PsoKey::simple("argmax_reduce"))
+            .expect("argmax_reduce PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso_reduce);
+        set_buffer(encoder, logits_buf, 0, 0);
+        set_bytes(encoder, &vocab_size_u32, 1);
+        set_buffer(encoder, &self.argmax_partial_vals, 0, 2);
+        set_buffer(encoder, &self.argmax_partial_idxs, 0, 3);
+
+        let grid = MTLSize { width: num_groups, height: 1, depth: 1 };
+        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+
+        // Stage 2: argmax_final
+        let pso_final = self
+            .pso_cache
+            .get(&PsoKey::simple("argmax_final"))
+            .expect("argmax_final PSO not prewarmed");
+
+        encoder.setComputePipelineState(pso_final);
+        set_buffer(encoder, &self.argmax_partial_vals, 0, 0);
+        set_buffer(encoder, &self.argmax_partial_idxs, 0, 1);
+        set_bytes(encoder, &num_groups_u32, 2);
+        set_buffer(encoder, &self.argmax_result, 0, 3);
+
+        let grid_final = MTLSize { width: 1, height: 1, depth: 1 };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_final, tg);
+    }
+}
+
+/// Validate that a command buffer completed successfully.
+fn validate_eagle_cmd_buf(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    stage: &str,
+) -> Result<(), String> {
+    let status = cmd_buf.status();
+    if status == MTLCommandBufferStatus::Completed {
+        Ok(())
+    } else {
+        let error_desc = cmd_buf
+            .error()
+            .map(|e| e.localizedDescription().to_string())
+            .unwrap_or_else(|| "unknown error".to_string());
+        Err(format!(
+            "GPU command buffer failed at {stage}: status={status:?}, error={error_desc}",
+        ))
     }
 }
