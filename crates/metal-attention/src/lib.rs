@@ -15,11 +15,13 @@ pub mod sampling;
 pub mod speculative;
 pub mod eagle;
 pub mod eagle_head;
+pub mod eagle_weights;
 
 // Re-exports for convenience
 pub use config::InferenceConfig;
 pub use eagle::EagleDecoder;
 pub use eagle_head::EagleHead;
+pub use eagle_weights::EagleWeightStore;
 pub use dequant::dequantize_tensor;
 pub use gpu_forward_pass::GpuForwardPass;
 pub use inference::{decode_step, generate, generate_streaming, prefill};
