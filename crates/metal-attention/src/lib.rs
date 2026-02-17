@@ -13,11 +13,13 @@ pub mod inference;
 pub mod model;
 pub mod sampling;
 pub mod speculative;
-mod eagle;
-mod eagle_head;
+pub mod eagle;
+pub mod eagle_head;
 
 // Re-exports for convenience
 pub use config::InferenceConfig;
+pub use eagle::EagleDecoder;
+pub use eagle_head::EagleHead;
 pub use dequant::dequantize_tensor;
 pub use gpu_forward_pass::GpuForwardPass;
 pub use inference::{decode_step, generate, generate_streaming, prefill};
